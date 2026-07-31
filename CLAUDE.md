@@ -17,16 +17,16 @@ mode and asked for words.
 | `server/index.ts` | WebSocket server (port 3001). One session per connection. |
 | `server/session.ts` | The state machine. Owns modes, timers, half-duplex gate, persistence. |
 | `server/tracker.ts` | Word-by-word passage following: best-attempt scoring, repeats, reading ahead. |
-| `server/azure.ts` | Pronunciation assessment (reading) + plain STT (talking). |
+| `server/azure.ts` | `PronunciationSession` (per passage, scoring) + `ConversationEar` (always on, hearing). |
 | `server/cartesia.ts` | Streaming TTS over the raw WebSocket, with per-context cancel for barge-in. |
 | `lib/leniency.ts` | Developmental-speech table. Extend this during kid testing. |
-| `lib/offscript.ts` | Was that utterance reading, or the child talking? Conservative on purpose. |
+| `lib/conversation.ts` | Was that reading, talking, or both? Plus the echo guard and "have they finished?". |
 | `lib/facts.ts` | What the child told us today, and which beat may use it. |
 | `lib/sessionflow.ts` | When to check in, what progress to celebrate, was that a yes. |
 | `lib/profile.ts` | The onboarding draft and what counts as enough to start. |
 | `lib/pedagogy.ts` | Mastery math and target selection. Pure, no LLM. |
 | `lib/skills.ts` | The skill list and word→skill mapping. |
-| `lib/llm/*` | Narrator, onboarding, planner, intent router, safety pass, consolidation. |
+| `lib/llm/*` | Narrator (story), responder (conversation), onboarding, planner, safety pass, consolidation. |
 | `app/api/*` | REST surface (§13). |
 | `components/*` | Session UI + debug panel. |
 
@@ -43,13 +43,20 @@ mode and asked for words.
   JSON `ClientMessage` / `ServerMessage` from `lib/types.ts`.
 - **`reading_events` is append-only.** Never UPDATE or DELETE.
 - Only `attempt = 1` results update mastery, so coached retries can't inflate it.
-- **Anything a child says gets an answer.** Speaking up mid-passage and talking
-  over the narrator are both detected in `lib/offscript.ts` and routed through the
-  same intent router as the talk button, so being heard never needs a button.
+- **The child has priority over the narrator, always.** There is no button. The
+  mic is open for the whole session, the narrator stops mid-word when the child
+  starts, and it never begins a sentence while they are mid-one.
+- **Two layers, one audio stream.** `ConversationEar` is opened once and never
+  torn down — it hears everything, in every mode. `PronunciationSession` scores
+  the passage and is never asked whether the child meant to read it. Do not put
+  branching logic back into the assessment stream.
 - **Never cut a child off.** Azure ends an utterance at every pause and children
-  pause constantly, so `listen()` collects segments and only settles after
-  `REPLY_QUIET_MS` of real silence. Settling on the first segment is how "I like
-  cars, like Lamborghini... and Bugatti" becomes an interruption.
+  pause constantly, so utterances are buffered into a turn and only settled after
+  real silence (longer if `soundsUnfinished`). Acting on the first segment is how
+  "I like cars, like Lamborghini... and Bugatti" becomes an interruption.
+- **A reply is on the critical path; a story beat is not.** Conversation is ONE
+  fast call (`lib/llm/respond.ts`). Story content keeps Sonnet and the full safety
+  pass. Do not re-add round-trips between a child speaking and being answered.
 - **A fallback may be plain; it may not be about somebody else.** `fallbackPlan`
   takes the child's memory. It once shipped a hardcoded dragon story to a child
   who had just spent a minute talking about cars, because the planner's schema
@@ -68,7 +75,7 @@ npm run dev        # Next.js on :3000 + WS server on :3001
 ```
 
 Run `npm run selftest` after touching `tracker.ts`, `leniency.ts`, `pedagogy.ts`,
-`skills.ts`, `offscript.ts`, `facts.ts`, `sessionflow.ts`, or `profile.ts` —
+`skills.ts`, `conversation.ts`, `facts.ts`, `sessionflow.ts`, or `profile.ts` —
 those files carry the behaviour that is hardest to eyeball and easiest to break.
 
 `npm run db:reset` seeds an **empty** profile, so the app opens with onboarding.

@@ -7,7 +7,7 @@ import { pool, query, getDemoChild, schemaIsReady, describeTarget } from '../lib
 import { model } from '../lib/llm/client';
 import { checkAzureCredentials } from '../server/azure';
 import { checkCartesia } from '../server/cartesia';
-import { classifyIntent } from '../lib/llm/intent';
+import { respondToChild } from '../lib/llm/respond';
 import { env } from '../lib/env';
 
 const results: { name: string; ok: boolean; detail: string }[] = [];
@@ -77,15 +77,21 @@ async function main() {
     return `${text.trim().slice(0, 20)}`;
   });
 
-  await check('Anthropic (Haiku intent router)', async () => {
-    const r = await classifyIntent({
+  await check('Anthropic (conversation responder)', async () => {
+    const r = await respondToChild({
+      childName: 'Maya',
       transcript: 'my dog is named Max!',
       currentPassage: 'The cat sat.',
       currentWord: 'cat',
       storyPremise: 'A cat looks for a bell',
+      learned: [],
+      socraticSoFar: 0,
+      socraticLimit: 3,
+      source: 'off_script',
     });
     if (r.intent !== 'chitchat') throw new Error(`expected chitchat, got ${r.intent}`);
-    return `classified as ${r.intent} (topic: ${r.interestTopic ?? 'none'})`;
+    if (!r.speakText.trim()) throw new Error('no reply text');
+    return `${r.intent} -> "${r.speakText.slice(0, 48)}"`;
   });
 
   await check(`Azure Speech (${env.azureRegion})`, async () => {

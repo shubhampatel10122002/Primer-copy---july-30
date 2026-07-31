@@ -118,8 +118,6 @@ export interface WordAssessment {
 
 export type ClientMessage =
   | { t: 'start' }
-  | { t: 'talk_start' }
-  | { t: 'talk_end' }
   | { t: 'resume' }
   | { t: 'stop' }
   /** Tapping the on-screen answer to a yes/no question, instead of saying it. */
@@ -135,14 +133,13 @@ export type ServerMessage =
   | { t: 'passage'; text: string; words: string[] }
   | { t: 'word'; index: number; status: TrackedWord['status']; score: number | null; errorType: ErrorType | null }
   | { t: 'cursor'; index: number }
-  /** bargeIn: keep capturing during playback so the child can interrupt by voice. */
-  | { t: 'tts_start'; bargeIn?: boolean }
+  | { t: 'tts_start' }
   | { t: 'tts_end' }
   /** Drop whatever is still queued — the child interrupted and we have stopped. */
   | { t: 'stop_playback' }
-  | { t: 'talk_open' }
+  /** Something the child said, and what we made of it. */
   | { t: 'talk_closed'; transcript: string | null; intent: Intent | null }
-  /** The mic is open for a conversational reply (onboarding, check-in). */
+  /** The microphone is live. It is live for the whole session. */
   | { t: 'listening'; on: boolean }
   /** Onboarding progress, so the panel can show the profile filling in. */
   | { t: 'profile'; name: string | null; age: number | null; interests: string[] }

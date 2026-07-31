@@ -191,7 +191,7 @@ button {
   font-weight: 500;
 }
 
-/* ---------- talk button ---------- */
+/* ---------- the listening indicator ---------- */
 
 .talk-dock {
   position: fixed;
@@ -201,56 +201,6 @@ button {
   align-items: center;
   gap: 16px;
   z-index: 10;
-}
-
-.talk-button {
-  width: 112px;
-  height: 112px;
-  border-radius: 50%;
-  border: 4px solid var(--accent);
-  background: var(--card);
-  font-size: 52px;
-  line-height: 1;
-  display: grid;
-  place-items: center;
-  box-shadow: 0 6px 0 rgba(217, 122, 69, 0.35);
-  transition:
-    transform 120ms ease,
-    box-shadow 120ms ease,
-    background-color 120ms ease;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: none;
-}
-
-.talk-button:active,
-.talk-button.listening {
-  transform: translateY(4px);
-  box-shadow: 0 2px 0 rgba(217, 122, 69, 0.35);
-  background: var(--accent-soft);
-}
-
-.talk-button.listening {
-  animation: pulse 1.1s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    box-shadow: 0 2px 0 rgba(217, 122, 69, 0.35);
-  }
-  50% {
-    box-shadow:
-      0 2px 0 rgba(217, 122, 69, 0.35),
-      0 0 0 14px rgba(217, 122, 69, 0.12);
-  }
-}
-
-.talk-hint {
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--accent);
-  max-width: 220px;
 }
 
 /* ---------- buttons ---------- */
@@ -507,4 +457,49 @@ button {
 }
 .panel .muted {
   color: #7d7871;
+}
+
+/* ---------- the ear ----------
+   Where the owl button used to be. The child never presses anything: the
+   microphone is live for the whole session, and this only says so. */
+
+.ear {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 22px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ear.live {
+  border-color: var(--good);
+  color: var(--good);
+}
+
+.ear-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.35;
+}
+
+.ear.live .ear-dot {
+  opacity: 1;
+  animation: ear-pulse 1.6s ease-in-out infinite;
+}
+
+.ear.speaking {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+@keyframes ear-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.35); opacity: 0.55; }
 }

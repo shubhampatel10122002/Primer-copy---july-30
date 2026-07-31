@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AudioEngine } from '@/lib/client/audio';
 import MicCheck from './MicCheck';
 import PassageView, { type WordState } from './PassageView';
-import TalkButton from './TalkButton';
 import DebugPanel from './DebugPanel';
 import type { Intent, Mode, ServerMessage, SessionPlan } from '@/lib/types';
 
@@ -117,16 +116,16 @@ export default function SessionView() {
       case 'tts_start':
         setSpeaking(true);
         setAudioBytes(0);
-        // Keep capturing so the child can talk over Ollie. The server sends these
-        // frames to the barge-in recognizer ONLY, and checks everything it hears
-        // against the words being spoken before acting on it — so the "never
-        // listen to ourselves" half of §8.2 still holds, it just holds on the
-        // server instead of by going deaf.
+        // The microphone stays live. The child can talk over Ollie at any moment
+        // and must be heard when they do; the server routes these frames to the
+        // conversation layer only and echo-checks everything against the words
+        // it is currently speaking, so "never listen to ourselves" still holds —
+        // it just holds without going deaf.
         //
         // getUserMedia already has echoCancellation on (lib/client/audio.ts),
-        // which is what makes this viable on laptop speakers.
-        engineRef.current?.setMuted(msg.bargeIn === false);
+        // which is what makes this work on laptop speakers.
         if (gateTimer.current) clearTimeout(gateTimer.current);
+        engineRef.current?.setMuted(false);
         break;
 
       case 'stop_playback':
@@ -139,25 +138,13 @@ export default function SessionView() {
 
       case 'tts_end':
         setSpeaking(false);
-        // The server sends this when it finishes *sending* audio, which is before
-        // the browser has finished *playing* it. The barge-in recognizer is closed
-        // by now, so anything captured during that tail would land in
-        // pronunciation assessment as the child's reading — mute until the
-        // speaker is genuinely quiet, then 300ms more.
-        if (gateTimer.current) clearTimeout(gateTimer.current);
-        engineRef.current?.setMuted(true);
-        gateTimer.current = setTimeout(
-          () => engineRef.current?.setMuted(false),
-          (engineRef.current?.playbackRemainingMs() ?? 0) + 300,
-        );
-        break;
-
-      case 'talk_open':
-        setListening(true);
+        // Capture keeps running here too. The server stops feeding pronunciation
+        // assessment while its own audio is in the room, so the tail is handled
+        // there; muting locally would only create a window where the child is
+        // talking to nothing, which is the thing we are trying to abolish.
         break;
 
       case 'talk_closed':
-        setListening(false);
         if (msg.transcript) {
           setLastIntent({ transcript: msg.transcript, intent: msg.intent });
           setTranscript((t) => [
@@ -167,8 +154,7 @@ export default function SessionView() {
         }
         break;
 
-      // The mic is open for a spoken reply — onboarding, or a check-in. Same
-      // indicator as the talk button, since to the child it is the same thing.
+      // The microphone went live. It stays live for the whole session.
       case 'listening':
         setListening(msg.on);
         break;
@@ -255,23 +241,6 @@ export default function SessionView() {
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   };
-
-  function pressTalk() {
-    // Barge-in: kill local playback the instant the button goes down, and drop
-    // any caption still waiting on audio that will now never play.
-    flushCaptions();
-    engineRef.current?.stopPlayback();
-    engineRef.current?.setMuted(false);
-    setSpeaking(false);
-    setListening(true);
-    send({ t: 'talk_start' });
-  }
-
-  function releaseTalk() {
-    if (!listening) return;
-    setListening(false);
-    send({ t: 'talk_end' });
-  }
 
   /** Answering the check-in by tapping. Saying it out loud works too. */
   function answer(value: 'yes' | 'no') {
@@ -388,14 +357,17 @@ export default function SessionView() {
           </>
         )}
 
-        <TalkButton
-          listening={listening}
-          // During onboarding and check-ins the mic is already open, so the
-          // button would only be a way to interrupt a question being asked.
-          disabled={!connected || ended || mode === 'ONBOARDING' || awaiting !== null}
-          onPress={pressTalk}
-          onRelease={releaseTalk}
-        />
+        {/*
+          No button. The microphone is on from the moment the session starts and
+          the child can speak at any time, over anything. This only tells them
+          that — it is an indicator, not a control.
+        */}
+        <div className="talk-dock">
+          <div className={`ear${listening ? ' live' : ''}${speaking ? ' speaking' : ''}`}>
+            <span className="ear-dot" />
+            {speaking ? 'You can talk any time' : listening ? "I'm listening" : 'Connecting…'}
+          </div>
+        </div>
       </main>
 
       <DebugPanel
