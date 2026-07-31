@@ -74,6 +74,55 @@ export async function generateSessionPlan(args: {
   return { ...object, target_skills: targetSkills } as SessionPlan;
 }
 
+/**
+ * More beats for a story the child asked to keep reading.
+ *
+ * Cheaper and safer than replanning: the premise, characters, difficulty and
+ * vocab constraints all stay exactly as they were, so continuing does not
+ * silently reset the pedagogy. Only the road ahead is extended.
+ */
+export async function extendPlanBeats(args: {
+  plan: SessionPlan;
+  fromBeat: number;
+  learned: string[];
+}): Promise<string[]> {
+  const { plan, fromBeat, learned } = args;
+
+  try {
+    const { object } = await generateObject({
+      model: model.planner(),
+      schema: z.object({
+        beats: z.array(z.string()).min(2).max(4).describe('The next story beats, one short phrase each'),
+      }),
+      system: [
+        'You extend a story that a young child is reading aloud and wants to continue.',
+        'Produce the next few beats only — short planning notes, not prose.',
+        'Hard rules:',
+        '- Continue the existing story. Do not restart it or introduce a new premise.',
+        '- The last beat you write should be able to end the story warmly, never on a cliffhanger.',
+        '- Nothing scary, violent, or sad about family. No brand or IP content.',
+      ].join('\n'),
+      prompt: [
+        `Premise: ${plan.premise}`,
+        `Characters: ${plan.characters.join(', ')}`,
+        `Beats so far: ${plan.beats.map((b, i) => `${i}. ${b}`).join(' | ')}`,
+        `They have just finished beat ${fromBeat}.`,
+        learned.length ? `Things the child mentioned today: ${learned.join('; ')}` : '',
+        '',
+        'Write the next beats.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    });
+
+    return object.beats;
+  } catch (err) {
+    console.error('[planner] beat extension failed, using fallback beats', err);
+    const hero = plan.characters[0] ?? 'our friend';
+    return [`${hero} finds one more surprise`, `${hero} heads home happy`];
+  }
+}
+
 /** Deterministic fallback so a planner outage can never block a demo. */
 export function fallbackPlan(child: Child, targetSkills: string[]): SessionPlan {
   return {

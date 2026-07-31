@@ -34,9 +34,13 @@ changes (REMIX / ADAPT). Sections, in order:
 
 1. **Who the child is** — name, age, parent onboarding notes, weighted
    interests, personality notes, canon characters, open threads from past sessions.
-2. **This session plan** — goal, premise, characters, beats, difficulty,
+2. **What they have told you during this session** — present only once the child
+   has volunteered something (`updateLearned()`). It is background for *tone*;
+   the section explicitly forbids working those details into the story unless a
+   turn says to. Timing belongs to `lib/facts.ts`.
+3. **This session plan** — goal, premise, characters, beats, difficulty,
    must-use words, max sentence length, allowed spelling patterns.
-3. **Hard rules** (the six from PLAN.md §7, verbatim in intent):
+4. **Hard rules** (the six from PLAN.md §7, verbatim in intent):
    1. Warm, playful, age-appropriate. Short sentences. No lecturing.
    2. Socratic **only** for thinking questions; procedural questions always get
       a direct, kind answer.
@@ -45,7 +49,7 @@ changes (REMIX / ADAPT). Sections, in order:
       stand-in ("a snow queen named Elka").
    5. Stay in the story world; weave interruptions back within one sentence.
    6. On frustration: get easier and shorter immediately, and offer a choice.
-4. **Output format** notes.
+5. **Output format** notes.
 
 ## Mode instructions
 
@@ -62,11 +66,34 @@ The state machine passes a `NarratorMode` plus free-text context. Modes:
 | `CHITCHAT` | child shared something about their life | no |
 | `REMIX` | change request — same difficulty/skills/words, new costume | yes |
 | `ADAPT` | struggling — shorter, simpler, offer a choice | yes |
+| `CHECK_IN` | WRAP_UP — celebrate, name real progress, ask if they want more | no |
+| `CONTINUE` | they said yes — resume mid-story, no recap, no re-greeting | yes |
 | `CLOSING` | END — wrap in one beat, never a cliffhanger | no |
 
 **REMIX is the subtle one**: the child changes the costume, the lesson stays.
 Always restate difficulty, target skills, and must-use words in the context
 string so the model cannot quietly drop them.
+
+**CHECK_IN must actually ask the question.** Both answers have to sound equally
+fine — a check-in that talks a child into continuing is not a check-in. Its
+fallback (`T.checkInLine`) is the one fallback that is not a story line, because
+falling back to narration would silently drop the question.
+
+## Personalizing from what the child says
+
+The narrator is never the thing that decides a detail is ready to use.
+
+- Something the child mentions is recorded by `FactLedger` (`lib/facts.ts`) and
+  pushed into the system prompt via `updateLearned()` — for tone only.
+- The state machine asks `pickForWeaving(beat)` when it writes the next beat.
+  That returns at most one fact, at least `WEAVE_DELAY_BEATS` (2) beats after it
+  was heard, and never within `WEAVE_SPACING_BEATS` of the last one used.
+- Only then does the turn get `{ weave }`, which asks for a prop or a passing
+  likeness — explicitly *not* the subject of the scene, and never "you told me".
+
+Why the delay: a detail echoed back in the very next sentence is not
+personalization, it is a parrot, and children notice. Feelings ("I'm bored") are
+never woven at all — the intent router answers those in the moment.
 
 ## The turn-transition acknowledgment
 
@@ -99,15 +126,19 @@ to remember. Its context is full of plausible-but-wrong alternatives (the plan's
 one. A real session praised **"glad"** — the canonical `blend_gl` example word —
 after the child read **"glides"**.
 
-`turn()` takes a `mustMention` option for this:
+`turn()` takes `mustMention` (exactly this word) and `mustMentionAny` (at least
+one of these) for this:
 
 ```ts
-const praiseWord = pickPraiseWord(tracker.words);   // lib/praise.ts, pure
+const praiseWord = pickPraiseWord(tracker.words);          // lib/praise.ts, pure
 await narrator.turn('ENCOURAGE', context, { mustMention: praiseWord });
+
+const progress = summarizeProgress(passageRecords);        // lib/sessionflow.ts, pure
+await narrator.turn('CHECK_IN', context, { mustMentionAny: progress.conquered });
 ```
 
-It adds a HARD CONSTRAINT line to the prompt, then **verifies in code** that the
-word appears (`mentionsWord`, word-boundary matched so "glide" fails for
+Both add a HARD CONSTRAINT line to the prompt, then **verify in code** that a
+required word appears (`mentionsWord`, word-boundary matched so "glide" fails for
 "glides"). One retry with a correction; still wrong and it falls back to
 `T.encourageLine(word)`, which is a template that cannot get the word wrong.
 

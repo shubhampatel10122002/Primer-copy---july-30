@@ -92,6 +92,19 @@ button {
   background: var(--warn-soft);
   color: #a9761d;
 }
+.mode-pill[data-mode='ONBOARDING'],
+.mode-pill[data-mode='WRAP_UP'] {
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+/* The two answers to "keep reading?" — equal weight, so neither is the default. */
+.choice-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
 
 .status-line {
   margin-left: auto;

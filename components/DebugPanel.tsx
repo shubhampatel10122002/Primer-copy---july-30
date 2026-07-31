@@ -29,6 +29,7 @@ export default function DebugPanel({
   transcript,
   liveFlags,
   audioBytes,
+  facts,
   onTtsTest,
   connected,
 }: {
@@ -39,11 +40,13 @@ export default function DebugPanel({
   transcript: { kind: string; text: string }[];
   liveFlags: { type: string; detail: string }[];
   audioBytes: number;
+  facts: { text: string; topic: string; kind: string }[];
   onTtsTest: () => void;
   connected: boolean;
 }) {
   const [memory, setMemory] = useState<MemoryResponse | null>(null);
   const [consolidating, setConsolidating] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState('');
 
@@ -78,7 +81,33 @@ export default function DebugPanel({
     }
   }
 
+  /**
+   * Blank the profile and reload, so the next session opens with onboarding.
+   * Reloading is deliberate: the live session is holding the old profile, and
+   * the point of the button is to watch Ollie meet someone new.
+   */
+  async function startOver() {
+    if (!confirm('Forget this child and start over? The next session will begin with onboarding.'))
+      return;
+    setResetting(true);
+    setError('');
+    try {
+      const res = await fetch('/api/child/reset', { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+        setResetting(false);
+        return;
+      }
+      window.location.reload();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+      setResetting(false);
+    }
+  }
+
   const words = (debug.lastWords as any[]) ?? [];
+  const wovenFact = debug.wovenFact as { text: string; beat: number } | undefined;
   const tts = debug.lastTts as { bytes: number; seconds: number; firstChunkMs: number } | undefined;
   const sentBytes = tts?.bytes ?? null;
   const sentSeconds = tts?.seconds ?? 0;
@@ -94,7 +123,7 @@ export default function DebugPanel({
       <div className="kv">
         <span>Child</span>
         <span>
-          {memory?.child.name ?? '—'}
+          {memory?.child.name?.trim() || 'not met yet'}
           {memory?.child.age ? `, ${memory.child.age}` : ''}
         </span>
       </div>
@@ -194,10 +223,38 @@ export default function DebugPanel({
               <span>Intent</span>
               <span>{lastIntent.intent ?? '—'}</span>
             </div>
+            {debug.offScript ? (
+              <div className="kv">
+                <span>Heard without the button</span>
+                <span>{(debug.offScript as any).reason}</span>
+              </div>
+            ) : null}
           </>
         ) : (
           <div className="muted" style={{ padding: '6px 0' }}>
-            No talk-button turns yet.
+            Nothing said yet.
+          </div>
+        )}
+      </div>
+
+      {/* The personalization loop, made visible: heard → held → woven in. */}
+      <h2>Learned today</h2>
+      <div className="panel-section">
+        {facts.length === 0 ? (
+          <div className="muted" style={{ padding: '6px 0' }}>
+            Nothing shared yet.
+          </div>
+        ) : (
+          facts.map((f, i) => (
+            <div className="transcript-line" key={i}>
+              <span className="kind">{f.kind}</span>
+              {f.text}
+            </div>
+          ))
+        )}
+        {wovenFact && (
+          <div className="chip added" style={{ marginTop: 8 }}>
+            woven into beat {wovenFact.beat}: {wovenFact.text}
           </div>
         )}
       </div>
@@ -280,6 +337,14 @@ export default function DebugPanel({
       <h2>Consolidate</h2>
       <button className="panel-btn" onClick={consolidate} disabled={consolidating}>
         {consolidating ? 'Thinking about today…' : 'Consolidate memory'}
+      </button>
+      <button
+        className="panel-btn"
+        onClick={startOver}
+        disabled={resetting}
+        style={{ marginTop: 8 }}
+      >
+        {resetting ? 'Forgetting…' : '↺ Start over (new child)'}
       </button>
       {error && (
         <div className="flag sensitive_topic" style={{ marginTop: 10 }}>

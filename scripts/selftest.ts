@@ -14,7 +14,17 @@ import { AUDIO } from '../lib/env';
 import { floatPcmToWav } from '../lib/wav';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
-import type { WordAssessment } from '../lib/types';
+import { detectOffScript } from '../lib/offscript';
+import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
+import { shouldCheckIn, summarizeProgress, parseYesNo } from '../lib/sessionflow';
+import {
+  emptyDraft,
+  mergeDraft,
+  hasEnoughToStart,
+  isFreshProfile,
+  draftToInterests,
+} from '../lib/profile';
+import type { ChildMemory, TrackedWord, WordAssessment } from '../lib/types';
 
 let passed = 0;
 let failed = 0;
@@ -426,6 +436,198 @@ console.log('\nWAV encoding (audio-check isolation path)');
   const clipped = floatPcmToWav(loud, 44100);
   ok('positive clipping saturates', clipped.readInt16LE(44) === 32767, String(clipped.readInt16LE(44)));
   ok('negative clipping saturates', clipped.readInt16LE(46) === -32768, String(clipped.readInt16LE(46)));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nOff-script detection (talking vs reading)');
+// --------------------------------------------------------------------------
+{
+  const passageWords = (text: string): TrackedWord[] =>
+    tokenize(text).map((expected, index) => ({
+      index,
+      expected,
+      bestScore: null,
+      errorType: null,
+      attempts: 0,
+      status: index === 0 ? 'current' : 'pending',
+    }));
+
+  const words = passageWords('The blue dragon flew over the hill.');
+  const verdict = (recognized: string) => detectOffScript({ recognized, words });
+
+  // The whole reason this exists: a child who says something mid-passage and is
+  // ignored learns the thing does not listen.
+  ok('"I am really bored of this" is off-script', verdict('I am really bored of this').offScript);
+  ok(
+    '"can we read about trucks instead" is off-script',
+    verdict('can we read about trucks instead').offScript,
+  );
+  ok('"I lost my tooth yesterday" is off-script', verdict('I lost my tooth yesterday').offScript);
+
+  // The expensive failure: interrupting a child who was reading.
+  ok('reading the passage is not off-script', !verdict('The blue dragon flew over the hill').offScript);
+  ok('a partial read is not off-script', !verdict('The blue dragon flew').offScript);
+  ok(
+    'a misread keeps enough overlap to stay reading',
+    !verdict('The bloo dragon flew over the hill').offScript,
+    JSON.stringify(verdict('The bloo dragon flew over the hill')),
+  );
+
+  // Short utterances need an unmistakable cue, and only when the passage does
+  // not contain it.
+  ok('"bored" alone is off-script', verdict('bored').offScript);
+  ok('"the hill" alone is not off-script', !verdict('the hill').offScript);
+  ok('a word from the passage is never a cue', !detectOffScript({ recognized: 'stop', words: passageWords('We stop at the top.') }).offScript);
+  ok('"stop" outside the passage is a cue', detectOffScript({ recognized: 'stop', words }).offScript);
+
+  // Noise fragments into tiny tokens that match nothing — not a conversation.
+  ok('noise fragments are not off-script', !verdict('a uh oh').offScript);
+  ok('empty recognition is not off-script', !verdict('').offScript);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nFact ledger (when the story may use what it heard)');
+// --------------------------------------------------------------------------
+{
+  const ledger = new FactLedger();
+  const tooth = ledger.add({ text: 'lost a tooth yesterday', topic: 'tooth', kind: 'event', beat: 1 })!;
+
+  ok('a fact is recorded', ledger.size === 1);
+  ok('the same fact twice is one fact', ledger.add({ text: 'lost a tooth yesterday', beat: 2 })!.id === tooth.id && ledger.size === 1);
+
+  // The point of the whole module: not the very next sentence.
+  ok('not woven immediately', ledger.pickForWeaving(1) === null);
+  ok(
+    `not woven before ${WEAVE_DELAY_BEATS} beats have passed`,
+    ledger.pickForWeaving(1 + WEAVE_DELAY_BEATS - 1) === null,
+  );
+  ok('woven once enough beats have passed', ledger.pickForWeaving(1 + WEAVE_DELAY_BEATS)?.id === tooth.id);
+
+  ledger.markWoven(tooth.id, 3);
+  ok('a used fact is not used again', ledger.pickForWeaving(9) === null);
+
+  // Spacing: two details must not land back to back.
+  const spaced = new FactLedger();
+  spaced.add({ text: 'has a dog called Max', topic: 'dogs', kind: 'person', beat: 0 });
+  spaced.add({ text: 'loves diggers', topic: 'diggers', kind: 'interest', beat: 0 });
+  const first = spaced.pickForWeaving(2)!;
+  spaced.markWoven(first.id, 2);
+  ok('no second detail in the very next beat', spaced.pickForWeaving(3) === null);
+  ok('a second detail lands later', spaced.pickForWeaving(4) !== null);
+
+  // Feelings are answered in the moment, never folded into a passage later.
+  const feelings = new FactLedger();
+  feelings.add({ text: 'is feeling bored right now', topic: 'bored', kind: 'feeling', beat: 0 });
+  ok('feelings are never woven', feelings.pickForWeaving(10) === null);
+
+  // Events prefer to go first — they are the most story-worthy.
+  const order = new FactLedger();
+  order.add({ text: 'likes space', topic: 'space', kind: 'interest', beat: 0 });
+  order.add({ text: 'has a birthday on Saturday', topic: 'birthday', kind: 'event', beat: 0 });
+  ok('events outrank interests', order.pickForWeaving(5)?.kind === 'event');
+}
+
+// --------------------------------------------------------------------------
+console.log('\nFacts folded into memory');
+// --------------------------------------------------------------------------
+{
+  const memory: ChildMemory = {
+    interests: [{ topic: 'dragons', weight: 0.5, last_seen: '2026-01-01T00:00:00.000Z' }],
+    personality_notes: '',
+    canon: { open_threads: ['Blue lost his bell'] },
+  };
+
+  const ledger = new FactLedger();
+  ledger.add({ text: 'loves diggers', topic: 'diggers', kind: 'interest', beat: 0 });
+  ledger.add({ text: 'loves dragons', topic: 'dragons', kind: 'interest', beat: 0 });
+  ledger.add({ text: 'lost a tooth yesterday', topic: 'tooth', kind: 'event', beat: 0 });
+
+  const merged = mergeFactsIntoMemory(memory, ledger.all());
+
+  ok('a new interest is added', merged.interests.some((i) => i.topic === 'diggers'));
+  ok(
+    'a mentioned interest is bumped by 0.3',
+    merged.interests.find((i) => i.topic === 'dragons')?.weight === 0.8,
+    String(merged.interests.find((i) => i.topic === 'dragons')?.weight),
+  );
+  ok('events land in canon, not interests', !merged.interests.some((i) => i.topic === 'tooth'));
+  ok(
+    'events are remembered for next time',
+    merged.canon.recent_events?.[0]?.text === 'lost a tooth yesterday',
+  );
+  ok('existing canon survives', merged.canon.open_threads?.[0] === 'Blue lost his bell');
+  ok('the original memory object is untouched', memory.interests.length === 1);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nSession flow (when to wrap up, and what to celebrate)');
+// --------------------------------------------------------------------------
+{
+  ok('no check-in early on', !shouldCheckIn({ passagesSinceCheckIn: 2, msSinceCheckIn: 60_000, checkIns: 0 }));
+  ok('check-in after six passages', shouldCheckIn({ passagesSinceCheckIn: 6, msSinceCheckIn: 0, checkIns: 0 }));
+  ok('check-in after ten minutes', shouldCheckIn({ passagesSinceCheckIn: 1, msSinceCheckIn: 10 * 60_000, checkIns: 0 }));
+  ok(
+    'check-ins come sooner once they have chosen to continue',
+    shouldCheckIn({ passagesSinceCheckIn: 4, msSinceCheckIn: 0, checkIns: 1 }),
+  );
+
+  // Progress: a word they fought for outranks one that was easy.
+  const stuck = new PassageTracker('The dragon glides home.');
+  stuck.ingest([word('The', 96)]);
+  stuck.ingest([word('dragon', 35, 'Mispronunciation', [{ phoneme: 'd', accuracyScore: 12 }])]);
+  stuck.ingest([word('dragon', 93), word('glides', 95), word('home', 97)]);
+
+  const progress = summarizeProgress([stuck.words]);
+  ok('one passage counted', progress.passages === 1);
+  ok('the word they fought for is named', progress.conquered.includes('dragon'), JSON.stringify(progress));
+  ok('a first-try word is not "conquered"', !progress.conquered.includes('glides'));
+  ok('strong first-try words are available as a fallback', progress.strong.includes('glides'), JSON.stringify(progress));
+
+  // Yes/no, decided in code — "no" is not a word to get wrong.
+  ok('"yes please" is yes', parseYesNo('yes please') === 'yes');
+  ok('"yeah keep going" is yes', parseYesNo('yeah keep going') === 'yes');
+  ok('"no" is no', parseYesNo('no') === 'no');
+  ok('"no more" is no, not yes', parseYesNo('no more') === 'no');
+  ok('"I\'m done" is no', parseYesNo("I'm done") === 'no');
+  ok('"nope not now" is no', parseYesNo('nope not now') === 'no');
+  ok('silence is neither', parseYesNo(null) === null);
+  ok('"can I have juice" is neither', parseYesNo('can I have juice') === null);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nOnboarding profile');
+// --------------------------------------------------------------------------
+{
+  ok('a blank name means onboarding', isFreshProfile({ name: '' }));
+  ok('the placeholder name means onboarding', isFreshProfile({ name: 'friend' }));
+  ok('a real name does not', !isFreshProfile({ name: 'Maya' }));
+
+  let draft = emptyDraft();
+  ok('an empty draft cannot start a story', !hasEnoughToStart(draft));
+
+  draft = mergeDraft(draft, { name: 'maya', interests: ['Dragons', 'dragons'] });
+  ok('the name is capitalised', draft.name === 'Maya');
+  ok('interests are deduped case-insensitively', draft.interests.length === 1, JSON.stringify(draft.interests));
+  ok('a name plus one interest is enough', hasEnoughToStart(draft));
+
+  // The model must not be able to rename the child halfway through.
+  draft = mergeDraft(draft, { name: 'Ada', age: 5, interests: ['diggers'] });
+  ok('the first name heard wins', draft.name === 'Maya');
+  ok('age is taken', draft.age === 5);
+
+  // Junk from the model is rejected rather than spoken back at the child.
+  const junk = mergeDraft(emptyDraft(), {
+    name: 'I think their name might be Sam',
+    age: 47,
+    interests: [''],
+  });
+  ok('a sentence is not a name', junk.name === null);
+  ok('an implausible age is dropped', junk.age === null);
+  ok('blank interests are dropped', junk.interests.length === 0);
+
+  const interests = draftToInterests(draft);
+  ok('the first interest carries the most weight', interests[0].weight >= interests[1].weight);
+  ok('interest weights stay in range', interests.every((i) => i.weight >= 0.6 && i.weight <= 1));
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

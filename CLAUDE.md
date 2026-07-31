@@ -20,9 +20,13 @@ mode and asked for words.
 | `server/azure.ts` | Pronunciation assessment (reading) + plain STT (talking). |
 | `server/cartesia.ts` | Streaming TTS over the raw WebSocket, with per-context cancel for barge-in. |
 | `lib/leniency.ts` | Developmental-speech table. Extend this during kid testing. |
+| `lib/offscript.ts` | Was that utterance reading, or the child talking? Conservative on purpose. |
+| `lib/facts.ts` | What the child told us today, and which beat may use it. |
+| `lib/sessionflow.ts` | When to check in, what progress to celebrate, was that a yes. |
+| `lib/profile.ts` | The onboarding draft and what counts as enough to start. |
 | `lib/pedagogy.ts` | Mastery math and target selection. Pure, no LLM. |
 | `lib/skills.ts` | The skill list and word→skill mapping. |
-| `lib/llm/*` | Narrator, planner, intent router, safety pass, consolidation. |
+| `lib/llm/*` | Narrator, onboarding, planner, intent router, safety pass, consolidation. |
 | `app/api/*` | REST surface (§13). |
 | `components/*` | Session UI + debug panel. |
 
@@ -39,6 +43,12 @@ mode and asked for words.
   JSON `ClientMessage` / `ServerMessage` from `lib/types.ts`.
 - **`reading_events` is append-only.** Never UPDATE or DELETE.
 - Only `attempt = 1` results update mastery, so coached retries can't inflate it.
+- **Anything a child says gets an answer.** Off-script speech is detected from the
+  reading stream (`lib/offscript.ts`) and routed through the same intent router as
+  the talk button, so speaking up never needs a button press.
+- **A detail the child shares never lands in the very next sentence.**
+  `lib/facts.ts` owns the delay; the narrator is only told what to say, and only
+  once a beat is cleared to use it.
 
 ## Commands
 
@@ -50,8 +60,11 @@ npm run dev        # Next.js on :3000 + WS server on :3001
 ```
 
 Run `npm run selftest` after touching `tracker.ts`, `leniency.ts`, `pedagogy.ts`,
-or `skills.ts` — those four files carry the behaviour that is hardest to eyeball
-and easiest to break.
+`skills.ts`, `offscript.ts`, `facts.ts`, `sessionflow.ts`, or `profile.ts` —
+those files carry the behaviour that is hardest to eyeball and easiest to break.
+
+`npm run db:reset` seeds an **empty** profile, so the app opens with onboarding.
+For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
 
 ## Gotchas found the hard way
 
