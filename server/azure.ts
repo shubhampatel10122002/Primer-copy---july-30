@@ -157,11 +157,22 @@ export interface TalkCallbacks {
   onPartial?: (text: string) => void;
   onFinal: (text: string) => void;
   onError?: (message: string) => void;
+  /**
+   * Report EVERY recognized segment instead of only the first.
+   *
+   * Azure ends an utterance at a pause, and children pause constantly — mid
+   * list, mid thought, hunting for the next word. Settling on the first segment
+   * is how "I like cars, like Lamborghini... and Bugatti" becomes "I like cars"
+   * and the child gets talked over. Callers that need a whole answer set this
+   * and decide for themselves when the child is actually finished.
+   */
+  continuous?: boolean;
 }
 
 /**
  * Plain conversational recognition for TALK mode — no pronunciation config.
- * Only ever active while the talk button session is open. PLAN.md §9.2.
+ * Used for the talk button, for onboarding and check-in replies, and for
+ * listening over our own voice during barge-in. PLAN.md §9.2.
  */
 export class TalkRecognizer {
   private recognizer: sdk.SpeechRecognizer;
@@ -180,7 +191,7 @@ export class TalkRecognizer {
     this.recognizer.recognized = (_s, e) => {
       if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
         if (this.settled) return;
-        this.settled = true;
+        if (!this.cb.continuous) this.settled = true;
         this.cb.onFinal(e.result.text);
       }
     };

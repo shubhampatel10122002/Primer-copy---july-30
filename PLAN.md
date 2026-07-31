@@ -136,11 +136,15 @@ Cross-cutting rules:
 
 ## 5. TALK mode and the intent router
 
-There are two ways in, and they end up in the same place. The talk button (an
-owl, large and always visible) is the explicit one. The implicit one is speaking
-up mid-passage: every utterance Azure returns during CHILD_READS is checked by
-`lib/offscript.ts`, and one that barely overlaps the passage is treated as
-conversation rather than a misread.
+There are three ways in and they all end up in the same place
+(`handleChildSpeech`). The talk button (an owl, large and always visible) is the
+explicit one, and by now the least important. The other two need no button:
+
+- **Speaking up mid-passage.** Every utterance Azure returns during CHILD_READS
+  is checked by `lib/offscript.ts`; one that barely overlaps the passage is
+  conversation, not a misread.
+- **Talking over the narrator.** A second recognizer runs during playback (§8.2).
+  Speech that is not our own echo cuts the story off and gets answered.
 
 That check is deliberately conservative, because the two failure modes are not
 symmetric. Interrupting a child who was reading is expensive; missing a comment
@@ -157,7 +161,12 @@ Flow when tapped (or when off-script speech is detected):
    revealed about their own life into the fact ledger (`lib/facts.ts`):
    - `help_with_word` — answer DIRECTLY (procedural help is never Socratic), then CHILD_READS.
    - `question_about_story_or_world` — enter SOCRATIC.
-   - `change_request` — enter REMIX.
+   - `change_request` — enter REMIX. If they said what they want ("trucks"),
+     rebuild around it. If they only said they were bored, **ask them what they
+     would like** and listen for the answer — "bored" is not a topic, and
+     rebuilding the story around the word is not an answer. No reply and we steer
+     to their strongest known interest. Either way the remaining beats are
+     retold around it, not just the next one.
    - `chitchat` — one warm sentence, logged as an interest signal, weave back.
    - `want_to_stop` — enter END gracefully. Log `early_exit`. Never guilt-trip.
    - `sensitive_topic` — FIXED comfort template, never improvised, log a `sensitive_topic` flag for the parent, gently return to the story.
@@ -216,12 +225,28 @@ Safety pass: before TTS, run `speak_text` + `child_passage` through one Haiku ca
 - Server pushes frames into an Azure push-stream. Do NOT use the browser's SpeechRecognition API.
 
 ### 8.2 Half-duplex rule (echo prevention)
-While Cartesia audio is playing:
-- The server drops all incoming mic frames (server-side gate, authoritative).
-- The client also pauses capture (belt and suspenders).
-- Keep the gate closed for 300ms after playback ends (audio tail).
 
-The talk button is the one exception: tapping it kills playback instantly (barge-in), then opens the mic.
+The rule is **"never listen to ourselves"**, not "never listen". While Cartesia
+audio is playing:
+
+- Mic frames reach the barge-in recognizer and **nothing else**. Pronunciation
+  assessment and conversational listens receive nothing until we have stopped
+  talking — that part is absolute.
+- Everything the barge-in recognizer hears is checked against the exact words
+  being spoken (`isInterruption` in `lib/offscript.ts`). Anything that
+  substantially *is* those words is echo and is dropped.
+- Once playback ends, the client keeps capture paused until its own audio queue
+  has drained plus 300ms (the speaker tail). `tts_end` fires when the server
+  finishes *sending*, which is well before the browser finishes *playing*.
+
+Going fully deaf during narration was the original design and it was wrong: a
+child who speaks up while the story is being told was heard by nothing at all,
+and a five-year-old neither waits for a turn nor reaches for a button. Accepting
+a real interruption kills playback instantly — including flushing the browser's
+queued audio, or the narrator keeps talking over the child who just interrupted.
+
+The talk button does the same thing explicitly, and is now a fallback rather than
+the only way in.
 
 ### 8.3 Playback
 Cartesia streaming output is forwarded over the WebSocket and played via Web Audio with a small jitter buffer. Target: first audible audio < 1s. While the child reads passage N, beat N+1 is already generated.

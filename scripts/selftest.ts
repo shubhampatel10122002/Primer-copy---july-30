@@ -14,7 +14,7 @@ import { AUDIO } from '../lib/env';
 import { floatPcmToWav } from '../lib/wav';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
-import { detectOffScript } from '../lib/offscript';
+import { detectOffScript, looksLikeEcho, isInterruption } from '../lib/offscript';
 import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
 import { shouldCheckIn, summarizeProgress, parseYesNo } from '../lib/sessionflow';
 import {
@@ -23,7 +23,10 @@ import {
   hasEnoughToStart,
   isFreshProfile,
   draftToInterests,
+  trimSpokenTurn,
+  repeatsPrevious,
 } from '../lib/profile';
+import { fallbackPlan } from '../lib/llm/planner';
 import type { ChildMemory, TrackedWord, WordAssessment } from '../lib/types';
 
 let passed = 0;
@@ -628,6 +631,87 @@ console.log('\nOnboarding profile');
   const interests = draftToInterests(draft);
   ok('the first interest carries the most weight', interests[0].weight >= interests[1].weight);
   ok('interest weights stay in range', interests.every((i) => i.weight >= 0.6 && i.weight <= 1));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nBarge-in (hearing the child over our own voice)');
+// --------------------------------------------------------------------------
+{
+  const speaking = 'Blue the dragon flew over the tall green hill.';
+
+  // Our own voice coming back through the speaker.
+  ok('exact echo is echo', looksLikeEcho('Blue the dragon flew over', speaking));
+  ok('partial echo is echo', looksLikeEcho('over the tall green hill', speaking));
+  ok('nothing heard counts as echo', looksLikeEcho('', speaking));
+
+  // The child, talking over it.
+  ok('"I am bored" is not echo', !looksLikeEcho('I am bored', speaking));
+  ok('"can we do cars instead" is not echo', !looksLikeEcho('can we do cars instead', speaking));
+
+  // What actually gets to interrupt the story.
+  ok('a cue interrupts', isInterruption('I am bored', speaking));
+  ok('one cue word is enough', isInterruption('stop', speaking));
+  ok('a real sentence interrupts', isInterruption('can we do cars instead', speaking));
+  ok('our own voice never interrupts', !isInterruption('the dragon flew over the hill', speaking));
+  ok('a stray syllable does not interrupt', !isInterruption('uh', speaking));
+  ok('two tiny words do not interrupt', !isInterruption('oh a', speaking));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nSpoken turn length and repetition');
+// --------------------------------------------------------------------------
+{
+  ok('a short turn is untouched', trimSpokenTurn('Hi! What is your name?') === 'Hi! What is your name?');
+
+  // The question is always the last sentence, so it must survive the cut.
+  const rambling =
+    'Oh wow, cars are wonderful. I love cars too. They go so fast. My favourite is a red one. What kind of car do you like best?';
+  const trimmed = trimSpokenTurn(rambling);
+  ok('a rambling turn is cut down', trimmed.split(/(?<=[.!?])\s+/).length === 2, trimmed);
+  ok('the reaction survives', trimmed.startsWith('Oh wow, cars are wonderful.'), trimmed);
+  ok('the question survives', trimmed.endsWith('What kind of car do you like best?'), trimmed);
+
+  // Two greetings in a row is what made one voice sound like two people.
+  ok(
+    'a repeated greeting is caught',
+    repeatsPrevious("Hi there! I'm Ollie, and I'm happy you came to read with me.", "Hi there! I'm Ollie. I'm so happy you came to read with me."),
+  );
+  ok(
+    'a genuine next question is not a repeat',
+    !repeatsPrevious('What do you love most?', "Hi there! I'm Ollie. I'm so happy you came to read with me."),
+  );
+  ok('nothing to compare against is not a repeat', !repeatsPrevious('Hello!', null));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nPlanner fallback (must never be about somebody else)');
+// --------------------------------------------------------------------------
+{
+  const child = { id: 'x', name: 'Sam', age: 5, onboarding_notes: null };
+  const carsMemory: ChildMemory = {
+    interests: [
+      { topic: 'dinosaurs', weight: 0.4, last_seen: '' },
+      { topic: 'cars', weight: 0.9, last_seen: '' },
+    ],
+    personality_notes: '',
+    canon: {},
+  };
+
+  // The failure this exists to prevent: a child spends a minute talking about
+  // cars, the planner throws on a schema technicality, and they get a dragon.
+  const personalized = fallbackPlan(child, ['short_a'], carsMemory);
+  ok('the fallback uses their top interest', personalized.premise.includes('cars'), personalized.premise);
+  ok('no dragon in sight', !JSON.stringify(personalized).toLowerCase().includes('dragon'));
+  ok('every beat is about them', personalized.beats.every((b) => b.includes('Sam')));
+  ok(
+    'practice words come from the target skill',
+    personalized.vocab_constraints.must_use_words.includes('cat'),
+    JSON.stringify(personalized.vocab_constraints.must_use_words),
+  );
+
+  const blank = fallbackPlan(child, ['short_a']);
+  ok('with no interests it still names the child', blank.premise.includes('Sam'));
+  ok('and stays within the passage limits', blank.vocab_constraints.max_sentence_words <= 12);
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

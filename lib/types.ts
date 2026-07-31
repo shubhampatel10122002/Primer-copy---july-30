@@ -135,8 +135,11 @@ export type ServerMessage =
   | { t: 'passage'; text: string; words: string[] }
   | { t: 'word'; index: number; status: TrackedWord['status']; score: number | null; errorType: ErrorType | null }
   | { t: 'cursor'; index: number }
-  | { t: 'tts_start' }
+  /** bargeIn: keep capturing during playback so the child can interrupt by voice. */
+  | { t: 'tts_start'; bargeIn?: boolean }
   | { t: 'tts_end' }
+  /** Drop whatever is still queued — the child interrupted and we have stopped. */
+  | { t: 'stop_playback' }
   | { t: 'talk_open' }
   | { t: 'talk_closed'; transcript: string | null; intent: Intent | null }
   /** The mic is open for a conversational reply (onboarding, check-in). */

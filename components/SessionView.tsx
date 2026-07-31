@@ -117,19 +117,35 @@ export default function SessionView() {
       case 'tts_start':
         setSpeaking(true);
         setAudioBytes(0);
-        // Belt and suspenders: pause capture client-side too. PLAN.md §8.2
-        engineRef.current?.setMuted(true);
+        // Keep capturing so the child can talk over Ollie. The server sends these
+        // frames to the barge-in recognizer ONLY, and checks everything it hears
+        // against the words being spoken before acting on it — so the "never
+        // listen to ourselves" half of §8.2 still holds, it just holds on the
+        // server instead of by going deaf.
+        //
+        // getUserMedia already has echoCancellation on (lib/client/audio.ts),
+        // which is what makes this viable on laptop speakers.
+        engineRef.current?.setMuted(msg.bargeIn === false);
         if (gateTimer.current) clearTimeout(gateTimer.current);
+        break;
+
+      case 'stop_playback':
+        // A barge-in was accepted. Drop the queued tail and any caption waiting
+        // on audio that will now never play.
+        flushCaptions();
+        engineRef.current?.stopPlayback();
+        setSpeaking(false);
         break;
 
       case 'tts_end':
         setSpeaking(false);
         // The server sends this when it finishes *sending* audio, which is before
-        // the browser has finished *playing* it — so wait out whatever is still
-        // queued, then 300ms more for the speaker tail. Reopening on the server's
-        // clock would let the mic hear the end of Ollie's own sentence, which now
-        // matters much more: it would be transcribed as the child's answer.
+        // the browser has finished *playing* it. The barge-in recognizer is closed
+        // by now, so anything captured during that tail would land in
+        // pronunciation assessment as the child's reading — mute until the
+        // speaker is genuinely quiet, then 300ms more.
         if (gateTimer.current) clearTimeout(gateTimer.current);
+        engineRef.current?.setMuted(true);
         gateTimer.current = setTimeout(
           () => engineRef.current?.setMuted(false),
           (engineRef.current?.playbackRemainingMs() ?? 0) + 300,
