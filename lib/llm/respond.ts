@@ -1,4 +1,4 @@
-import { generateObject } from 'ai';
+import { streamObject } from 'ai';
 import { z } from 'zod';
 import { model } from './client';
 import { trimSpokenTurn } from '../profile';
@@ -25,6 +25,18 @@ import type { Intent } from '../types';
  * depended on this call in the first place.
  */
 
+/**
+ * Field order is load-bearing, because the object is streamed.
+ *
+ * `intent` first: it is one token, it arrives almost immediately, and it is the
+ * thing that decides whether the generated reply is allowed to be spoken at all.
+ * A sensitive topic gets a fixed template and NOTHING improvised (PLAN.md §5) —
+ * speaking first and classifying afterwards would be exactly the wrong order for
+ * the one path where it matters most.
+ *
+ * `speak_text` second: the only field the child is waiting on. Everything after
+ * it is bookkeeping for the state machine, and the voice no longer waits for it.
+ */
 const schema = z.object({
   intent: z.enum([
     'help_with_word',
@@ -59,7 +71,22 @@ export interface ChildResponse {
   interestTopic: string | null;
   fact: string | null;
   factKind: FactKind | null;
+  /** True when `onReplyReady` spoke it already, so the caller does not repeat it. */
+  alreadySpoken: boolean;
 }
+
+/**
+ * Handed the reply the moment it is complete, before the rest of the object has
+ * finished generating. The intent comes with it so the caller can decline to
+ * speak — a sensitive topic must never be improvised.
+ *
+ * Return your speaking promise and it will be awaited before the full result
+ * resolves. Return false to say nothing.
+ */
+export type OnReplyReady = (
+  speakText: string,
+  intent: Intent,
+) => boolean | void | Promise<boolean | void>;
 
 export async function respondToChild(args: {
   childName: string;
@@ -83,6 +110,8 @@ export async function respondToChild(args: {
   socraticLimit: number;
   /** How they got our attention. */
   source: 'off_script' | 'barge_in' | 'aside';
+  /** Called as soon as the spoken reply is ready — usually well before the rest. */
+  onReplyReady?: OnReplyReady;
 }): Promise<ChildResponse> {
   const fallback: ChildResponse = {
     intent: 'unclear',
@@ -91,12 +120,13 @@ export async function respondToChild(args: {
     interestTopic: null,
     fact: null,
     factKind: null,
+    alreadySpoken: false,
   };
 
   if (!args.transcript || args.transcript.trim().length < 2) return fallback;
 
   try {
-    const { object } = await generateObject({
+    const { partialObjectStream, object } = streamObject({
       model: model.intent(), // fast: this is on the critical path between them and an answer
       schema,
       system: [
@@ -152,14 +182,45 @@ export async function respondToChild(args: {
         .join('\n'),
     });
 
+    // Fire the reply the instant the sentence is finished, which — because
+    // speak_text is second and only `intent` precedes it — is a long way before
+    // the object as a whole is done.
+    //
+    // The stream is always consumed, callback or not: leaving it unread stalls
+    // the request.
+    let spoken: string | null = null;
+    let speaking: boolean | void | Promise<boolean | void> = undefined;
+
+    for await (const partial of partialObjectStream) {
+      if (spoken || !args.onReplyReady) continue;
+      if (!partial.intent || !partial.speak_text) continue;
+
+      // A field that comes AFTER speak_text has appeared, so speak_text will not
+      // grow any further.
+      const complete =
+        partial.requested_topic !== undefined ||
+        partial.interest_topic !== undefined ||
+        partial.fact !== undefined;
+      if (!complete) continue;
+
+      spoken = trimSpokenTurn(partial.speak_text as string, 2);
+      speaking = args.onReplyReady(spoken, partial.intent as Intent);
+    }
+
+    const final = await object;
+    const speakText = spoken ?? trimSpokenTurn(final.speak_text, 2);
+    // The caller may have declined to speak it (a sensitive topic).
+    const wasSpoken = (await speaking) !== false && spoken !== null;
+
     return {
-      intent: object.intent as Intent,
+      intent: final.intent as Intent,
       // Length is arithmetic, not a thing to trust a prompt with.
-      speakText: trimSpokenTurn(object.speak_text, 2),
-      requestedTopic: object.requested_topic,
-      interestTopic: object.interest_topic,
-      fact: object.fact,
-      factKind: (object.fact_kind ?? null) as FactKind | null,
+      speakText,
+      requestedTopic: final.requested_topic,
+      interestTopic: final.interest_topic,
+      fact: final.fact,
+      factKind: (final.fact_kind ?? null) as FactKind | null,
+      alreadySpoken: wasSpoken,
     };
   } catch (err) {
     console.error('[respond] failed, using fallback', err);

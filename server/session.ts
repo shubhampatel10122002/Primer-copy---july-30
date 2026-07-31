@@ -12,7 +12,7 @@ import {
   branchUtterance,
   isInterruption,
   looksLikeEcho,
-  soundsUnfinished,
+  settleDelay,
   startsAnInterruption,
 } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
@@ -71,18 +71,22 @@ const MAX_ONBOARDING_TURNS = 6;
 const ANSWER_LISTEN_MS = 10_000;
 
 /**
- * How long the child must be quiet before we treat their answer as finished.
+ * How long the child must be quiet before we treat their turn as finished.
  *
- * This is the single most important number in the conversation. Too short and
- * we interrupt them between two thoughts — which is exactly what a child
- * experiences as not being listened to. Two and a half seconds is longer than
- * the pause inside a list ("Lamborghini... Bugatti") and shorter than a silence
- * that means "your turn".
+ * These are the most important numbers in the conversation, and the biggest
+ * single component of how long a reply takes — at a flat 2.5s the model was less
+ * than a third of the wait. So the delay is now chosen per utterance
+ * (`settleDelay`): a plainly complete sentence, or an urgent one-word cue, is
+ * answered almost at once, and only a thought still visibly in motion — a
+ * trailing "and", a list that has just started — buys the long window.
+ *
+ * Too short anywhere and we cut them off between two thoughts, which is exactly
+ * what a child experiences as not being listened to. The patience is kept; it is
+ * just spent where it is needed.
  */
-const REPLY_QUIET_MS = 2_500;
-
-/** A trailing "and" or "like" means they are mid-thought. Wait longer. */
-const UNFINISHED_QUIET_MS = 4_000;
+const QUIET_QUICK_MS = 800;
+const QUIET_NORMAL_MS = 2_000;
+const QUIET_PATIENT_MS = 3_800;
 
 /**
  * How long after hearing them we still consider the child to be talking.
@@ -132,6 +136,8 @@ export class Session {
   private speakingText = '';
   /** While this is in the future, the child is mid-sentence and we stay quiet. */
   private childSpeakingUntil = 0;
+  /** The previous partial, so we can judge only the words that just arrived. */
+  private lastPartial = '';
   /**
    * Bumped whenever playback is cut short. Utterances queued behind the one that
    * was interrupted check this and drop themselves — otherwise the narrator
@@ -479,19 +485,25 @@ export class Session {
     if (this.closed) return;
 
     if (this.isSpeaking) {
-      // Stop HERE, on the partial. Waiting for the complete utterance meant
-      // waiting a second or more past the child's first syllable, by which time
-      // the narrator had usually finished its sentence anyway — an interruption
-      // that arrives after you would have stopped regardless is not one.
-      if (startsAnInterruption(text, this.speakingText)) {
+      // Stop HERE, on the partial — and judge only the words that have appeared
+      // since the last one, because everything before them is very likely our own
+      // voice being transcribed back at us.
+      //
+      // The browser's energy detector usually beats this by a couple of hundred
+      // milliseconds; this is the backstop for a child who speaks quietly enough
+      // to stay under the loudness bar but is still perfectly intelligible.
+      const previous = this.lastPartial;
+      this.lastPartial = text;
+      if (startsAnInterruption(text, this.speakingText, previous)) {
         console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
-        this.debug('bargeIn', text);
+        this.debug('bargeIn', { by: 'words', text });
         this.stopSpeaking();
       } else {
         return; // our own echo, or a noise
       }
     }
 
+    this.lastPartial = text;
     this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
     this.lastSpeechAt = Date.now();
     this.nudgeStage = 0;
@@ -510,6 +522,7 @@ export class Session {
    */
   private onChildUtterance(text: string) {
     if (this.closed || !text.trim()) return;
+    this.lastPartial = '';
 
     // Usually we have already stopped, on the partial. This is the backstop for
     // an utterance that arrived without one.
@@ -547,10 +560,13 @@ export class Session {
 
     const quiet = looksLikeReading
       ? READING_SETTLE_MS
-      : soundsUnfinished(text)
-        ? UNFINISHED_QUIET_MS
-        : REPLY_QUIET_MS;
+      : settleDelay(soFar, {
+          quick: QUIET_QUICK_MS,
+          normal: QUIET_NORMAL_MS,
+          patient: QUIET_PATIENT_MS,
+        });
 
+    this.debug('settleIn', quiet);
     if (this.turnTimer) clearTimeout(this.turnTimer);
     this.turnTimer = setTimeout(() => this.closeTurn(), quiet);
   }
@@ -664,7 +680,7 @@ export class Session {
       this.replyTimeout = setTimeout(() => {
         // One more check — they may have started talking during the wait.
         if (this.turnSegments.length > 0 || Date.now() < this.childSpeakingUntil) {
-          this.replyTimeout = setTimeout(() => finish(null), REPLY_QUIET_MS + 1_000);
+          this.replyTimeout = setTimeout(() => finish(null), QUIET_PATIENT_MS + 1_000);
           return;
         }
         finish(null);
@@ -688,6 +704,20 @@ export class Session {
         if (this.answerFromUi) this.answerFromUi(msg.value);
         else this.stashedAnswer = msg.value;
         break;
+      // The browser heard a voice over our own playback and has already stopped
+      // it. No transcript is involved and none is waited for: the words arrive a
+      // moment later through the ear and decide what it MEANT. This only decides
+      // that we stop.
+      case 'barge_in':
+        if (this.isSpeaking) {
+          console.log(`[barge-in] heard over playback (rms ${msg.level} > ${msg.floor})`);
+          this.debug('bargeIn', { by: 'sound', level: msg.level, floor: msg.floor });
+          this.stopSpeaking();
+        }
+        // Either way they are talking, so hold anything queued.
+        this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
+        break;
+
       case 'resume':
         if (this.mode === 'PAUSED') {
           this.lastSpeechAt = Date.now();
@@ -783,6 +813,7 @@ export class Session {
 
     this.isSpeaking = true;
     this.speakingText = text;
+    this.lastPartial = '';
     this.gateOpenAt = Number.MAX_SAFE_INTEGER; // no scoring over our own voice
     this.send({ t: 'tts_start' });
     this.send({ t: 'speak', text });
@@ -1382,6 +1413,15 @@ export class Session {
         ? this.tracker.words[this.tracker.cursor].expected
         : null;
 
+    const askedAt = Date.now();
+
+    // Start speaking the moment the sentence exists, rather than when the whole
+    // structured object has finished generating. The intent and the fact are for
+    // us; the child is only waiting on the words.
+    //
+    // Sensitive topics are the one thing that must NOT be improvised, so nothing
+    // is spoken early until we know it is not one — that path uses a fixed
+    // template (PLAN.md §5) and is worth the extra moment.
     const reply = await respondToChild({
       childName: this.child.name,
       transcript,
@@ -1393,6 +1433,15 @@ export class Session {
       socraticSoFar: this.socraticCount,
       socraticLimit: MAX_SOCRATIC_QUESTIONS,
       source,
+      onReplyReady: async (speakText, intent) => {
+        if (this.closed || this.mode === 'END') return false;
+        // The one thing that is never improvised. A fixed comfort template
+        // follows in actOnIntent; say nothing until then.
+        if (intent === 'sensitive_topic') return false;
+        this.debug('replyLatencyMs', Date.now() - askedAt);
+        await this.speak(speakText);
+        return true;
+      },
     });
 
     this.debug('lastIntent', { transcript, intent: reply.intent, source, requestedTopic: reply.requestedTopic });
@@ -1401,7 +1450,7 @@ export class Session {
     // Remember before replying, so anything generated afterwards already knows it.
     this.rememberFact(reply.fact, reply.interestTopic, reply.factKind);
 
-    await this.actOnIntent(reply.intent, transcript, reply);
+    await this.actOnIntent(reply.intent, transcript, reply, reply.alreadySpoken);
   }
 
   /** The child's strongest known interest — what to steer towards when they only said "no". */
@@ -1437,7 +1486,17 @@ export class Session {
    * decides only what the SESSION does afterwards. Which is the split that has
    * to hold: the model chose the words, code chooses the mode.
    */
-  private async actOnIntent(intent: Intent, transcript: string, reply: ChildResponse) {
+  private async actOnIntent(
+    intent: Intent,
+    transcript: string,
+    reply: ChildResponse,
+    alreadySpoken = false,
+  ) {
+    /** The reply may already be in the air — never say it twice. */
+    const sayReply = async () => {
+      if (!alreadySpoken) await this.speak(reply.speakText);
+    };
+
     switch (intent) {
       // Never improvised, never from the model, always flagged. PLAN.md §5.
       case 'sensitive_topic': {
@@ -1446,6 +1505,8 @@ export class Session {
         await this.flag('sensitive_topic', transcript);
         this.send({ t: 'flag', type: 'sensitive_topic', detail: transcript });
         this.log('narrator', line, { template: 'sensitive_topic' });
+        // The generated reply is void here even if it has already been spoken —
+        // this template is the answer, and it follows immediately.
         await this.speak(line);
         this.resumeReading();
         return;
@@ -1463,7 +1524,7 @@ export class Session {
 
         // Say something back BEFORE any of the story work. Rebuilding a plan is
         // seconds of silence, and they have just told us they are not enjoying it.
-        await this.speak(reply.speakText);
+        await sayReply();
 
         // "I'm bored" is a change request with nothing to change to. Rebuilding
         // the story around the word "bored" is not an answer — asking them what
@@ -1530,7 +1591,7 @@ export class Session {
         // count and answered accordingly.
         this.socraticCount = this.socraticCount >= MAX_SOCRATIC_QUESTIONS ? 0 : this.socraticCount + 1;
         this.setMode('SOCRATIC', `question #${this.socraticCount}`);
-        await this.speak(reply.speakText);
+        await sayReply();
         this.resumeReading();
         return;
 
@@ -1539,14 +1600,14 @@ export class Session {
           this.interestSignals.push(reply.interestTopic);
           this.debug('interestSignals', this.interestSignals);
         }
-        await this.speak(reply.speakText);
+        await sayReply();
         this.resumeReading();
         return;
 
       // help_with_word, unclear, and anything else: say the reply and carry on.
       // There is no branch here that stays silent.
       default:
-        await this.speak(reply.speakText);
+        await sayReply();
         this.resumeReading();
         return;
     }

@@ -118,6 +118,12 @@ export interface WordAssessment {
 
 export type ClientMessage =
   | { t: 'start' }
+  /**
+   * The browser heard the child's voice over our own playback and has already
+   * stopped it locally. Sent from an energy detector, not from a transcript —
+   * waiting for words is waiting too long.
+   */
+  | { t: 'barge_in'; level: number; floor: number }
   | { t: 'resume' }
   | { t: 'stop' }
   /** Tapping the on-screen answer to a yes/no question, instead of saying it. */

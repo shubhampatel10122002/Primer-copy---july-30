@@ -7,6 +7,18 @@ import PassageView, { type WordState } from './PassageView';
 import DebugPanel from './DebugPanel';
 import type { Intent, Mode, ServerMessage, SessionPlan } from '@/lib/types';
 
+/**
+ * Barge-in sensitivity.
+ *
+ * MIN_RMS is an absolute floor so a silent room cannot trigger on nothing.
+ * OVER_FLOOR is how many times louder than the echo residual a sound has to be.
+ * FRAMES is how many consecutive level reports (~11ms each) must clear the bar,
+ * so a door closing does not cut Ollie off mid-sentence.
+ */
+const BARGE_IN_MIN_RMS = 0.03;
+const BARGE_IN_OVER_FLOOR = 3.5;
+const BARGE_IN_FRAMES = 4;
+
 const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ??
   (typeof window !== 'undefined'
@@ -45,6 +57,18 @@ export default function SessionView() {
   const engineRef = useRef<AudioEngine | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const gateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Barge-in detector state.
+   *
+   * `speakingRef` mirrors `speaking` for the audio callback, which fires ~90
+   * times a second and must not go through React state. `floorRef` is the echo
+   * residual: how loud the microphone is while WE are talking and the child is
+   * not. Everything above that floor is a person.
+   */
+  const speakingRef = useRef(false);
+  const floorRef = useRef(0.004);
+  const loudFramesRef = useRef(0);
+  const bargedRef = useRef(false);
   /** Caption updates waiting for the previous utterance to finish playing. */
   const captionTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
@@ -115,6 +139,9 @@ export default function SessionView() {
 
       case 'tts_start':
         setSpeaking(true);
+        speakingRef.current = true;
+        bargedRef.current = false;
+        loudFramesRef.current = 0;
         setAudioBytes(0);
         // The microphone stays live. The child can talk over Ollie at any moment
         // and must be heard when they do; the server routes these frames to the
@@ -134,10 +161,12 @@ export default function SessionView() {
         flushCaptions();
         engineRef.current?.stopPlayback();
         setSpeaking(false);
+        speakingRef.current = false;
         break;
 
       case 'tts_end':
         setSpeaking(false);
+        speakingRef.current = false;
         // Capture keeps running here too. The server stops feeding pronunciation
         // assessment while its own audio is in the room, so the tail is handled
         // there; muting locally would only create a window where the child is
@@ -233,6 +262,53 @@ export default function SessionView() {
 
   function onMicReady(engine: AudioEngine) {
     engineRef.current = engine;
+
+    /**
+     * Stop on SOUND, not on words.
+     *
+     * The transcript-based barge-in was always going to be too slow, and worse
+     * than slow: while Ollie is talking, Azure is busy transcribing Ollie, so a
+     * partial that contains our voice AND the child's reads as mostly ours and
+     * gets thrown away as echo. The child speaks and nothing happens.
+     *
+     * Loudness has neither problem. Echo cancellation leaves a small, steady
+     * residual while we play; a child's voice is several times that and arrives
+     * within a frame. Roughly 45ms of sound above the residual floor is enough
+     * to know somebody is talking, and playback stops HERE, in the browser, with
+     * no round-trip between the child speaking and the voice stopping.
+     *
+     * The transcript still arrives a moment later and still decides what the
+     * words meant. This only decides when to shut up.
+     */
+    engine.onLevel = (rms) => {
+      if (!speakingRef.current) {
+        // Quiet times are how we learn what the room sounds like when nobody is
+        // talking over us. Decay slowly so one cough cannot raise the bar.
+        floorRef.current = Math.max(0.003, floorRef.current * 0.995);
+        return;
+      }
+      if (bargedRef.current) return;
+
+      const threshold = Math.max(BARGE_IN_MIN_RMS, floorRef.current * BARGE_IN_OVER_FLOOR);
+      if (rms > threshold) {
+        loudFramesRef.current += 1;
+        if (loudFramesRef.current >= BARGE_IN_FRAMES) {
+          bargedRef.current = true;
+          // Stop the voice first, tell the server second. The child should not
+          // wait on a network hop to be listened to.
+          flushCaptions();
+          engineRef.current?.stopPlayback();
+          setSpeaking(false);
+          speakingRef.current = false;
+          send({ t: 'barge_in', level: Number(rms.toFixed(4)), floor: Number(threshold.toFixed(4)) });
+        }
+      } else {
+        loudFramesRef.current = 0;
+        // Track the residual while we are talking and they are not.
+        floorRef.current = floorRef.current * 0.9 + rms * 0.1;
+      }
+    };
+
     setMicReady(true);
     connect(engine);
   }

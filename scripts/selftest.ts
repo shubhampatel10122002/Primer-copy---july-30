@@ -20,6 +20,7 @@ import {
   isInterruption,
   startsAnInterruption,
   soundsUnfinished,
+  settleDelay,
 } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
 import { shouldCheckIn, summarizeProgress, parseYesNo } from '../lib/sessionflow';
@@ -664,6 +665,50 @@ console.log('\nBarge-in (hearing the child over our own voice)');
   ok(
     'partials are stopped on sooner than finals are acted on',
     startsAnInterruption('can we', speaking) && !isInterruption('can we', speaking),
+  );
+
+  // The trap: while we talk, Azure transcribes US, so by the time the child cuts
+  // in the partial is mostly our own words. Scored whole it reads as echo and
+  // the child is ignored. Only the words that just arrived are theirs.
+  const contaminated = 'Blue the dragon flew over the tall can we do cars';
+  ok(
+    'echo-contaminated partial reads as echo when scored whole',
+    looksLikeEcho(contaminated, speaking),
+  );
+  ok(
+    'but the new words still interrupt',
+    startsAnInterruption(contaminated, speaking, 'Blue the dragon flew over the tall'),
+    JSON.stringify({ contaminated }),
+  );
+  ok(
+    'more of our own voice arriving does not interrupt',
+    !startsAnInterruption('Blue the dragon flew over the tall green', speaking, 'Blue the dragon flew over'),
+  );
+}
+
+// --------------------------------------------------------------------------
+console.log('\nHow long to wait before answering');
+// --------------------------------------------------------------------------
+{
+  const ms = { quick: 800, normal: 2000, patient: 3800 };
+  const delay = (text: string) => settleDelay(text, ms);
+
+  // The long wait is for thoughts still in motion.
+  ok('a trailing "and" waits longest', delay('I like cars and') === ms.patient);
+  ok('a trailing "like" waits longest', delay('I like cars, like') === ms.patient);
+  ok('one bare word waits longest', delay('Lamborghini') === ms.patient);
+
+  // A child who starts "I like..." is usually about to list three more things.
+  ok('a list opener gets the normal wait', delay('I like cars and trucks') === ms.normal);
+  ok('"my dog is called Max" gets the normal wait', delay('my dog is called Max') === ms.normal);
+
+  // Everything else gets answered quickly — this is where the latency went.
+  ok('a finished sentence is quick', delay('can we read about trucks instead') === ms.quick);
+  ok('an urgent cue is quick', delay('bored') === ms.quick);
+  ok('"stop" is quick', delay('stop') === ms.quick);
+  ok(
+    'quick really is quicker than the old flat wait',
+    delay('can we read about trucks instead') < 2_500,
   );
 }
 
