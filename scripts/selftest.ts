@@ -18,6 +18,7 @@ import {
   branchUtterance,
   looksLikeEcho,
   isInterruption,
+  startsAnInterruption,
   soundsUnfinished,
 } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
@@ -652,6 +653,18 @@ console.log('\nBarge-in (hearing the child over our own voice)');
   ok('our own voice never interrupts', !isInterruption('the dragon flew over the hill', speaking));
   ok('a stray syllable does not interrupt', !isInterruption('uh', speaking));
   ok('two tiny words do not interrupt', !isInterruption('oh a', speaking));
+
+  // Stopping on a PARTIAL is what makes an interruption feel immediate: a final
+  // arrives a second past the child's first syllable, by which point the
+  // narrator has usually finished the sentence anyway.
+  ok('two words stop us mid-sentence', startsAnInterruption('can we', speaking));
+  ok('one cue word stops us', startsAnInterruption('bored', speaking));
+  ok('a partial of our own line does not', !startsAnInterruption('the dragon flew', speaking));
+  ok('a single stray syllable does not', !startsAnInterruption('uh', speaking));
+  ok(
+    'partials are stopped on sooner than finals are acted on',
+    startsAnInterruption('can we', speaking) && !isInterruption('can we', speaking),
+  );
 }
 
 // --------------------------------------------------------------------------
