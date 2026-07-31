@@ -3,10 +3,29 @@ import { AUDIO } from '../lib/env';
 import { query, one } from '../lib/db';
 import { Narrator, type NarratorMode, type NarratorTurn } from '../lib/llm/narrator';
 import { classifyIntent } from '../lib/llm/intent';
-import { generateSessionPlan, fallbackPlan } from '../lib/llm/planner';
+import { generateSessionPlan, fallbackPlan, extendPlanBeats } from '../lib/llm/planner';
 import { generateAcknowledgment } from '../lib/llm/acknowledge';
+import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
+import { detectOffScript } from '../lib/offscript';
+import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
+import {
+  shouldCheckIn,
+  summarizeProgress,
+  parseYesNo,
+  HARD_STOP_MS,
+} from '../lib/sessionflow';
+import {
+  emptyDraft,
+  mergeDraft,
+  hasEnoughToStart,
+  canStartAtAll,
+  isFreshProfile,
+  draftToNotes,
+  draftToInterests,
+  type OnboardingDraft,
+} from '../lib/profile';
 import * as T from '../lib/templates';
 import { PronunciationSession, TalkRecognizer } from './azure';
 import { tts, type SpeakHandle } from './cartesia';
@@ -20,10 +39,12 @@ import type {
   Mode,
   ServerMessage,
   SessionPlan,
+  TrackedWord,
   TranscriptEntry,
 } from '../lib/types';
 
-const SESSION_MAX_MS = 15 * 60 * 1000;
+/** How long a stretch of reading runs before the narrator offers a natural stop. */
+const SESSION_SOFT_MAX_MS = 15 * 60 * 1000;
 const SILENCE_NUDGE_MS = 8_000;
 const SILENCE_CHECKIN_MS = 28_000;
 const SILENCE_PAUSE_MS = 45_000;
@@ -32,6 +53,18 @@ const TALK_TIMEOUT_MS = 5_000;
 const MAX_COACH_ATTEMPTS = 2;
 const ADAPT_COACH_THRESHOLD = 3;
 const MAX_SOCRATIC_QUESTIONS = 3;
+
+/**
+ * Onboarding: how long to wait for a reply, and how many questions is too many.
+ *
+ * Generous on purpose. Azure fires as soon as the child stops talking, so a long
+ * window costs nothing when they answer — it only costs when they say nothing,
+ * and waiting on a shy four-year-old is much better than talking over them.
+ */
+const ONBOARDING_LISTEN_MS = 12_000;
+const MAX_ONBOARDING_TURNS = 6;
+/** How long to wait for "yes, keep going" before asking again. */
+const ANSWER_LISTEN_MS = 10_000;
 
 export class Session {
   private mode: Mode = 'IDLE';
@@ -53,7 +86,12 @@ export class Session {
   private interestSignals: string[] = [];
   private pendingEvents: any[] = [];
 
+  /** Everything the child has volunteered today, and when the story may use it. */
+  private facts = new FactLedger();
+  private draft: OnboardingDraft = emptyDraft();
+
   private coachAttempts = new Map<number, number>();
+  private celebrated = new Set<number>();
   private coachEventsThisPassage = 0;
   private strongPassages = 0;
   private socraticCount = 0;
@@ -61,6 +99,19 @@ export class Session {
 
   private bufferedTurn: Promise<NarratorTurn> | null = null;
   private bufferToken = 0;
+  /** The fact spoken for in the buffered beat — released if that beat is dropped. */
+  private bufferedFactId: number | null = null;
+
+  /** Passages read so far, for the progress summary at a check-in. */
+  private passageRecords: TrackedWord[][] = [];
+  private passagesSinceCheckIn = 0;
+  private lastCheckInAt = Date.now();
+  private checkIns = 0;
+
+  /** Resolvers for an open conversational listen and an on-screen yes/no tap. */
+  private endListen: ((text: string | null) => void) | null = null;
+  private answerFromUi: ((value: 'yes' | 'no') => void) | null = null;
+  private stashedAnswer: 'yes' | 'no' | null = null;
 
   private lastSpeechAt = Date.now();
   private nudgeStage = 0;
@@ -112,19 +163,36 @@ export class Session {
   async start() {
     this.tick = setInterval(() => this.onTick(), 500);
 
+    // A child with no profile is met, not greeted: we cannot personalise a story
+    // for someone we know nothing about, and planning before onboarding would
+    // produce a story about a stranger.
+    const fresh = isFreshProfile(this.child, this.memory);
+    if (fresh) {
+      await this.runOnboarding();
+      if (this.closed) return;
+    }
+
     // Speak a template greeting FIRST, with no LLM in the way. Planning plus the
     // opening narrator turn is several seconds of round-trips; a child staring at
     // a silent screen for that long assumes it is broken. This also means the
     // very first thing that happens in a session exercises the whole audio path.
-    this.setMode('NARRATE', 'greeting');
-    const greeting = this.speak(T.openingLine(this.child.name));
+    //
+    // After onboarding the same slot is filled by the hand-off line, which is
+    // already spoken by then — so all that is left is to say the story is coming.
+    this.setMode('NARRATE', fresh ? 'making their story' : 'greeting');
+    const greeting = this.speak(
+      fresh ? T.makingStoryLine(this.child.name) : T.openingLine(this.child.name),
+    );
 
     // Resolve the plan while the greeting is playing.
     const planning = (async (): Promise<SessionPlan> => {
-      const stored = await one<{ plan: SessionPlan }>(
-        'SELECT plan FROM next_plans WHERE child_id = $1',
-        [this.child.id],
-      );
+      // A stored plan was written for the profile that existed before onboarding;
+      // a brand-new child gets a fresh one.
+      const stored = fresh
+        ? null
+        : await one<{ plan: SessionPlan }>('SELECT plan FROM next_plans WHERE child_id = $1', [
+            this.child.id,
+          ]);
       if (stored?.plan) return stored.plan;
 
       const targets = pickTargets(this.mastery);
@@ -162,10 +230,175 @@ export class Session {
     );
   }
 
+  // -------------------------------------------------------------------------
+  // ONBOARDING (a child we have never met)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Learn enough about a new child to make them a story.
+   *
+   * The loop is the authority, not the agent: it caps how many questions a child
+   * can be asked, it decides when there is enough to start (lib/profile.ts), and
+   * it stops asking someone who has gone quiet. The agent only picks the words.
+   */
+  private async runOnboarding() {
+    this.setMode('ONBOARDING', 'no profile yet');
+    const agent = new OnboardingAgent();
+
+    // Something friendly before the first round-trip, for the same reason the
+    // returning-child greeting is templated: silence at the start reads as broken.
+    await this.speak(T.helloStrangerLine());
+
+    let heard: string | null = null;
+    let silences = 0;
+
+    for (let turn = 0; turn < MAX_ONBOARDING_TURNS; turn++) {
+      const reply = await agent.turn(heard, this.draft);
+      if (this.closed) return;
+
+      this.draft = mergeDraft(this.draft, reply.learned);
+      this.send({
+        t: 'profile',
+        name: this.draft.name,
+        age: this.draft.age,
+        interests: this.draft.interests,
+      });
+      this.debug('onboardingDraft', this.draft);
+
+      await this.speak(reply.speak);
+      if (this.closed) return;
+
+      // The agent may say it is ready; whether it actually is, is decided here.
+      // One follow-up minimum, so nobody is hustled from "I'm Sam" to a story.
+      if (hasEnoughToStart(this.draft) && (reply.ready || turn >= 1)) break;
+
+      heard = await this.listen(ONBOARDING_LISTEN_MS);
+      if (heard) {
+        this.log('child_talk', heard);
+        silences = 0;
+      } else if (++silences >= 2 && canStartAtAll(this.draft)) {
+        // Twice with no answer. Start with what we have rather than interviewing
+        // an empty room — a story is a better invitation than another question.
+        break;
+      }
+    }
+
+    const finale = await agent.finale(this.draft);
+    await this.persistOnboarding();
+    if (this.closed) return;
+    await this.speak(finale);
+  }
+
+  /**
+   * Write the new profile before the story is planned, since the planner reads
+   * it. In-memory first: a failed write should cost the next session, not this one.
+   */
+  private async persistOnboarding() {
+    const notes = draftToNotes(this.draft);
+    const personality = this.draft.notes.join(' ');
+    const interests = draftToInterests(this.draft);
+
+    this.child = {
+      ...this.child,
+      // Without a name every template line reads "Hi !". "friend" is also a
+      // placeholder (lib/profile.ts), so a child who never told us their name is
+      // asked again next time rather than being stuck as "friend" forever.
+      name: this.draft.name ?? (this.child.name?.trim() || 'friend'),
+      age: this.draft.age ?? this.child.age,
+      onboarding_notes: notes || this.child.onboarding_notes,
+    };
+    this.memory = {
+      ...this.memory,
+      interests: interests.length ? interests : this.memory.interests,
+      personality_notes: personality || this.memory.personality_notes,
+    };
+
+    try {
+      await query(
+        `UPDATE children SET name = COALESCE($2, name), age = COALESCE($3, age), onboarding_notes = $4
+         WHERE id = $1`,
+        [this.child.id, this.draft.name, this.draft.age, notes || null],
+      );
+      await query(
+        `INSERT INTO child_memory (child_id, interests, personality_notes, canon)
+         VALUES ($1, $2, $3, '{}')
+         ON CONFLICT (child_id) DO UPDATE
+           SET interests = EXCLUDED.interests,
+               personality_notes = EXCLUDED.personality_notes,
+               version = child_memory.version + 1,
+               updated_at = now()`,
+        [this.child.id, JSON.stringify(this.memory.interests), this.memory.personality_notes],
+      );
+      // Any stored plan was written for the profile that just got replaced.
+      await query('DELETE FROM next_plans WHERE child_id = $1', [this.child.id]);
+    } catch (err) {
+      console.error('[session] failed to save the onboarding profile', err);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Conversational listening (no button)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open the mic for one spoken reply and wait for it.
+   *
+   * The counterpart to the talk button: when the narrator asks a direct question
+   * — during onboarding, or at a check-in — the child should just answer, not go
+   * looking for a control. Resolves null if nothing intelligible arrives in time.
+   */
+  private listen(timeoutMs: number): Promise<string | null> {
+    return new Promise((resolve) => {
+      if (this.closed) {
+        resolve(null);
+        return;
+      }
+
+      let timer: NodeJS.Timeout;
+      let settled = false;
+      const finish = (text: string | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.endListen = null;
+        const recognizer = this.talk;
+        this.talk = null;
+        void recognizer?.close();
+        this.send({ t: 'listening', on: false });
+        resolve(text);
+      };
+
+      this.endListen = finish;
+      this.send({ t: 'listening', on: true });
+      this.talk = new TalkRecognizer({
+        onPartial: (text) => this.debug('talkPartial', text),
+        onFinal: (text) => finish(text),
+        onError: (m) => console.error('[azure listen]', m),
+      });
+
+      // Do not start the clock until the mic is actually open. The half-duplex
+      // gate is still shut for the tail of the question we just asked, and a
+      // window that expires while the child is still being spoken to reads to
+      // them as being ignored — the exact thing this is here to prevent.
+      const gateDelay = Math.max(0, this.gateOpenAt - Date.now());
+      timer = setTimeout(() => finish(null), gateDelay + timeoutMs);
+    });
+  }
+
+  private stopListening() {
+    this.endListen?.(null);
+  }
+
   async handleMessage(msg: ClientMessage) {
     switch (msg.t) {
       case 'start':
         if (this.mode === 'IDLE') await this.start();
+        break;
+      case 'answer':
+        // Tapped rather than spoken. Stash it if nothing is waiting yet, so a
+        // fast tap during the question is not thrown away.
+        if (this.answerFromUi) this.answerFromUi(msg.value);
+        else this.stashedAnswer = msg.value;
         break;
       case 'talk_start':
         await this.openTalk();
@@ -200,8 +433,10 @@ export class Session {
     if (this.closed) return;
     if (Date.now() < this.gateOpenAt) return; // half-duplex: never listen to ourselves
 
-    if (this.mode === 'TALK') {
-      this.talk?.write(pcm);
+    // An open conversational recognizer always wins: onboarding and check-ins
+    // listen outside TALK mode.
+    if (this.talk) {
+      this.talk.write(pcm);
       return;
     }
     if (this.mode === 'CHILD_READS' || this.mode === 'COACH') {
@@ -214,6 +449,8 @@ export class Session {
     this.closed = true;
     if (this.tick) clearInterval(this.tick);
     if (this.talkTimer) clearTimeout(this.talkTimer);
+    // Anything awaiting a reply must not hang once the socket is gone.
+    this.endListen?.(null);
     this.speaking?.cancel();
     await Promise.all([this.pron?.close(), this.talk?.close()]);
   }
@@ -304,21 +541,37 @@ export class Session {
   private async narrate(
     mode: NarratorMode,
     context: string,
-    prefetched?: NarratorTurn,
-    mustMention?: string | null,
-    speakPrefix?: string | null,
+    opts: {
+      prefetched?: NarratorTurn;
+      mustMention?: string | null;
+      mustMentionAny?: string[];
+      speakPrefix?: string | null;
+      weave?: string | null;
+      /** 'auto' continues the session; 'hold' hands control back to the caller. */
+      after?: 'auto' | 'hold';
+    } = {},
   ) {
     this.setMode('NARRATE');
-    const turn = prefetched ?? (await this.narrator.turn(mode, context, { mustMention }));
+    const turn =
+      opts.prefetched ??
+      (await this.narrator.turn(mode, context, {
+        mustMention: opts.mustMention,
+        mustMentionAny: opts.mustMentionAny,
+        weave: opts.weave,
+      }));
 
     // Prepend rather than speak separately: one Cartesia context instead of two
     // (the free tier allows 2 concurrent), and it reads as a single natural
     // utterance rather than two clips butted together.
-    if (speakPrefix) turn.speak_text = `${speakPrefix} ${turn.speak_text}`;
+    if (opts.speakPrefix) turn.speak_text = `${opts.speakPrefix} ${turn.speak_text}`;
     this.beatIndex = turn.current_beat_index ?? this.beatIndex;
     this.debug('lastNarratorTurn', { mode, ...turn });
 
     await this.speak(turn.speak_text);
+
+    // The caller is running a conversation (a check-in) and decides what happens
+    // next itself.
+    if (opts.after === 'hold') return;
 
     if (turn.child_passage && turn.child_passage.trim()) {
       await this.startPassage(turn.child_passage.trim());
@@ -341,6 +594,7 @@ export class Session {
 
     this.tracker = new PassageTracker(passage);
     this.coachAttempts.clear();
+    this.celebrated.clear();
     this.coachEventsThisPassage = 0;
     this.nudgeStage = 0;
     this.lastSpeechAt = Date.now();
@@ -371,12 +625,20 @@ export class Session {
   /** Keep ONE beat buffered while the child reads. PLAN.md §4 cross-cutting rules. */
   private prefetchNextBeat() {
     const token = ++this.bufferToken;
+    const nextBeat = this.beatIndex + 1;
+
+    // Which detail the child shared this beat is allowed to use, if any. Chosen
+    // here — at the moment the beat is written — and committed only when that
+    // beat is actually spoken. See lib/facts.ts for why it is not the last thing
+    // they said.
+    const fact = this.facts.pickForWeaving(nextBeat);
+    this.bufferedFactId = fact?.id ?? null;
+
     this.bufferedTurn = this.narrator
       .turn(
         'NEXT_BEAT',
-        `The child is currently reading. Prepare beat ${this.beatIndex + 1} of ${
-          this.plan.beats.length
-        }.`,
+        `The child is currently reading. Prepare beat ${nextBeat} of ${this.plan.beats.length}.`,
+        { weave: fact?.text ?? null },
       )
       .then((turn) => {
         if (token !== this.bufferToken) throw new Error('stale buffer');
@@ -388,11 +650,16 @@ export class Session {
   private discardBuffer() {
     this.bufferToken++;
     this.bufferedTurn = null;
+    // The beat that would have carried this detail is gone; it stays unused and
+    // eligible for a later one.
+    this.bufferedFactId = null;
   }
 
   private async nextBeat() {
     if (this.beatIndex >= this.plan.beats.length - 1) {
-      await this.end('story complete');
+      // The planned story is out of road. That is a natural pause, not the end —
+      // celebrate, and let the child decide whether there is more.
+      await this.checkIn('the story reached its last beat');
       return;
     }
 
@@ -408,19 +675,27 @@ export class Session {
       ? generateAcknowledgment({ childName: this.child.name, words: this.tracker.words })
       : Promise.resolve(null);
 
+    const factId = this.bufferedFactId;
     const buffered = this.bufferedTurn ? await this.bufferedTurn.catch(() => null) : null;
     this.discardBuffer();
 
     const ack = await ackPromise;
     if (ack) this.debug('lastAck', { text: ack.text, band: ack.quality.band, source: ack.source });
 
-    await this.narrate(
-      'NEXT_BEAT',
-      `Advance to beat ${this.beatIndex + 1}.`,
-      buffered ?? undefined,
-      null,
-      ack?.text ?? null,
-    );
+    // If the buffered beat survived it already carries the detail; if it did not,
+    // this turn is generated fresh and needs to be told about it.
+    const woven = factId === null ? null : this.facts.find(factId);
+
+    await this.narrate('NEXT_BEAT', `Advance to beat ${this.beatIndex + 1}.`, {
+      prefetched: buffered ?? undefined,
+      speakPrefix: ack?.text ?? null,
+      weave: buffered ? null : (woven?.text ?? null),
+    });
+
+    if (woven) {
+      this.facts.markWoven(woven.id, this.beatIndex);
+      this.debug('wovenFact', { text: woven.text, beat: this.beatIndex });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -433,9 +708,23 @@ export class Session {
 
     this.lastSpeechAt = Date.now();
     this.nudgeStage = 0;
+    this.debug('azureRecognized', recognized);
+
+    // Was that reading, or was it the child talking to us? Being ignored is what
+    // teaches a child that the thing does not really listen, so every utterance
+    // gets this question asked of it. lib/offscript.ts errs towards "reading".
+    const verdict = detectOffScript({ recognized, words: this.tracker.words });
+    if (verdict.offScript) {
+      this.debug('offScript', {
+        recognized,
+        matchRatio: Number(verdict.matchRatio.toFixed(2)),
+        reason: verdict.reason,
+      });
+      await this.handleChildSpeech(recognized, 'off_script');
+      return;
+    }
 
     const result = this.tracker.ingest(words);
-    this.debug('azureRecognized', recognized);
     this.debug('lastWords', this.tracker.summary());
 
     for (const u of result.updates) {
@@ -451,10 +740,29 @@ export class Session {
     this.send({ t: 'cursor', index: this.tracker.cursor });
     void this.flushEvents();
 
+    // A word they were stuck on and just got right. This is the moment worth
+    // marking, and it has to land immediately — a two-second pause for an LLM
+    // after a hard-won word is the wrong kind of silence, so it is templated.
+    const wonBack = result.updates.find(
+      (u) =>
+        u.word.status === 'passed' &&
+        (this.coachAttempts.get(u.index) ?? 0) > 0 &&
+        !this.celebrated.has(u.index),
+    );
+
     if (result.complete) {
+      // The end-of-passage acknowledgment already celebrates; two in a row is a lot.
       await this.onPassageComplete();
       return;
     }
+
+    if (wonBack) {
+      this.celebrated.add(wonBack.index);
+      this.log('coach', `celebrated "${wonBack.word.expected}"`, { word: wonBack.word.expected });
+      await this.speak(T.gotItLine(wonBack.word.expected));
+      this.setMode('CHILD_READS');
+    }
+
     if (result.needsCoaching !== null) {
       await this.coach(result.needsCoaching);
     }
@@ -509,12 +817,30 @@ export class Session {
   private async onPassageComplete() {
     if (!this.tracker) return;
 
+    // Snapshot for the progress summary at the next check-in. A copy, because
+    // the tracker is about to be replaced.
+    this.passageRecords.push(this.tracker.words.map((w) => ({ ...w })));
+    this.passagesSinceCheckIn += 1;
+
     const strong = this.tracker.wasStrong();
     this.strongPassages = strong ? this.strongPassages + 1 : 0;
     this.debug('strongPassages', this.strongPassages);
 
     await this.pron?.close();
     this.pron = null;
+
+    // A check-in outranks an encouragement — it is celebratory in its own right,
+    // and stacking praise on praise right at a stopping point is a lot of noise.
+    if (
+      shouldCheckIn({
+        passagesSinceCheckIn: this.passagesSinceCheckIn,
+        msSinceCheckIn: Date.now() - this.lastCheckInAt,
+        checkIns: this.checkIns,
+      })
+    ) {
+      await this.checkIn('a good stopping point');
+      return;
+    }
 
     if (this.strongPassages >= 2) {
       this.strongPassages = 0;
@@ -530,18 +856,124 @@ export class Session {
       await this.narrate(
         'ENCOURAGE',
         `They read two passages beautifully. Then continue to beat ${this.beatIndex + 1}.`,
-        undefined,
-        praiseWord,
+        { mustMention: praiseWord },
       );
       return;
     }
 
-    if (Date.now() - this.startedAt > SESSION_MAX_MS) {
-      await this.end('15 minutes elapsed');
+    await this.nextBeat();
+  }
+
+  // -------------------------------------------------------------------------
+  // WRAP_UP: celebrate, then ask whether to keep going
+  // -------------------------------------------------------------------------
+
+  /**
+   * A natural pause after a stretch of reading.
+   *
+   * Celebrates the effort, names what actually improved, and asks — genuinely —
+   * whether the child wants more. The words named come from the passages really
+   * read (lib/sessionflow.ts), never from the narrator's recollection of them.
+   */
+  private async checkIn(reason: string) {
+    if (this.closed || this.mode === 'END') return;
+
+    this.checkIns += 1;
+    this.passagesSinceCheckIn = 0;
+    this.lastCheckInAt = Date.now();
+    this.discardBuffer();
+
+    await this.pron?.close();
+    this.pron = null;
+
+    const progress = summarizeProgress(this.passageRecords);
+    this.debug('progress', progress);
+    const named = [...progress.conquered, ...progress.strong].slice(0, 3);
+
+    const context = [
+      `They have read ${progress.passages} passage${progress.passages === 1 ? '' : 's'} today.`,
+      progress.conquered.length
+        ? `Words they were stuck on and then got right: ${progress.conquered.join(', ')}.`
+        : '',
+      !progress.conquered.length && progress.strong.length
+        ? `Words they read beautifully: ${progress.strong.join(', ')}.`
+        : '',
+      `Reason for pausing here: ${reason}.`,
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    await this.narrate('CHECK_IN', context, { mustMentionAny: named, after: 'hold' });
+    if (this.closed) return;
+
+    this.setMode('WRAP_UP', reason);
+    this.send({ t: 'awaiting_answer', question: 'continue' });
+
+    const answer = await this.askContinue();
+    if (this.closed) return;
+
+    if (answer === 'yes') {
+      await this.continueStory();
       return;
     }
+    await this.end(answer === 'no' ? 'child chose to stop' : 'no answer at the check-in');
+  }
 
-    await this.nextBeat();
+  /**
+   * Two chances to answer, by voice or by tapping. Silence is never taken as a
+   * yes: a child who has drifted off gets an ending, not more reading.
+   */
+  private async askContinue(): Promise<'yes' | 'no' | null> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (this.stashedAnswer) {
+        const stashed = this.stashedAnswer;
+        this.stashedAnswer = null;
+        return stashed;
+      }
+
+      const tapped = new Promise<'yes' | 'no'>((resolve) => {
+        this.answerFromUi = resolve;
+      });
+      const spoken = this.listen(ANSWER_LISTEN_MS).then((text) => {
+        if (text) this.log('child_talk', text);
+        return parseYesNo(text);
+      });
+
+      const answer = await Promise.race([tapped, spoken]);
+      this.answerFromUi = null;
+      this.stopListening();
+
+      if (answer) return answer;
+      if (this.closed) return null;
+
+      // Nothing, or something that was neither yes nor no. Ask once more, plainly.
+      if (attempt === 0) await this.speak(T.continueRepromptLine());
+    }
+    return null;
+  }
+
+  private async continueStory() {
+    if (this.closed) return;
+
+    // Say yes out loud before doing any work — extending the plan is an LLM call,
+    // and the child has just committed to more reading.
+    await this.speak(T.keepGoingLine());
+
+    // Out of planned beats: extend the SAME story rather than starting a new one.
+    // Premise, difficulty, target skills and must-use words all stay put — only
+    // the road ahead is new.
+    if (this.beatIndex >= this.plan.beats.length - 1) {
+      const more = await extendPlanBeats({
+        plan: this.plan,
+        fromBeat: this.beatIndex,
+        learned: this.facts.summaryLines(),
+      });
+      this.plan = { ...this.plan, beats: [...this.plan.beats, ...more] };
+      this.narrator.updatePlan(this.plan);
+      this.debug('plan', this.plan);
+    }
+
+    await this.narrate('CONTINUE', `They want to keep reading. Continue from beat ${this.beatIndex + 1}.`);
   }
 
   private async adapt(reason: string) {
@@ -576,6 +1008,10 @@ export class Session {
 
   private async openTalk() {
     if (this.mode === 'END' || this.closed) return;
+    // Nothing to interrupt yet, and no story to route an intent against.
+    if (this.mode === 'ONBOARDING' || !this.plan) return;
+    // A conversational listen is already open — the child is being heard.
+    if (this.talk) return;
 
     // 1. Kill playback instantly and stop pronunciation assessment.
     this.stopSpeaking();
@@ -631,24 +1067,66 @@ export class Session {
       return;
     }
 
+    await this.handleChildSpeech(transcript, 'button');
+  }
+
+  /**
+   * Everything the child says that is not reading arrives here — whether they
+   * tapped the owl or simply spoke up mid-passage. One path, so speaking up gets
+   * the same answer either way, and so nothing a child says goes unanswered.
+   */
+  private async handleChildSpeech(transcript: string, source: 'button' | 'off_script') {
+    if (this.closed) return;
+
+    this.setMode('TALK', source === 'off_script' ? 'child spoke up' : 'talk button');
     this.log('child_talk', transcript);
+
+    // Assessment must stop: they are talking, and anything they say now would be
+    // scored against a passage they are not reading.
+    await this.pron?.close();
+    this.pron = null;
 
     const currentWord =
       this.tracker && this.tracker.cursor < this.tracker.words.length
         ? this.tracker.words[this.tracker.cursor].expected
         : null;
 
-    const { intent, interestTopic, reasoning } = await classifyIntent({
+    const { intent, interestTopic, fact, factKind, reasoning } = await classifyIntent({
       transcript,
       currentPassage: this.tracker?.passage ?? null,
       currentWord,
       storyPremise: this.plan.premise,
+      source,
     });
 
-    this.debug('lastIntent', { transcript, intent, reasoning });
+    this.debug('lastIntent', { transcript, intent, reasoning, source });
     this.send({ t: 'talk_closed', transcript, intent });
 
+    // Remember before replying, so the reply is generated by a narrator that
+    // already knows this about them.
+    this.rememberFact(fact, interestTopic, factKind);
+
     await this.handleIntent(intent, transcript, interestTopic, currentWord);
+  }
+
+  /**
+   * File something the child revealed about their life.
+   *
+   * Note what this does NOT do: change the story now. The narrator is told about
+   * it for tone, but lib/facts.ts decides which beat may actually use it, two
+   * beats later at the earliest. A detail echoed back in the very next sentence
+   * is not personalisation, it is a parrot.
+   */
+  private rememberFact(text: string | null, topic: string | null, kind: FactKind | null) {
+    if (!text) return;
+
+    const fact = this.facts.add({ text, topic, kind, beat: this.beatIndex });
+    if (!fact) return;
+
+    this.log('fact', fact.text, { kind: fact.kind, topic: fact.topic });
+    this.send({ t: 'fact', text: fact.text, topic: fact.topic, kind: fact.kind });
+    this.debug('facts', this.facts.all());
+    this.narrator?.updateLearned(this.facts.summaryLines());
   }
 
   private async handleIntent(
@@ -705,7 +1183,7 @@ export class Session {
         }
         await this.narrate(
           'CHITCHAT',
-          `The child said: "${transcript}". Acknowledge it warmly in one sentence and weave back to the story.`,
+          `The child said: "${transcript}". Answer them warmly and briefly — two short sentences at the very most — then invite them back to the line they were reading. Do not turn this into a scene, and do not put what they said into the story now.`,
         );
         this.resumeReading();
         return;
@@ -804,8 +1282,20 @@ export class Session {
       return;
     }
 
-    if (Date.now() - this.startedAt > SESSION_MAX_MS) {
-      void this.end('15 minutes elapsed');
+    const elapsed = Date.now() - this.startedAt;
+
+    // Nobody reads for half an hour. This is the backstop for a session left
+    // running, not a pedagogical decision.
+    if (elapsed > HARD_STOP_MS) {
+      void this.end('session ran long');
+      return;
+    }
+
+    // The 15 minute mark is no longer a hard stop: it offers a stopping point.
+    // Passage boundaries usually get there first (lib/sessionflow.ts); this
+    // catches a child who has been on one passage for a long time.
+    if (elapsed > SESSION_SOFT_MAX_MS && this.checkIns === 0) {
+      void this.checkIn('we have been reading a while');
     }
   }
 
@@ -860,19 +1350,60 @@ export class Session {
     if (this.mode === 'END' || this.closed) return;
     this.discardBuffer();
     this.setMode('END', reason);
+    this.stopListening();
 
     await this.pron?.close();
     this.pron = null;
 
-    const strongest = this.transcript.filter((t) => t.kind === 'child_passage').length;
+    // Stopped before there was a story — during onboarding, or while the plan was
+    // still being written. There is nothing to wrap up, so say goodbye kindly.
+    if (!this.narrator) {
+      await this.speak(T.goodbyeLine(this.child.name || 'friend', 'Come back and read with me soon!'));
+      await this.finishEnd();
+      return;
+    }
+
+    const progress = summarizeProgress(this.passageRecords);
+    const won = progress.conquered.length
+      ? ` They were stuck on these words and then got them right: ${progress.conquered.join(', ')}.`
+      : progress.strong.length
+        ? ` Words they read beautifully: ${progress.strong.join(', ')}.`
+        : '';
+
     await this.narrate(
       'CLOSING',
-      `Wrap the story up in one beat — never on a cliffhanger. Reference something specific: they read ${strongest} passage(s) today. Reason for ending: ${reason}.`,
+      `Wrap the story up in one beat — never on a cliffhanger. They read ${progress.passages} passage(s) today.${won} Name something real they did, tell them you cannot wait to read again, and leave them feeling proud. Reason for ending: ${reason}.`,
     );
+  }
+
+  /**
+   * Fold what the child told us today into the memory model, so the NEXT
+   * session's planner already knows it. Consolidation (PLAN.md §12) still does
+   * the deeper rewrite — this just means nobody has to press a button for the
+   * story to remember a lost tooth.
+   */
+  private async persistFacts() {
+    const facts = this.facts.all();
+    if (facts.length === 0) return;
+
+    const merged = mergeFactsIntoMemory(this.memory, facts);
+    try {
+      await query(
+        `UPDATE child_memory
+            SET interests = $2, canon = $3, version = version + 1, updated_at = now()
+          WHERE child_id = $1`,
+        [this.child.id, JSON.stringify(merged.interests), JSON.stringify(merged.canon)],
+      );
+      this.memory = merged;
+      this.debug('memoryAfterSession', merged);
+    } catch (err) {
+      console.error('[session] failed to save what the child told us', err);
+    }
   }
 
   private async finishEnd() {
     await this.flushEvents();
+    await this.persistFacts();
 
     if (this.sessionId) {
       try {

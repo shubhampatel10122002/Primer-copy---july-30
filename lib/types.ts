@@ -2,6 +2,8 @@
 
 export type Mode =
   | 'IDLE'
+  /** Getting to know a child with no profile yet. */
+  | 'ONBOARDING'
   | 'NARRATE'
   | 'CHILD_READS'
   | 'COACH'
@@ -10,6 +12,8 @@ export type Mode =
   | 'SOCRATIC'
   | 'REMIX'
   | 'ADAPT'
+  /** Celebrating progress and asking whether to keep reading. */
+  | 'WRAP_UP'
   | 'PAUSED'
   | 'END';
 
@@ -51,6 +55,8 @@ export interface ChildMemory {
     characters?: string[];
     past_summaries?: string[];
     open_threads?: string[];
+    /** Things the child mentioned about their own life, newest last. */
+    recent_events?: { text: string; ts: string }[];
   };
   version?: number;
 }
@@ -81,7 +87,7 @@ export interface TrackedWord {
 
 export interface TranscriptEntry {
   ts: string;
-  kind: 'narrator' | 'child_passage' | 'child_talk' | 'mode' | 'coach' | 'system';
+  kind: 'narrator' | 'child_passage' | 'child_talk' | 'mode' | 'coach' | 'fact' | 'system';
   text: string;
   meta?: Record<string, unknown>;
 }
@@ -116,6 +122,8 @@ export type ClientMessage =
   | { t: 'talk_end' }
   | { t: 'resume' }
   | { t: 'stop' }
+  /** Tapping the on-screen answer to a yes/no question, instead of saying it. */
+  | { t: 'answer'; value: 'yes' | 'no' }
   /** Speak a fixed line — verifies the audio path without involving the LLM. */
   | { t: 'tts_test' }
   | { t: 'ping' };
@@ -131,6 +139,14 @@ export type ServerMessage =
   | { t: 'tts_end' }
   | { t: 'talk_open' }
   | { t: 'talk_closed'; transcript: string | null; intent: Intent | null }
+  /** The mic is open for a conversational reply (onboarding, check-in). */
+  | { t: 'listening'; on: boolean }
+  /** Onboarding progress, so the panel can show the profile filling in. */
+  | { t: 'profile'; name: string | null; age: number | null; interests: string[] }
+  /** Something the child told us, now in the session's memory. */
+  | { t: 'fact'; text: string; topic: string; kind: string }
+  /** A yes/no question is on the table and can be answered by tapping. */
+  | { t: 'awaiting_answer'; question: 'continue' }
   | { t: 'nudge'; text: string }
   | { t: 'flag'; type: string; detail: string }
   | { t: 'debug'; key: string; value: unknown }

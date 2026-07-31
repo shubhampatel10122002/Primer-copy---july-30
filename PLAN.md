@@ -109,18 +109,25 @@ Runs on the WebSocket server. Deterministic code picks the mode; the LLM writes 
 
 | Mode | Trigger to enter | What happens |
 |---|---|---|
+| ONBOARDING | Session start with a blank profile (`lib/profile.ts`) | A short spoken conversation — name, then what they love. Mic opens between questions; no button. Writes the profile, then hands off with "I'm making a story just for you". Capped at 6 questions and 2 silences. |
 | NARRATE | Session start, or child finished a passage | Narrator produces next story beat (2-3 spoken sentences) + the child's next passage (1-2 sentences). TTS speaks the beat. Mic is muted during playback. |
 | CHILD_READS | Narrator hands over | Mic streams to Azure Pronunciation Assessment with the passage as referenceText. Tracker follows word by word. |
 | COACH | Word AccuracyScore < 60 (after leniency table, §9.3), or Omission, or pause > 3000ms on a word | Short coaching line ("Let's sound it out: b... l... ue"). Back to CHILD_READS on the same word. Max 2 coach attempts per word, then narrator says the word warmly and moves on. |
 | ENCOURAGE | 2 consecutive passages with all words >= 80 accuracy | One short praise line naming something specific, then NARRATE. |
-| TALK | Child taps the talk button (push-to-talk), any time | Pause current mode. Switch Azure to plain speech recognition. Transcribe, classify intent (§5), route. Then resume or transition. |
+| TALK | Child taps the talk button, **or speaks off-script while reading** (`lib/offscript.ts`) | Pause current mode. Transcribe, classify intent (§5), route. Then resume or transition. Both entry points share one path, so speaking up never needs a button. |
 | SOCRATIC | TALK intent = question_about_story_or_world | Narrator responds with ONE guiding question. Max 3 guiding questions, then a strong hint, then let the child conclude. Weave back to the story in one sentence, then NARRATE. |
 | REMIX | TALK intent = change_request ("I want dragons") | Discard the buffered next beat. Narrator acknowledges enthusiastically and regenerates the next beat + passage with the new theme but the SAME difficulty, SAME target skills, SAME must_use words. |
 | ADAPT | 3+ COACH entries within one passage, or frustration detected | Difficulty down one level. Discard buffered beat. Regenerate next passage, shorter and simpler. |
-| END | Beat list complete, 15 min elapsed, or child wants to stop | Closing line referencing something specific the child did. Wraps the story in one beat. Save transcript. |
+| WRAP_UP | ~6 passages or 10 min (then ~4 / 6 min), or the beat list runs out (`lib/sessionflow.ts`) | Celebrate, name the words they were stuck on and then got right, and ask whether to keep reading. Answered by voice or by tapping. Yes extends the same story (same premise, difficulty, skills, must-use words); no or silence goes to END. |
+| END | Child wants to stop, no answer at a check-in, or 30 min hard stop | Closing line referencing something specific the child did. Wraps the story in one beat. Saves the transcript and folds today's facts into memory. |
 
 Cross-cutting rules:
 - Always keep ONE beat buffered; discard the buffer on REMIX, ADAPT, or SOCRATIC.
+- A word the child was coached on and then reads correctly gets an immediate
+  templated celebration — no LLM in the path, because it has to land at once.
+- Anything the child reveals about their life is recorded, but never used in the
+  next sentence: `lib/facts.ts` releases at most one detail per beat, at least two
+  beats after hearing it. Feelings are answered in the moment and never woven.
 - Every Azure word result is written to `reading_events` immediately.
 - Silence in CHILD_READS: 8s gentle prompt, 20s more a friendly check-in, 45s total pause the session with a resume screen. Never nag more than twice.
 - All mode transitions are appended to the session transcript with timestamps.
@@ -129,13 +136,25 @@ Cross-cutting rules:
 
 ## 5. TALK mode and the intent router
 
-The talk button (an owl, large and always visible) is the ONLY interruption mechanism in this MVP. No automatic off-script detection — deliberately out of scope.
+There are two ways in, and they end up in the same place. The talk button (an
+owl, large and always visible) is the explicit one. The implicit one is speaking
+up mid-passage: every utterance Azure returns during CHILD_READS is checked by
+`lib/offscript.ts`, and one that barely overlaps the passage is treated as
+conversation rather than a misread.
 
-Flow when tapped:
+That check is deliberately conservative, because the two failure modes are not
+symmetric. Interrupting a child who was reading is expensive; missing a comment
+just means they can still tap the owl. So it takes a full sentence with almost no
+overlap, or a short utterance carrying an unmistakable cue that the passage does
+not contain.
+
+Flow when tapped (or when off-script speech is detected):
 1. Immediately stop any TTS playback and stop pronunciation assessment.
 2. Start plain Azure speech recognition.
 3. No intelligible speech within 5s: playful nudge, return to the previous mode at the same word.
-4. On transcript: one Haiku call classifies intent into exactly one of:
+4. On transcript: one Haiku call classifies intent into exactly one of the
+   following, and — separately, in any intent — extracts anything the child
+   revealed about their own life into the fact ledger (`lib/facts.ts`):
    - `help_with_word` — answer DIRECTLY (procedural help is never Socratic), then CHILD_READS.
    - `question_about_story_or_world` — enter SOCRATIC.
    - `change_request` — enter REMIX.
@@ -308,4 +327,10 @@ Testing note: put the app in front of a real 4-6 year old no later than step 5. 
 
 ## 15. Out of scope (do not build)
 
-Auth, multi-child, parent app, payments, mobile, nightly cron, custom ASR, automatic off-script detection (the talk button replaces it), agent frameworks, analytics, i18n, voice cloning, avatar animation.
+Auth, multi-child, parent app, payments, mobile, nightly cron, custom ASR, agent frameworks, analytics, i18n, voice cloning, avatar animation.
+
+Automatic off-script detection **used to be on this list** — the talk button was
+meant to replace it. That was wrong: a child who says "I'm bored" mid-passage and
+gets no reply has learned the thing does not listen, and a 5-year-old will not
+reach for a button to be heard. It is now §5, built to fail towards "that was
+reading" so the reading flow is never interrupted on a guess.

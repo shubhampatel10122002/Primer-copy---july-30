@@ -47,6 +47,36 @@ export const ackFallback = (band: 'flawless' | 'solid' | 'effortful'): string =>
   return pick(['Nice!', 'Great job!', 'Well done!', 'Lovely!']);
 };
 
+/**
+ * The moment a coached word finally lands. Templated rather than generated
+ * because it has to arrive instantly — a two-second LLM pause after a child
+ * nails a word they were stuck on is the wrong kind of silence.
+ */
+export const gotItLine = (word: string): string => {
+  const clean = word.replace(/[^a-zA-Z']/g, '');
+  return pick([
+    `Yes! ${clean}. You got it!`,
+    `That's it — ${clean}! Nice work.`,
+    `${clean}! You figured it out.`,
+    `There it is! ${clean}.`,
+  ]);
+};
+
+/** Fallback check-in when the narrator cannot produce one. Must still ask. */
+export const checkInLine = (name: string): string =>
+  `You've been doing such good reading, ${name}. Do you want to keep going, or should we stop here for today?`;
+
+/** Instant reply to "yes, keep reading" while the next beats are being written. */
+export const keepGoingLine = (): string =>
+  pick([`Yes! Let's keep going.`, `Wonderful — more story it is!`, `Yay! Here comes more.`]);
+
+/** Asked again when a yes/no answer did not arrive. */
+export const continueRepromptLine = (): string =>
+  pick([
+    `Should we keep reading? Say yes or no!`,
+    `Do you want more story, or are you all done for today?`,
+  ]);
+
 export const encourageLine = (detail: string): string =>
   pick([
     `Wow, you read ${detail} perfectly! Your reading voice is getting so strong.`,
@@ -85,6 +115,16 @@ export const safeFallbackPassage = (): string => `The sun was warm and the path 
 
 export const openingLine = (name: string): string =>
   `Hi ${name}! I'm so happy you're here. Let's read a story together.`;
+
+/** First words a brand-new child hears, before any LLM has been called. */
+export const helloStrangerLine = (): string =>
+  `Hi there! I'm Ollie. I'm so happy you came to read with me.`;
+
+/** Said while the story is actually being planned, so the wait has a reason. */
+export const makingStoryLine = (name: string | null): string =>
+  name
+    ? `Give me one second, ${name} — I'm making up a story just for you.`
+    : `Give me one second — I'm making up a story just for you.`;
 
 export const goodbyeLine = (name: string, detail: string): string =>
   `That was wonderful, ${name}. ${detail} See you next time!`;

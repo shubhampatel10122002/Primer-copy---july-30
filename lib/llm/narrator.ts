@@ -30,14 +30,17 @@ export type NarratorMode =
   | 'CHITCHAT'
   | 'REMIX'
   | 'ADAPT'
+  | 'CHECK_IN'
+  | 'CONTINUE'
   | 'CLOSING';
 
 function buildSystemPrompt(args: {
   child: Child;
   memory: ChildMemory;
   plan: SessionPlan;
+  learned: string[];
 }): string {
-  const { child, memory, plan } = args;
+  const { child, memory, plan, learned } = args;
   const canon = memory.canon ?? {};
   const interests = memory.interests
     .slice()
@@ -58,6 +61,18 @@ function buildSystemPrompt(args: {
     `Story canon (recurring characters): ${(canon.characters ?? []).join(', ') || 'none yet'}`,
     `Open threads from past sessions: ${(canon.open_threads ?? []).join('; ') || 'none yet'}`,
     '',
+    // Refreshed by updatePlan/updateLearned as the child tells us things. It is
+    // background knowledge, not a to-do list: the state machine decides when a
+    // detail is actually allowed into the story (see lib/facts.ts).
+    ...(learned.length
+      ? [
+          '# What they have told you during this session',
+          ...learned.map((l) => `- ${l}`),
+          'Let this colour how you talk to them. Do NOT work these into the story unless a',
+          'turn explicitly tells you to — timing is decided elsewhere.',
+          '',
+        ]
+      : []),
     '# This session plan',
     `Goal: ${plan.goal}`,
     `Premise: ${plan.premise}`,
@@ -108,6 +123,10 @@ const MODE_INSTRUCTIONS: Record<NarratorMode, string> = {
     "The child asked for something different. Acknowledge their idea enthusiastically, then regenerate the NEXT beat and passage with their new theme. Keep the SAME difficulty, the SAME target skills, and the SAME must-use words. The child changes the costume; the lesson stays.",
   ADAPT:
     'The child is struggling. Make this easier immediately: one short sentence for the passage, simplest words possible, and offer them a choice about what happens next. Stay upbeat — never signal that they failed.',
+  CHECK_IN:
+    'They have been reading for a while and this is a natural pause. Celebrate the effort warmly, name the specific progress you are given in the context, and then ask ONE question: whether they want to keep reading or stop for today. Make both answers sound equally fine — never pressure them to continue. Do not advance the story. Set child_passage to null.',
+  CONTINUE:
+    'They said they want to keep reading. Pick the story straight back up where it left off in 2-3 sentences — do not re-introduce yourself, do not recap from the beginning, do not thank them for continuing — then give them the next passage.',
   CLOSING:
     'Wrap the story up warmly in one beat — never on a cliffhanger. Reference something specific the child did today. Set child_passage to null.',
 };
@@ -119,27 +138,55 @@ const MODE_INSTRUCTIONS: Record<NarratorMode, string> = {
 export class Narrator {
   private history: ModelMessage[] = [];
   private system: string;
+  private learned: string[] = [];
 
   constructor(
     private child: Child,
     private memory: ChildMemory,
     private plan: SessionPlan,
   ) {
-    this.system = buildSystemPrompt({ child, memory, plan });
+    this.system = buildSystemPrompt({ child, memory, plan, learned: [] });
+  }
+
+  private rebuild() {
+    this.system = buildSystemPrompt({
+      child: this.child,
+      memory: this.memory,
+      plan: this.plan,
+      learned: this.learned,
+    });
   }
 
   /** Replaces the plan after a REMIX/ADAPT rewrite so later turns stay consistent. */
   updatePlan(plan: SessionPlan) {
     this.plan = plan;
-    this.system = buildSystemPrompt({ child: this.child, memory: this.memory, plan });
+    this.rebuild();
+  }
+
+  /** Everything the child has volunteered so far, for tone. Not a weave instruction. */
+  updateLearned(learned: string[]) {
+    this.learned = learned;
+    this.rebuild();
   }
 
   async turn(
     mode: NarratorMode,
     context: string,
-    opts: { mustMention?: string | null } = {},
+    opts: {
+      mustMention?: string | null;
+      /** At least one of these must appear — used when several words qualify. */
+      mustMentionAny?: string[];
+      /** A detail the child shared that this beat may finally use. */
+      weave?: string | null;
+    } = {},
   ): Promise<NarratorTurn> {
     const mustMention = opts.mustMention?.trim() || null;
+    const weave = opts.weave?.trim() || null;
+    // One list, whichever way the caller expressed it. Satisfying it means using
+    // at least one of these exact words.
+    const required = mustMention ? [mustMention] : (opts.mustMentionAny ?? []).filter(Boolean);
+    const satisfied = (text: string) =>
+      required.length === 0 || required.some((w) => mentionsWord(text, w));
 
     const userMessage = [
       `MODE: ${mode}`,
@@ -147,6 +194,21 @@ export class Narrator {
       context ? `\nCONTEXT: ${context}` : '',
       mustMention
         ? `\nHARD CONSTRAINT: the child read the word "${mustMention}". Praise that exact word, spelled exactly that way. Do NOT name any other word the child read, and do NOT substitute a similar-looking word — you have other words in your context that the child did not read.`
+        : '',
+      !mustMention && required.length
+        ? `\nHARD CONSTRAINT: name at least one of these exact words, which the child really did read: ${required
+            .map((w) => `"${w}"`)
+            .join(', ')}. Do NOT name any other word — your context is full of words they never said.`
+        : '',
+      weave
+        ? [
+            '',
+            `GENTLE PERSONALIZATION: the child mentioned earlier that they ${weave}.`,
+            'Let that show up in the story world as a small detail — a prop, a passing',
+            'likeness, something a character happens to have or notice. Do NOT say that they',
+            'told you, do NOT address them about it, and do NOT make it the point of the scene.',
+            'If it cannot be done gracefully in this beat, leave it out entirely.',
+          ].join('\n')
         : '',
     ].join('\n');
 
@@ -174,10 +236,10 @@ export class Narrator {
     // Objective constraints first — arithmetic, not an LLM judgment call.
     const vocab = checkVocab(turn.child_passage, this.plan.vocab_constraints);
 
-    // Did it praise the word the child actually read? Checked in code, because
+    // Did it praise a word the child actually read? Checked in code, because
     // the model reaching for a similar word from its context is the exact
     // failure this constraint exists to prevent.
-    const wrongWord = mustMention !== null && !mentionsWord(turn.speak_text, mustMention);
+    const wrongWord = !satisfied(turn.speak_text);
 
     // Then the fuzzy safety judgments. Run in parallel with nothing else; this is
     // the only LLM call in the hot path besides the narrator itself.
@@ -189,7 +251,9 @@ export class Narrator {
         verdict.ok ? '' : verdict.reason,
         vocab.feedback,
         wrongWord
-          ? `You praised a word the child did not read. The only word you may name is "${mustMention}".`
+          ? `You named a word the child did not read. The only words you may name are: ${required
+              .map((w) => `"${w}"`)
+              .join(', ')}.`
           : '',
       ]
         .filter(Boolean)
@@ -208,13 +272,13 @@ export class Narrator {
         // Still crediting the wrong word after being told twice? Do not let it
         // reach the child — a template that names the right word is strictly
         // better than fluent praise for something they never said.
-        if (mustMention !== null && !mentionsWord(retry.speak_text, mustMention)) {
+        if (!satisfied(retry.speak_text)) {
           console.error(
-            `[narrator] still praising the wrong word after a retry; using template for "${mustMention}"`,
+            `[narrator] still praising the wrong word after a retry; using template for "${required[0]}"`,
           );
           return {
             ...retry,
-            speak_text: T.encourageLine(`"${mustMention}"`),
+            speak_text: T.encourageLine(`"${required[0]}"`),
           };
         }
 
@@ -226,8 +290,8 @@ export class Narrator {
         console.error('[narrator] regeneration failed, keeping first draft', err);
         // Only refuse the first draft if it was a hard safety failure.
         if (verdict.severity === 'hard') return this.fallback(mode);
-        if (wrongWord && mustMention !== null) {
-          return { ...turn, speak_text: T.encourageLine(`"${mustMention}"`) };
+        if (wrongWord && required.length) {
+          return { ...turn, speak_text: T.encourageLine(`"${required[0]}"`) };
         }
       }
     }
@@ -242,7 +306,20 @@ export class Narrator {
 
   private fallback(mode: NarratorMode): NarratorTurn {
     const character = this.plan.characters[0] ?? 'our friend';
-    const needsPassage = mode === 'OPENING' || mode === 'NEXT_BEAT' || mode === 'ENCOURAGE';
+    const needsPassage =
+      mode === 'OPENING' || mode === 'NEXT_BEAT' || mode === 'ENCOURAGE' || mode === 'CONTINUE';
+
+    // A check-in that falls back to "something new was about to happen" would
+    // never ask the question the whole mode exists to ask.
+    if (mode === 'CHECK_IN') {
+      return {
+        speak_text: T.checkInLine(this.child.name),
+        child_passage: null,
+        plan_update: null,
+        current_beat_index: 0,
+      };
+    }
+
     return {
       speak_text: T.safeFallbackBeat(character),
       child_passage: needsPassage ? T.safeFallbackPassage() : null,

@@ -49,6 +49,8 @@ export async function consolidateMemory(args: {
       '- past_summaries: append one short sentence summarizing today. Keep at most 8 entries, newest last.',
       '- open_threads: what is unresolved and worth picking up next time.',
       '- characters: recurring characters the child now knows.',
+      '- canon.recent_events lists things the child said about their own life. Use them as',
+      '  evidence, and promote anything still live ("birthday on Saturday") to an open thread.',
     ].join('\n'),
     prompt: [
       `Child: ${child.name}${child.age ? `, age ${child.age}` : ''}`,
@@ -64,7 +66,18 @@ export async function consolidateMemory(args: {
     ].join('\n'),
   });
 
-  return object as ChildMemory;
+  // The schema deliberately does not expose recent_events for rewriting — they
+  // are things the child actually said, not something to be paraphrased. Carry
+  // them through by hand so consolidation cannot quietly erase them.
+  return {
+    ...(object as ChildMemory),
+    canon: {
+      ...object.canon,
+      ...(current.canon?.recent_events?.length
+        ? { recent_events: current.canon.recent_events.slice(-8) }
+        : {}),
+    },
+  };
 }
 
 /** Field-level diff for the debug panel. "Watch it learn her." PLAN.md §12 step 6. */

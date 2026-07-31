@@ -32,6 +32,14 @@ export default function SessionView() {
   const [flags, setFlags] = useState<{ type: string; detail: string }[]>([]);
   const [ended, setEnded] = useState(false);
   const [error, setError] = useState('');
+  /** Onboarding profile filling in live, and everything learned since. */
+  const [profile, setProfile] = useState<{
+    name: string | null;
+    age: number | null;
+    interests: string[];
+  } | null>(null);
+  const [facts, setFacts] = useState<{ text: string; topic: string; kind: string }[]>([]);
+  const [awaiting, setAwaiting] = useState<'continue' | null>(null);
   /** Bytes of TTS audio this browser actually received for the current utterance. */
   const [audioBytes, setAudioBytes] = useState(0);
 
@@ -76,6 +84,8 @@ export default function SessionView() {
 
       case 'mode':
         setMode(msg.mode);
+        // The question is only on the table while the wrap-up is.
+        if (msg.mode !== 'WRAP_UP') setAwaiting(null);
         break;
 
       case 'speak':
@@ -114,9 +124,16 @@ export default function SessionView() {
 
       case 'tts_end':
         setSpeaking(false);
-        // Reopen 300ms after playback ends, to swallow the speaker tail.
+        // The server sends this when it finishes *sending* audio, which is before
+        // the browser has finished *playing* it — so wait out whatever is still
+        // queued, then 300ms more for the speaker tail. Reopening on the server's
+        // clock would let the mic hear the end of Ollie's own sentence, which now
+        // matters much more: it would be transcribed as the child's answer.
         if (gateTimer.current) clearTimeout(gateTimer.current);
-        gateTimer.current = setTimeout(() => engineRef.current?.setMuted(false), 300);
+        gateTimer.current = setTimeout(
+          () => engineRef.current?.setMuted(false),
+          (engineRef.current?.playbackRemainingMs() ?? 0) + 300,
+        );
         break;
 
       case 'talk_open':
@@ -132,6 +149,25 @@ export default function SessionView() {
             { kind: `child · ${msg.intent ?? 'unknown'}`, text: msg.transcript! },
           ]);
         }
+        break;
+
+      // The mic is open for a spoken reply — onboarding, or a check-in. Same
+      // indicator as the talk button, since to the child it is the same thing.
+      case 'listening':
+        setListening(msg.on);
+        break;
+
+      case 'profile':
+        setProfile({ name: msg.name, age: msg.age, interests: msg.interests });
+        break;
+
+      case 'fact':
+        setFacts((f) => [...f, { text: msg.text, topic: msg.topic, kind: msg.kind }]);
+        setTranscript((t) => [...t, { kind: 'remembered', text: msg.text }]);
+        break;
+
+      case 'awaiting_answer':
+        setAwaiting(msg.question);
         break;
 
       case 'flag':
@@ -221,6 +257,12 @@ export default function SessionView() {
     send({ t: 'talk_end' });
   }
 
+  /** Answering the check-in by tapping. Saying it out loud works too. */
+  function answer(value: 'yes' | 'no') {
+    setAwaiting(null);
+    send({ t: 'answer', value });
+  }
+
   useEffect(() => {
     return () => {
       if (gateTimer.current) clearTimeout(gateTimer.current);
@@ -247,15 +289,19 @@ export default function SessionView() {
                 ? 'Ollie is speaking…'
                 : ended
                   ? 'all done'
-                  : mode === 'CHILD_READS'
-                    ? 'listening to you'
-                    : mode === 'TALK'
-                      ? 'listening…'
-                      : mode === 'PAUSED'
-                        ? 'paused'
-                        : // NARRATE / COACH / SOCRATIC / REMIX / ADAPT between
-                          // utterances all mean one thing: waiting on the LLM.
-                          'Ollie is thinking…'}
+                  : listening
+                    ? 'listening…'
+                    : mode === 'CHILD_READS'
+                      ? 'listening to you'
+                      : mode === 'TALK'
+                        ? 'listening…'
+                        : mode === 'PAUSED'
+                          ? 'paused'
+                          : mode === 'ONBOARDING'
+                            ? 'getting to know you'
+                            : // NARRATE / COACH / SOCRATIC / REMIX / ADAPT between
+                              // utterances all mean one thing: waiting on the LLM.
+                              'Ollie is thinking…'}
           </div>
         </header>
 
@@ -271,7 +317,40 @@ export default function SessionView() {
           <span>{narratorText || 'Getting your story ready…'}</span>
         </div>
 
-        {mode === 'PAUSED' ? (
+        {mode === 'ONBOARDING' ? (
+          <div>
+            <div className="passage-label">Getting to know you</div>
+            <p className="empty-passage">
+              {listening ? 'Ollie is listening — just talk!' : 'Ollie is thinking…'}
+            </p>
+            {profile && (profile.name || profile.interests.length > 0) && (
+              <div style={{ marginTop: 14 }}>
+                {profile.name && <span className="chip added">{profile.name}</span>}
+                {profile.age !== null && <span className="chip">{profile.age} years old</span>}
+                {profile.interests.map((i) => (
+                  <span className="chip" key={i}>
+                    {i}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : awaiting === 'continue' ? (
+          <div>
+            <div className="passage-label">Keep reading?</div>
+            <div className="choice-row">
+              <button className="btn btn-primary" onClick={() => answer('yes')}>
+                Yes, more story!
+              </button>
+              <button className="btn" onClick={() => answer('no')}>
+                I&rsquo;m all done
+              </button>
+            </div>
+            <p className="muted" style={{ marginTop: 12, fontSize: 14 }}>
+              You can just say it out loud, too.
+            </p>
+          </div>
+        ) : mode === 'PAUSED' ? (
           <div>
             <div className="passage-label">Paused</div>
             <p className="empty-passage">Ollie is waiting for you.</p>
@@ -295,7 +374,9 @@ export default function SessionView() {
 
         <TalkButton
           listening={listening}
-          disabled={!connected || ended}
+          // During onboarding and check-ins the mic is already open, so the
+          // button would only be a way to interrupt a question being asked.
+          disabled={!connected || ended || mode === 'ONBOARDING' || awaiting !== null}
           onPress={pressTalk}
           onRelease={releaseTalk}
         />
@@ -309,6 +390,7 @@ export default function SessionView() {
         transcript={transcript}
         liveFlags={flags}
         audioBytes={audioBytes}
+        facts={facts}
         onTtsTest={() => send({ t: 'tts_test' })}
         connected={connected}
       />
