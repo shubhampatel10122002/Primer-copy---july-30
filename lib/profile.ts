@@ -111,6 +111,53 @@ export function isFreshProfile(child: Pick<Child, 'name'>, _memory?: ChildMemory
   return PLACEHOLDER_NAMES.has((child.name ?? '').trim().toLowerCase());
 }
 
+/**
+ * Cut a spoken turn down to what a small child will actually sit through.
+ *
+ * A 15-second monologue from a companion that is supposed to be having a
+ * conversation is not warmth, it is a wait. When a turn runs long we keep the
+ * first sentence (the reaction to what they said) and the last one (the
+ * question) — the middle of a rambling turn is always padding, and dropping the
+ * end would drop the question the whole turn exists to ask.
+ */
+export function trimSpokenTurn(raw: string, maxSentences = 2): string {
+  const clean = raw
+    .replace(/[*_#`~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const sentences = clean.split(/(?<=[.!?])\s+/).filter((s) => /[a-zA-Z]/.test(s));
+  if (sentences.length <= maxSentences) return clean;
+
+  return [sentences[0], sentences[sentences.length - 1]].join(' ');
+}
+
+/**
+ * Is this turn just the last one again?
+ *
+ * Two greetings in a row is the single most obvious way for a voice companion to
+ * stop sounding like one person. The prompt forbids it; this catches it anyway,
+ * because the cost of checking is nothing and the cost of a child hearing the
+ * same sentence twice is that they stop believing anyone is there.
+ */
+export function repeatsPrevious(text: string, previous: string | null): boolean {
+  if (!previous) return false;
+
+  const words = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z' ]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+
+  const now = words(text);
+  const before = new Set(words(previous));
+  if (now.length === 0 || before.size === 0) return false;
+
+  const shared = now.filter((w) => before.has(w)).length;
+  return shared / now.length >= 0.7;
+}
+
 /** The draft as the free-text notes the planner and narrator already read. */
 export function draftToNotes(draft: OnboardingDraft): string {
   const parts: string[] = [];

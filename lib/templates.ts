@@ -66,6 +66,22 @@ export const gotItLine = (word: string): string => {
 export const checkInLine = (name: string): string =>
   `You've been doing such good reading, ${name}. Do you want to keep going, or should we stop here for today?`;
 
+/**
+ * The child wants something different but did not say what. Asked immediately,
+ * from a template, because "oh no, what would you rather?" three seconds after
+ * they said they were bored is three seconds too late.
+ */
+export const whatWouldYouLikeLine = (favourite: string | null): string =>
+  favourite
+    ? pick([
+        `Oh no, let's fix that! What should the story be about — something with ${favourite}?`,
+        `Okay! You tell me. What do you want this story to be about? We could do ${favourite}!`,
+      ])
+    : pick([
+        `Oh no, let's fix that! What do you want the story to be about?`,
+        `Okay! You pick. What should we make the story about?`,
+      ]);
+
 /** Instant reply to "yes, keep reading" while the next beats are being written. */
 export const keepGoingLine = (): string =>
   pick([`Yes! Let's keep going.`, `Wonderful — more story it is!`, `Yay! Here comes more.`]);

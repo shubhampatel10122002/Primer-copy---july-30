@@ -2,7 +2,7 @@ import { generateObject } from 'ai';
 import type { ModelMessage } from 'ai';
 import { z } from 'zod';
 import { model } from './client';
-import type { OnboardingDraft, OnboardingLearned } from '../profile';
+import { trimSpokenTurn, type OnboardingDraft, type OnboardingLearned } from '../profile';
 
 /**
  * Getting to know a child who has never used this before.
@@ -50,15 +50,20 @@ const SYSTEM = [
   'before you make up a story just for them.',
   '',
   '# How to talk',
-  '- You are speaking out loud to a 4-6 year old. Short sentences. No markdown, no emoji,',
-  '  no stage directions.',
+  '- You are speaking out loud to a 4-6 year old. No markdown, no emoji, no stage directions.',
+  '- HARD LIMIT: at most TWO short sentences per turn, and the second one is the question.',
+  '  Say less than you want to. A long turn from you is a long wait for them.',
   '- Ask exactly ONE question per turn, and make it an easy one.',
-  '- React to what they said before you ask the next thing. Never fire questions in a row.',
+  '- You have already said hello. Never greet the child again, never introduce yourself',
+  '  again, and never repeat something you have already said in this conversation.',
+  '- React to what they just said before you ask the next thing. Every turn must connect',
+  '  to their last answer — name the thing they told you.',
   '- Never read a list of questions and never sound like a form. "What should I call you?"',
   '  not "Please state your name and age."',
-  '- If they say something surprising or funny, enjoy it for one sentence first.',
   '- If they do not answer, or answer something else entirely, roll with it warmly and',
   '  gently try once more in a different way.',
+  '- Never tell a child you have heard enough, that you have what you need, or that it is',
+  '  time to move on. If they are still talking, they are still talking.',
   '',
   '# What you are trying to learn',
   '1. Their name. Always ask this first.',
@@ -90,8 +95,12 @@ export class OnboardingAgent {
     const userMessage =
       childSaid === null
         ? this.history.length === 0
-          ? `Say hello and ask their name. This is the first thing they will ever hear you say.\n${known}`
-          : `They did not say anything. Nudge them warmly and ask again in an easier way.\n${known}`
+          ? // "Hi there! I'm Ollie..." has ALREADY been spoken by the state machine
+            // before this call, so that the child hears something immediately
+            // rather than waiting on a round-trip. Saying hello again here is how
+            // the first thing a child ever hears becomes the same thing twice.
+            `You have just said "Hi there! I'm Ollie. I'm so happy you came to read with me." out loud. Do NOT greet them again and do NOT introduce yourself again. Ask what you should call them, in ONE short sentence.\n${known}`
+          : `They did not say anything. Nudge them warmly and ask again in an easier way, in one short sentence.\n${known}`
         : `The child said: "${childSaid}"\n${known}`;
 
     try {
@@ -106,7 +115,8 @@ export class OnboardingAgent {
       this.history.push({ role: 'assistant', content: JSON.stringify(object) });
 
       return {
-        speak: object.speak_text,
+        // Enforced here rather than trusted to the prompt: length is arithmetic.
+        speak: trimSpokenTurn(object.speak_text, 2),
         learned: {
           name: object.learned.name,
           age: object.learned.age,
@@ -150,12 +160,13 @@ export class OnboardingAgent {
                 draft.interests[0] ?? 'the things they love'
               } specifically so they know you were listening,`,
               'and tell them you are making up a story just for them right now.',
-              'Two or three short sentences. Do not ask a question. Do not start the story yet.',
+              'TWO short sentences at most. Do not ask a question. Do not start the story yet.',
+              'Do not greet them again — you are already mid-conversation.',
             ].join(' '),
           },
         ],
       });
-      return object.speak_text;
+      return trimSpokenTurn(object.speak_text, 2);
     } catch (err) {
       console.error('[onboarding] finale failed, using template', err);
       const who = draft.name ? `, ${draft.name}` : '';

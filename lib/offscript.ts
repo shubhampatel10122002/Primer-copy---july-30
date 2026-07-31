@@ -102,3 +102,52 @@ export function detectOffScript(args: {
 
   return { offScript: false, matchRatio, reason: 'too short to be sure' };
 }
+
+/**
+ * Is what we just heard our own voice coming back through the speaker?
+ *
+ * The half-duplex gate (PLAN.md §8.2) exists because the app could hear itself.
+ * But keeping the mic shut for the whole of every narration means a child who
+ * speaks up while the story is being told is heard by nothing at all — and a
+ * five-year-old will not wait politely for a turn, nor reach for a button.
+ *
+ * So during playback the mic stays open and this decides what to do with what
+ * arrives. Browser echo cancellation removes most of it; this catches the rest,
+ * and it has the one piece of information that makes the judgment easy: the
+ * exact words currently being spoken. Anything that substantially IS those words
+ * is echo.
+ */
+export function looksLikeEcho(recognized: string, spokenText: string): boolean {
+  const heard = tokenize(recognized).map(normalizeWord).filter(Boolean);
+  if (heard.length === 0) return true;
+
+  const said = new Set(tokenize(spokenText).map(normalizeWord).filter(Boolean));
+  if (said.size === 0) return false;
+
+  const matched = heard.filter((t) => said.has(t)).length;
+  // Half is a low bar on purpose. Treating a real interruption as echo costs the
+  // child one repetition; treating our own voice as an interruption derails the
+  // story and, worse, teaches the app to interrupt itself.
+  return matched / heard.length >= 0.5;
+}
+
+/**
+ * Did the child really interrupt, or did the microphone just pick something up?
+ *
+ * Stricter than `detectOffScript`, because this fires while the narrator is
+ * mid-sentence: cutting the story off is a bigger disruption than answering a
+ * comment between passages, so it takes clearer evidence.
+ */
+export function isInterruption(recognized: string, spokenText: string): boolean {
+  if (looksLikeEcho(recognized, spokenText)) return false;
+
+  const heard = tokenize(recognized).map(normalizeWord).filter(Boolean);
+  if (heard.length === 0) return false;
+
+  // An unmistakable cue is enough on its own — "stop", "bored", "mommy" are not
+  // words a passing television says into a laptop microphone.
+  if (heard.some((t) => CONVERSATION_CUES.has(t))) return true;
+
+  // Otherwise it has to look like a sentence someone meant to say.
+  return heard.length >= MIN_SENTENCE_TOKENS && heard.some((t) => t.replace(/'/g, '').length >= 3);
+}

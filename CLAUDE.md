@@ -43,9 +43,17 @@ mode and asked for words.
   JSON `ClientMessage` / `ServerMessage` from `lib/types.ts`.
 - **`reading_events` is append-only.** Never UPDATE or DELETE.
 - Only `attempt = 1` results update mastery, so coached retries can't inflate it.
-- **Anything a child says gets an answer.** Off-script speech is detected from the
-  reading stream (`lib/offscript.ts`) and routed through the same intent router as
-  the talk button, so speaking up never needs a button press.
+- **Anything a child says gets an answer.** Speaking up mid-passage and talking
+  over the narrator are both detected in `lib/offscript.ts` and routed through the
+  same intent router as the talk button, so being heard never needs a button.
+- **Never cut a child off.** Azure ends an utterance at every pause and children
+  pause constantly, so `listen()` collects segments and only settles after
+  `REPLY_QUIET_MS` of real silence. Settling on the first segment is how "I like
+  cars, like Lamborghini... and Bugatti" becomes an interruption.
+- **A fallback may be plain; it may not be about somebody else.** `fallbackPlan`
+  takes the child's memory. It once shipped a hardcoded dragon story to a child
+  who had just spent a minute talking about cars, because the planner's schema
+  rejected a plan for having one must-use word too many.
 - **A detail the child shares never lands in the very next sentence.**
   `lib/facts.ts` owns the delay; the narrator is only told what to say, and only
   once a beat is cleared to use it.
