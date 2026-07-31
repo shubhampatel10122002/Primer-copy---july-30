@@ -168,6 +168,12 @@ which compares it to the line on screen and returns one of three things:
 There is no fourth branch and none of the three is "ignore". An utterance that
 reaches the branch always ends in a score, a reply, or both.
 
+Interruption is decided on **partial** results, not final ones. A final arrives a
+second or more after the child's first syllable, by which point the narrator has
+usually finished the sentence — an interruption that lands after you would have
+stopped anyway is not one. Two words that are not our own echo, or a single
+unmistakable cue, and playback stops.
+
 An utterance is not one recognizer result. Azure ends an utterance at every
 pause and children pause constantly, so results are buffered into a *turn* and
 only acted on after `REPLY_QUIET_MS` of real silence — longer when the last thing

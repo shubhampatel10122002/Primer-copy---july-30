@@ -70,6 +70,14 @@ export async function respondToChild(args: {
   storyPremise: string;
   /** What they have told us today, so the reply can sound like it remembers. */
   learned: string[];
+  /**
+   * The last few things said, by either of you, in order.
+   *
+   * Without this every reply was written by something with no memory of the
+   * sentence before it — which is exactly what "it feels like different people
+   * talking" is. It could ask a question and then answer as though it had not.
+   */
+  dialogue: string[];
   /** How many guiding questions they have already had. Decided by code, not here. */
   socraticSoFar: number;
   socraticLimit: number;
@@ -121,8 +129,12 @@ export async function respondToChild(args: {
         '  else handles that. You are only answering them.',
         '- If they said they are bored or want something else, sound pleased about it and ask',
         '  what they would rather have. Never talk them out of it.',
+        '- You are ONE continuous person in this conversation. Read what was just said before',
+        '  you reply. Never repeat a question you already asked, never ask something they have',
+        '  already answered, and never answer a question of your own that they have not.',
       ].join('\n'),
       prompt: [
+        args.dialogue.length ? `Just now:\n${args.dialogue.join('\n')}\n` : '',
         `Story so far: ${args.storyPremise}`,
         args.currentPassage ? `The line on screen: ${args.currentPassage}` : 'No line on screen right now.',
         args.currentWord ? `The word they were on: ${args.currentWord}` : '',

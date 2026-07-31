@@ -54,6 +54,14 @@ mode and asked for words.
   pause constantly, so utterances are buffered into a turn and only settled after
   real silence (longer if `soundsUnfinished`). Acting on the first segment is how
   "I like cars, like Lamborghini... and Bugatti" becomes an interruption.
+- **Stop on the partial, not the final.** A final arrives a second past the
+  child's first syllable — by then the narrator has finished its sentence anyway,
+  so an interruption that waits for one is indistinguishable from none.
+- **When the child takes the floor, `yieldFloor()`.** Queued and held speech is
+  dropped, not just the sentence in the air. A coaching line written before they
+  said "I don't want to read any more" is about a moment that no longer exists.
+- **Never ask a question you will not wait for.** Onboarding decides whether it
+  has enough BEFORE generating a turn, never after speaking one.
 - **A reply is on the critical path; a story beat is not.** Conversation is ONE
   fast call (`lib/llm/respond.ts`). Story content keeps Sonnet and the full safety
   pass. Do not re-add round-trips between a child speaking and being answered.

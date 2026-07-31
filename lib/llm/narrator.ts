@@ -175,6 +175,11 @@ export class Narrator {
       mustMentionAny?: string[];
       /** A detail the child shared that this beat may finally use. */
       weave?: string | null;
+      /**
+       * The last few things said, including anything the fast responder said on
+       * your behalf. You did not write those, but the child heard them from you.
+       */
+      dialogue?: string[];
     } = {},
   ): Promise<NarratorTurn> {
     const mustMention = opts.mustMention?.trim() || null;
@@ -188,6 +193,9 @@ export class Narrator {
     const userMessage = [
       `MODE: ${mode}`,
       MODE_INSTRUCTIONS[mode],
+      opts.dialogue?.length
+        ? `\nJUST NOW (you and the child, in order — some of your lines were spoken for you, but the child heard them all as you):\n${opts.dialogue.join('\n')}`
+        : '',
       context ? `\nCONTEXT: ${context}` : '',
       mustMention
         ? `\nHARD CONSTRAINT: the child read the word "${mustMention}". Praise that exact word, spelled exactly that way. Do NOT name any other word the child read, and do NOT substitute a similar-looking word — you have other words in your context that the child did not read.`

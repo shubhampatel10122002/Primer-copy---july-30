@@ -8,7 +8,13 @@ import { generateAcknowledgment } from '../lib/llm/acknowledge';
 import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
-import { branchUtterance, isInterruption, looksLikeEcho, soundsUnfinished } from '../lib/conversation';
+import {
+  branchUtterance,
+  isInterruption,
+  looksLikeEcho,
+  soundsUnfinished,
+  startsAnInterruption,
+} from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
   shouldCheckIn,
@@ -84,7 +90,17 @@ const UNFINISHED_QUIET_MS = 4_000;
  * The AI must never start a sentence inside this window. It is the whole of
  * "never talk over the child", expressed as one number.
  */
-const CHILD_SPEAKING_GRACE_MS = 1_500;
+const CHILD_SPEAKING_GRACE_MS = 900;
+
+/**
+ * A turn that is clearly just the line on screen needs no patience: we are not
+ * going to answer it, so there is nothing to cut off. Only conversation gets the
+ * long quiet window.
+ */
+const READING_SETTLE_MS = 350;
+
+/** How much of the back-and-forth both the responder and the narrator can see. */
+const DIALOGUE_MEMORY = 10;
 
 /** Longest we will hold a reply waiting for a child to stop talking. */
 const MAX_HOLD_MS = 15_000;
@@ -126,6 +142,16 @@ export class Session {
   private pendingSpeech: string | null = null;
   /** Tail of the utterance queue — see speak(). */
   private speechChain: Promise<void> = Promise.resolve();
+
+  /**
+   * The last few things said, by either of us, in order.
+   *
+   * There are two writers of speech in this system — the fast responder and the
+   * narrator — and without this they were two separate conversations happening at
+   * the same child. It is why Ollie could ask a question and then, one sentence
+   * later, behave as though he had not. One thread, shared by both.
+   */
+  private dialogue: string[] = [];
 
   private transcript: TranscriptEntry[] = [];
   private interestSignals: string[] = [];
@@ -192,6 +218,13 @@ export class Session {
 
   private log(kind: TranscriptEntry['kind'], text: string, meta?: Record<string, unknown>) {
     this.transcript.push({ ts: new Date().toISOString(), kind, text, meta });
+
+    // Keep one thread of who said what, so neither writer of speech has to guess
+    // what the other one just did.
+    if (kind === 'narrator') this.dialogue.push(`You: ${text}`);
+    else if (kind === 'child_talk') this.dialogue.push(`Child: ${text}`);
+    else return;
+    if (this.dialogue.length > DIALOGUE_MEMORY) this.dialogue.shift();
   }
 
   private setMode(mode: Mode, reason?: string) {
@@ -344,10 +377,17 @@ export class Session {
       });
       this.debug('onboardingDraft', this.draft);
 
+      // Decide whether we are done BEFORE asking anything, never after.
+      //
+      // This used to sit at the bottom of the loop, so a turn that asked "and
+      // what colour car?" and then tipped the draft over the line would speak the
+      // question and immediately break — the story started half a second later,
+      // on top of a child who was drawing breath to answer. Asking a question you
+      // are not going to wait for is worse than not asking it.
+      if (hasEnoughToStart(this.draft) && turn >= 1) break;
+
       // Saying the same thing twice is how one voice starts sounding like two
-      // different people talking past each other. Checked here because it is
-      // checkable, and because the first thing a child ever hears is the worst
-      // possible place for it.
+      // different people talking past each other.
       let line = reply.speak;
       if (repeatsPrevious(line, lastSaid)) {
         console.warn(`[onboarding] dropped a repeat of "${lastSaid.slice(0, 40)}…"`);
@@ -360,10 +400,7 @@ export class Session {
       lastSaid = line;
       if (this.closed) return '';
 
-      // The agent may say it is ready; whether it actually is, is decided here.
-      // One follow-up minimum, so nobody is hustled from "I'm Sam" to a story.
-      if (hasEnoughToStart(this.draft) && (reply.ready || turn >= 1)) break;
-
+      // We just asked them something. We wait. Every time.
       heard = await this.waitForReply(ONBOARDING_LISTEN_MS);
       if (heard) {
         this.log('child_talk', heard);
@@ -441,10 +478,19 @@ export class Session {
   private onChildPartial(text: string) {
     if (this.closed) return;
 
-    // While we are speaking this could be our own voice coming back. Barge-in is
-    // decided on the complete utterance, where the echo guard has something to
-    // work with; a partial is too short a fragment to judge.
-    if (this.isSpeaking) return;
+    if (this.isSpeaking) {
+      // Stop HERE, on the partial. Waiting for the complete utterance meant
+      // waiting a second or more past the child's first syllable, by which time
+      // the narrator had usually finished its sentence anyway — an interruption
+      // that arrives after you would have stopped regardless is not one.
+      if (startsAnInterruption(text, this.speakingText)) {
+        console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
+        this.debug('bargeIn', text);
+        this.stopSpeaking();
+      } else {
+        return; // our own echo, or a noise
+      }
+    }
 
     this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
     this.lastSpeechAt = Date.now();
@@ -465,6 +511,8 @@ export class Session {
   private onChildUtterance(text: string) {
     if (this.closed || !text.trim()) return;
 
+    // Usually we have already stopped, on the partial. This is the backstop for
+    // an utterance that arrived without one.
     if (this.isSpeaking) {
       if (looksLikeEcho(text, this.speakingText)) {
         this.debug('echoIgnored', text);
@@ -474,7 +522,6 @@ export class Session {
         this.debug('noiseIgnored', text);
         return;
       }
-      // The child talked over us. They have priority, always: stop mid-word.
       console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
       this.debug('bargeIn', text);
       this.stopSpeaking();
@@ -487,9 +534,23 @@ export class Session {
     this.turnSegments.push(text.trim());
     this.debug('turnSegments', this.turnSegments);
 
-    // Wait longer when they clearly have not finished the sentence — a trailing
-    // "and" or "like" is a breath, not a full stop.
-    const quiet = soundsUnfinished(text) ? UNFINISHED_QUIET_MS : REPLY_QUIET_MS;
+    // How long to wait before deciding they have finished.
+    //
+    // Patience is for conversation. A turn that is plainly just the line on
+    // screen is not going to be answered, so holding the floor open for it only
+    // delays the narrator — and holding the floor is what keeps the assessment
+    // layer quiet, so the delay is real.
+    const soFar = this.turnSegments.join(' ');
+    const passage = this.tracker?.passage ?? null;
+    const looksLikeReading =
+      passage !== null && branchUtterance({ text: soFar, passage }).kind === 'reading';
+
+    const quiet = looksLikeReading
+      ? READING_SETTLE_MS
+      : soundsUnfinished(text)
+        ? UNFINISHED_QUIET_MS
+        : REPLY_QUIET_MS;
+
     if (this.turnTimer) clearTimeout(this.turnTimer);
     this.turnTimer = setTimeout(() => this.closeTurn(), quiet);
   }
@@ -541,6 +602,11 @@ export class Session {
     // reading half is already scored; answer the half that was aimed at us.
     const said = branch.kind === 'mixed' ? branch.conversationText : text;
     if (!said.trim()) return;
+
+    // They said something to us. Anything the assessment layer was in the middle
+    // of saying — a coaching line, a celebration, the next beat — was written
+    // before this and is now the wrong thing to say.
+    this.yieldFloor(`child said "${said.slice(0, 40)}"`);
 
     // Nothing to answer with yet — still onboarding or still planning. Hold it so
     // the next thing that listens picks it up instead of losing it.
@@ -695,23 +761,25 @@ export class Session {
     this.speechChain = new Promise<void>((r) => (release = r));
     try {
       await previous;
-      // The child interrupted while this was waiting its turn. It was written
-      // for a moment that has passed — saying it now would be talking over the
-      // answer they just got.
+      // The child took the floor while this was waiting its turn. It was written
+      // for a moment that has passed.
       if (generation !== this.speechGeneration) return;
-      await this.speakNow(text);
+      await this.speakNow(text, generation);
     } finally {
       release();
     }
   }
 
-  private async speakNow(text: string): Promise<void> {
+  private async speakNow(text: string, generation = this.speechGeneration): Promise<void> {
     if (!text.trim() || this.closed) return;
 
     // Never start a sentence on top of one of theirs. The child has priority,
     // and "priority" that only applies when it is convenient is not priority.
     await this.holdWhileChildSpeaks();
     if (this.closed) return;
+    // Waiting for them to finish is exactly when what we were going to say stops
+    // being the right thing to say. Check again on the way out of the hold.
+    if (generation !== this.speechGeneration) return;
 
     this.isSpeaking = true;
     this.speakingText = text;
@@ -759,17 +827,44 @@ export class Session {
   }
 
   /**
+   * Does the child currently have the floor?
+   *
+   * True while they are audibly mid-sentence, and while a turn of theirs is open
+   * but not yet classified. The second half matters: between "they stopped
+   * talking" and "we know whether that was reading or a request to stop" is
+   * exactly the window in which the assessment layer used to pipe up with
+   * "let's sound it out" over a child who had just asked to be finished.
+   */
+  private childHasFloor(): boolean {
+    return Date.now() < this.childSpeakingUntil || this.turnSegments.length > 0;
+  }
+
+  /**
    * Wait until the child has stopped talking.
    *
-   * The one rule this enforces: the AI never talks over the child. A reply that
-   * is ready is not a reason to start speaking — them being quiet is. The cap
-   * exists only so a stuck partial cannot mute the narrator forever.
+   * The one rule this enforces: the AI never talks over the child. A reply being
+   * ready is not a reason to start speaking — them being quiet is. The cap exists
+   * only so a stuck partial cannot mute the narrator forever.
    */
   private async holdWhileChildSpeaks(): Promise<void> {
     const until = Date.now() + MAX_HOLD_MS;
-    while (!this.closed && Date.now() < this.childSpeakingUntil && Date.now() < until) {
-      await new Promise((r) => setTimeout(r, 100));
+    while (!this.closed && this.childHasFloor() && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 80));
     }
+  }
+
+  /**
+   * The child has taken the floor. Everything we were about to say is void.
+   *
+   * Not just the sentence in the air — the queued ones too. A coach line written
+   * three seconds ago, before they said "I don't want to read any more", is
+   * about a moment that no longer exists, and speaking it is how the app ends up
+   * explaining pronunciation to a child who just asked to stop.
+   */
+  private yieldFloor(reason: string) {
+    if (this.isSpeaking) this.stopSpeaking();
+    else this.speechGeneration += 1;
+    this.debug('yieldedFloor', reason);
   }
 
   /** Stop mid-word. Called the instant the child starts talking. */
@@ -807,12 +902,17 @@ export class Session {
     } = {},
   ) {
     this.setMode('NARRATE');
+    // If the child takes the floor while this beat is being written or spoken,
+    // everything after it belongs to a moment that no longer exists — including
+    // handing them a passage to read.
+    const generation = this.speechGeneration;
     const turn =
       opts.prefetched ??
       (await this.narrator.turn(mode, context, {
         mustMention: opts.mustMention,
         mustMentionAny: opts.mustMentionAny,
         weave: opts.weave,
+        dialogue: this.dialogue,
       }));
 
     // Prepend rather than speak separately: one Cartesia context instead of two
@@ -823,6 +923,7 @@ export class Session {
     this.debug('lastNarratorTurn', { mode, ...turn });
 
     await this.speak(turn.speak_text);
+    if (this.closed || generation !== this.speechGeneration) return;
 
     // The caller is running a conversation (a check-in) and decides what happens
     // next itself.
@@ -893,7 +994,7 @@ export class Session {
       .turn(
         'NEXT_BEAT',
         `The child is currently reading. Prepare beat ${nextBeat} of ${this.plan.beats.length}.`,
-        { weave: fact?.text ?? null },
+        { weave: fact?.text ?? null, dialogue: this.dialogue },
       )
       .then((turn) => {
         if (token !== this.bufferToken) throw new Error('stale buffer');
@@ -1288,6 +1389,7 @@ export class Session {
       currentWord,
       storyPremise: this.plan.premise,
       learned: this.facts.summaryLines(),
+      dialogue: this.dialogue,
       socraticSoFar: this.socraticCount,
       socraticLimit: MAX_SOCRATIC_QUESTIONS,
       source,
@@ -1383,6 +1485,7 @@ export class Session {
               currentWord: null,
               storyPremise: this.plan.premise,
               learned: this.facts.summaryLines(),
+              dialogue: this.dialogue,
               socraticSoFar: this.socraticCount,
               socraticLimit: MAX_SOCRATIC_QUESTIONS,
               source: 'off_script',
@@ -1584,6 +1687,8 @@ export class Session {
   async end(reason: string) {
     if (this.mode === 'END' || this.closed) return;
     this.discardBuffer();
+    // Whatever was queued was written for a session that is still going.
+    this.yieldFloor(`ending: ${reason}`);
     this.setMode('END', reason);
     this.stopWaitingForReply();
 

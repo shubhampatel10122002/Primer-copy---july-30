@@ -216,10 +216,32 @@ export function looksLikeEcho(recognized: string, spokenText: string): boolean {
 }
 
 /**
+ * Should we stop talking, right now, on a PARTIAL result?
+ *
+ * This is the difference between an interruption that works and one that does
+ * not. A final result arrives a second or more after the child stops speaking a
+ * segment — by which time the narrator has usually finished the sentence anyway,
+ * so stopping "on interruption" was indistinguishable from not stopping at all.
+ * Partials arrive within a few hundred milliseconds of the first syllable.
+ *
+ * The bar is two words, or one unmistakable cue, that are not our own echo.
+ * Deliberately lower than `isInterruption`: stopping is cheap and recoverable,
+ * being talked over is not.
+ */
+export function startsAnInterruption(partial: string, spokenText: string): boolean {
+  if (looksLikeEcho(partial, spokenText)) return false;
+
+  const heard = words(partial);
+  if (heard.length === 0) return false;
+  if (heard.some((t) => CONVERSATION_CUES.has(t))) return true;
+
+  return heard.length >= 2 && heard.some((t) => t.replace(/'/g, '').length >= 3);
+}
+
+/**
  * Did the child really interrupt, or did the microphone just pick something up?
  *
- * Stricter than branching, because acting on this cuts the narrator off
- * mid-sentence.
+ * Applied to complete utterances, where there is enough text to be sure.
  */
 export function isInterruption(recognized: string, spokenText: string): boolean {
   if (looksLikeEcho(recognized, spokenText)) return false;

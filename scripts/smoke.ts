@@ -85,6 +85,7 @@ async function main() {
       currentWord: 'cat',
       storyPremise: 'A cat looks for a bell',
       learned: [],
+      dialogue: [],
       socraticSoFar: 0,
       socraticLimit: 3,
       source: 'off_script',
