@@ -54,17 +54,25 @@ mode and asked for words.
   pause constantly, so utterances are buffered into a turn and only settled after
   real silence (longer if `soundsUnfinished`). Acting on the first segment is how
   "I like cars, like Lamborghini... and Bugatti" becomes an interruption.
-- **Stop on the partial, not the final.** A final arrives a second past the
-  child's first syllable — by then the narrator has finished its sentence anyway,
-  so an interruption that waits for one is indistinguishable from none.
+- **Stop on SOUND, not on words.** The browser watches microphone loudness
+  against the echo residual and kills playback locally in ~45ms, with no ASR and
+  no round-trip. The transcript arrives later and decides what it MEANT.
+- **Judge a partial by its newest words only.** While we speak, Azure is
+  transcribing us, so a partial holding echo *and* the child scores >50% match
+  and gets binned as echo — the exact moment a child must not be ignored.
 - **When the child takes the floor, `yieldFloor()`.** Queued and held speech is
   dropped, not just the sentence in the air. A coaching line written before they
   said "I don't want to read any more" is about a moment that no longer exists.
 - **Never ask a question you will not wait for.** Onboarding decides whether it
   has enough BEFORE generating a turn, never after speaking one.
 - **A reply is on the critical path; a story beat is not.** Conversation is ONE
-  fast call (`lib/llm/respond.ts`). Story content keeps Sonnet and the full safety
-  pass. Do not re-add round-trips between a child speaking and being answered.
+  streamed call (`lib/llm/respond.ts`) whose schema order is load-bearing: intent
+  first so a sensitive topic is never improvised, then `speak_text` so the voice
+  starts before the bookkeeping fields generate. Do not re-add round-trips
+  between a child speaking and being answered.
+- **The settle window, not the model, is most of a reply's latency.** At a flat
+  2.5s the LLM was under a third of the wait. `settleDelay` spends the patience
+  only where a thought is visibly still in motion.
 - **A fallback may be plain; it may not be about somebody else.** `fallbackPlan`
   takes the child's memory. It once shipped a hardcoded dragon story to a child
   who had just spent a minute talking about cars, because the planner's schema

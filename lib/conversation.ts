@@ -97,6 +97,43 @@ export function soundsUnfinished(text: string): boolean {
 }
 
 /**
+ * Openers that promise more is coming, however the sentence ends.
+ *
+ * "I like cars" is a complete sentence and could be a whole turn, but a child
+ * who begins "I like..." is usually about to list three more things. These get
+ * the patient window even when the grammar looks finished.
+ */
+const LIST_OPENERS = new Set(['i', 'my', 'we', 'and', 'also', 'like', 'theres', 'there']);
+
+/**
+ * How long to wait after this before deciding the child has finished.
+ *
+ * This number, not the language model, is what a reply's latency mostly is: at
+ * two and a half seconds flat, the model was less than a third of the wait. So
+ * spend the patience where it is actually needed — a plainly complete sentence
+ * gets answered quickly, and only a thought that is visibly still in motion buys
+ * the long window.
+ */
+export function settleDelay(
+  text: string,
+  opts: { quick: number; normal: number; patient: number },
+): number {
+  const spoken = words(text);
+  if (spoken.length === 0) return opts.normal;
+
+  if (soundsUnfinished(text)) return opts.patient;
+
+  const first = spoken[0].replace(/'/g, '');
+  if (LIST_OPENERS.has(first)) return opts.normal;
+
+  // A cue on its own ("bored", "stop") is unambiguous and urgent.
+  if (spoken.length <= 2 && spoken.some((w) => CONVERSATION_CUES.has(w))) return opts.quick;
+
+  // A sentence of real length that closed cleanly is a finished turn.
+  return spoken.length >= 3 ? opts.quick : opts.normal;
+}
+
+/**
  * Was that reading, talking, or both?
  *
  * `passage` is the whole line, not just the words ahead of the cursor — a child
@@ -228,14 +265,31 @@ export function looksLikeEcho(recognized: string, spokenText: string): boolean {
  * Deliberately lower than `isInterruption`: stopping is cheap and recoverable,
  * being talked over is not.
  */
-export function startsAnInterruption(partial: string, spokenText: string): boolean {
-  if (looksLikeEcho(partial, spokenText)) return false;
+export function startsAnInterruption(
+  partial: string,
+  spokenText: string,
+  previousPartial = '',
+): boolean {
+  // Judge only what is NEW since the last partial.
+  //
+  // This is the trap the old version fell into. While the narrator is talking,
+  // Azure is transcribing the narrator, so by the time the child cuts in the
+  // partial reads "the dragon flew over the hill can we" — six of our words and
+  // two of theirs. Scored whole, that is 75% echo and gets thrown away, and the
+  // child is ignored precisely when they most need not to be. The two words that
+  // just appeared are not ours, and that is the entire signal.
+  const before = words(previousPartial).length;
+  const all = words(partial);
+  const fresh = before > 0 && all.length > before ? all.slice(before) : all;
+  if (fresh.length === 0) return false;
 
-  const heard = words(partial);
-  if (heard.length === 0) return false;
-  if (heard.some((t) => CONVERSATION_CUES.has(t))) return true;
+  const said = new Set(words(spokenText));
+  const novel = fresh.filter((t) => !said.has(t));
+  if (novel.length === 0) return false;
 
-  return heard.length >= 2 && heard.some((t) => t.replace(/'/g, '').length >= 3);
+  if (novel.some((t) => CONVERSATION_CUES.has(t))) return true;
+
+  return novel.length >= 2 && novel.some((t) => t.replace(/'/g, '').length >= 3);
 }
 
 /**
