@@ -153,34 +153,36 @@ export class PronunciationSession {
   }
 }
 
-export interface TalkCallbacks {
+export interface ConversationCallbacks {
+  /** Fires while the child is mid-utterance. This is how we know not to speak. */
   onPartial?: (text: string) => void;
-  onFinal: (text: string) => void;
+  /** One complete thing the child said. Fires for EVERYTHING, always. */
+  onUtterance: (text: string) => void;
   onError?: (message: string) => void;
-  /**
-   * Report EVERY recognized segment instead of only the first.
-   *
-   * Azure ends an utterance at a pause, and children pause constantly — mid
-   * list, mid thought, hunting for the next word. Settling on the first segment
-   * is how "I like cars, like Lamborghini... and Bugatti" becomes "I like cars"
-   * and the child gets talked over. Callers that need a whole answer set this
-   * and decide for themselves when the child is actually finished.
-   */
-  continuous?: boolean;
 }
 
 /**
- * Plain conversational recognition for TALK mode — no pronunciation config.
- * Used for the talk button, for onboarding and check-in replies, and for
- * listening over our own voice during barge-in. PLAN.md §9.2.
+ * The conversation layer's ear: one recognizer, open from the first moment of
+ * the session to the last.
+ *
+ * It replaces a family of short-lived recognizers — one per talk-button press,
+ * one per onboarding question, one per narrated utterance for barge-in — each of
+ * which cost a few hundred milliseconds of connection setup during which the
+ * child was speaking to nothing at all. Those gaps were most of why the thing
+ * felt unresponsive, and every one of them landed at exactly the moment a child
+ * was most likely to say something.
+ *
+ * So: never torn down, never rebuilt, deaf at no point in the session. It runs
+ * alongside PronunciationSession rather than taking turns with it — scoring and
+ * listening are different jobs and no longer contend for the microphone.
  */
-export class TalkRecognizer {
+export class ConversationEar {
   private recognizer: sdk.SpeechRecognizer;
   private pushStream: sdk.PushAudioInputStream;
   private closed = false;
-  private settled = false;
+  private restarts = 0;
 
-  constructor(private cb: TalkCallbacks) {
+  constructor(private cb: ConversationCallbacks) {
     this.pushStream = sdk.AudioInputStream.createPushStream(pcmFormat());
     const audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
     this.recognizer = new sdk.SpeechRecognizer(speechConfig(), audioConfig);
@@ -188,16 +190,28 @@ export class TalkRecognizer {
     this.recognizer.recognizing = (_s, e) => {
       if (e.result?.text) this.cb.onPartial?.(e.result.text);
     };
+
     this.recognizer.recognized = (_s, e) => {
       if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
-        if (this.settled) return;
-        if (!this.cb.continuous) this.settled = true;
-        this.cb.onFinal(e.result.text);
+        this.cb.onUtterance(e.result.text);
       }
     };
+
     this.recognizer.canceled = (_s, e) => {
+      if (this.closed) return;
       if (e.reason === sdk.CancellationReason.Error) {
         this.cb.onError?.(`azure canceled: ${e.errorDetails}`);
+      }
+      // A session runs for tens of minutes and Azure will drop the connection at
+      // some point in that. Silently going deaf for the rest of the session is
+      // the worst possible failure here, so climb back up.
+      if (this.restarts < 5) {
+        this.restarts += 1;
+        console.warn(`[ear] recognition stopped, restarting (${this.restarts}/5)`);
+        this.recognizer.startContinuousRecognitionAsync(
+          () => {},
+          (err) => this.cb.onError?.(`azure restart failed: ${err}`),
+        );
       }
     };
 

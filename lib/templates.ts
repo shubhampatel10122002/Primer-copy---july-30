@@ -109,13 +109,7 @@ export const stillThereLine = (): string =>
   pick([`Are you still there, friend?`, `Still with me? I'm right here when you're ready.`]);
 
 export const pausedLine = (): string =>
-  `I'll wait right here. Tap the owl whenever you want to keep going!`;
-
-export const talkTimeoutLine = (): string =>
-  pick([`Tap me when you want to chat!`, `I didn't hear anything — tap me again when you're ready!`]);
-
-export const unclearLine = (): string =>
-  `Hmm, I didn't catch that! Want to tell me again, or keep reading?`;
+  `I'll wait right here. Just say something whenever you're ready!`;
 
 /**
  * FIXED comfort template for sensitive topics. Never LLM-generated. PLAN.md §5.

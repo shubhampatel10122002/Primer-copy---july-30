@@ -2,13 +2,13 @@ import type { WebSocket } from 'ws';
 import { AUDIO } from '../lib/env';
 import { query, one } from '../lib/db';
 import { Narrator, type NarratorMode, type NarratorTurn } from '../lib/llm/narrator';
-import { classifyIntent } from '../lib/llm/intent';
+import { respondToChild, type ChildResponse } from '../lib/llm/respond';
 import { generateSessionPlan, fallbackPlan, extendPlanBeats } from '../lib/llm/planner';
 import { generateAcknowledgment } from '../lib/llm/acknowledge';
 import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
-import { detectOffScript, isInterruption } from '../lib/offscript';
+import { branchUtterance, isInterruption, looksLikeEcho, soundsUnfinished } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
   shouldCheckIn,
@@ -28,7 +28,7 @@ import {
   type OnboardingDraft,
 } from '../lib/profile';
 import * as T from '../lib/templates';
-import { PronunciationSession, TalkRecognizer } from './azure';
+import { PronunciationSession, ConversationEar } from './azure';
 import { tts, type SpeakHandle } from './cartesia';
 import { PassageTracker, tokenize } from './tracker';
 import type {
@@ -50,7 +50,6 @@ const SILENCE_NUDGE_MS = 8_000;
 const SILENCE_CHECKIN_MS = 28_000;
 const SILENCE_PAUSE_MS = 45_000;
 const WORD_STUCK_MS = 3_000;
-const TALK_TIMEOUT_MS = 5_000;
 const MAX_COACH_ATTEMPTS = 2;
 const ADAPT_COACH_THRESHOLD = 3;
 const MAX_SOCRATIC_QUESTIONS = 3;
@@ -76,8 +75,19 @@ const ANSWER_LISTEN_MS = 10_000;
  */
 const REPLY_QUIET_MS = 2_500;
 
-/** Backstop for a recognizer that never reports silence. Never hit by talking. */
-const REPLY_CEILING_MS = 45_000;
+/** A trailing "and" or "like" means they are mid-thought. Wait longer. */
+const UNFINISHED_QUIET_MS = 4_000;
+
+/**
+ * How long after hearing them we still consider the child to be talking.
+ *
+ * The AI must never start a sentence inside this window. It is the whole of
+ * "never talk over the child", expressed as one number.
+ */
+const CHILD_SPEAKING_GRACE_MS = 1_500;
+
+/** Longest we will hold a reply waiting for a child to stop talking. */
+const MAX_HOLD_MS = 15_000;
 
 export class Session {
   private mode: Mode = 'IDLE';
@@ -86,16 +96,26 @@ export class Session {
   private plan!: SessionPlan;
 
   private tracker: PassageTracker | null = null;
+
+  /**
+   * Two ears, two jobs, no contention.
+   *
+   * `ear` is the conversation layer: open from the first moment of the session
+   * to the last, hears everything, never rebuilt. `pron` is the assessment
+   * layer: created per passage, strict, and only ever asked how well the words
+   * on screen were said. They run at the same time on the same audio, so a child
+   * who talks mid-line is heard by one while being scored by the other.
+   */
+  private ear: ConversationEar | null = null;
   private pron: PronunciationSession | null = null;
-  private talk: TalkRecognizer | null = null;
 
   private speaking: SpeakHandle | null = null;
   private gateOpenAt = 0; // mic frames before this timestamp are dropped
   private isSpeaking = false;
   /** What we are saying right now — the echo guard needs the exact words. */
   private speakingText = '';
-  private bargeIn: TalkRecognizer | null = null;
-  private bargeInHandled = false;
+  /** While this is in the future, the child is mid-sentence and we stay quiet. */
+  private childSpeakingUntil = 0;
   /**
    * Bumped whenever playback is cut short. Utterances queued behind the one that
    * was interrupted check this and drop themselves — otherwise the narrator
@@ -134,7 +154,12 @@ export class Session {
   private checkIns = 0;
 
   /** Resolvers for an open conversational listen and an on-screen yes/no tap. */
-  private endListen: ((text: string | null) => void) | null = null;
+  /** Segments of the turn the child is speaking right now, and the quiet timer. */
+  private turnSegments: string[] = [];
+  private turnTimer: NodeJS.Timeout | null = null;
+  /** Set when something is waiting for a spoken answer (onboarding, check-in). */
+  private awaitingReply: ((text: string | null) => void) | null = null;
+  private replyTimeout: NodeJS.Timeout | null = null;
   private answerFromUi: ((value: 'yes' | 'no') => void) | null = null;
   private stashedAnswer: 'yes' | 'no' | null = null;
 
@@ -142,7 +167,6 @@ export class Session {
   private nudgeStage = 0;
   private tick: NodeJS.Timeout | null = null;
   private startedAt = Date.now();
-  private talkTimer: NodeJS.Timeout | null = null;
   private closed = false;
 
   constructor(
@@ -187,6 +211,17 @@ export class Session {
 
   async start() {
     this.tick = setInterval(() => this.onTick(), 500);
+
+    // Open the ear FIRST, before anything is said. From this moment to the end of
+    // the session the child is being listened to, in every mode, with no gap for
+    // a recognizer to be torn down and rebuilt in. Everything else — onboarding,
+    // reading, check-ins — happens on top of a microphone that never closes.
+    this.ear = new ConversationEar({
+      onPartial: (text) => this.onChildPartial(text),
+      onUtterance: (text) => this.onChildUtterance(text),
+      onError: (m) => console.error('[ear]', m),
+    });
+    this.send({ t: 'listening', on: true });
 
     // A child with no profile is met, not greeted: we cannot personalise a story
     // for someone we know nothing about, and planning before onboarding would
@@ -329,7 +364,7 @@ export class Session {
       // One follow-up minimum, so nobody is hustled from "I'm Sam" to a story.
       if (hasEnoughToStart(this.draft) && (reply.ready || turn >= 1)) break;
 
-      heard = await this.listen(ONBOARDING_LISTEN_MS);
+      heard = await this.waitForReply(ONBOARDING_LISTEN_MS);
       if (heard) {
         this.log('child_talk', heard);
         silences = 0;
@@ -396,33 +431,142 @@ export class Session {
   }
 
   // -------------------------------------------------------------------------
-  // Conversational listening (no button)
+  // The conversation layer: every utterance, one pipeline
   // -------------------------------------------------------------------------
 
   /**
-   * Open the mic for a spoken reply and wait until the child is actually done.
-   *
-   * The counterpart to the talk button: when the narrator asks a direct question
-   * — during onboarding, or at a check-in — the child should just answer, not go
-   * looking for a control.
-   *
-   * The hard part is knowing when they have finished. Azure ends an utterance at
-   * every pause, and a five-year-old listing their favourite cars pauses between
-   * every one of them. Taking the first segment as the answer is how "I like
-   * cars, like Lamborghini... and Bugatti" turns into being cut off mid-sentence.
-   * So segments are collected and we only settle after the child has been quiet
-   * for REPLY_QUIET_MS, with the wait restarting every time they start again.
-   *
-   * Resolves null if nothing intelligible arrives at all.
+   * A partial from the always-on ear. This is how we know the child is talking
+   * RIGHT NOW, which is how we know not to.
    */
-  private listen(waitForStartMs: number): Promise<string | null> {
+  private onChildPartial(text: string) {
+    if (this.closed) return;
+
+    // While we are speaking this could be our own voice coming back. Barge-in is
+    // decided on the complete utterance, where the echo guard has something to
+    // work with; a partial is too short a fragment to judge.
+    if (this.isSpeaking) return;
+
+    this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
+    this.lastSpeechAt = Date.now();
+    this.nudgeStage = 0;
+    this.debug('hearing', text);
+  }
+
+  /**
+   * One complete utterance from the ear. EVERY utterance arrives here, in every
+   * mode, whether we are speaking or not. Nothing else in the system decides
+   * whether the child is worth listening to.
+   *
+   * Utterances are buffered into a turn rather than acted on one at a time: Azure
+   * ends an utterance at every pause and children pause constantly, so acting on
+   * the first segment is how "I like cars, like Lamborghini... and Bugatti"
+   * becomes an interruption.
+   */
+  private onChildUtterance(text: string) {
+    if (this.closed || !text.trim()) return;
+
+    if (this.isSpeaking) {
+      if (looksLikeEcho(text, this.speakingText)) {
+        this.debug('echoIgnored', text);
+        return;
+      }
+      if (!isInterruption(text, this.speakingText)) {
+        this.debug('noiseIgnored', text);
+        return;
+      }
+      // The child talked over us. They have priority, always: stop mid-word.
+      console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
+      this.debug('bargeIn', text);
+      this.stopSpeaking();
+    }
+
+    this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
+    this.lastSpeechAt = Date.now();
+    this.nudgeStage = 0;
+
+    this.turnSegments.push(text.trim());
+    this.debug('turnSegments', this.turnSegments);
+
+    // Wait longer when they clearly have not finished the sentence — a trailing
+    // "and" or "like" is a breath, not a full stop.
+    const quiet = soundsUnfinished(text) ? UNFINISHED_QUIET_MS : REPLY_QUIET_MS;
+    if (this.turnTimer) clearTimeout(this.turnTimer);
+    this.turnTimer = setTimeout(() => this.closeTurn(), quiet);
+  }
+
+  /** The child has stopped talking. Now, and only now, decide what it was. */
+  private closeTurn() {
+    if (this.turnTimer) {
+      clearTimeout(this.turnTimer);
+      this.turnTimer = null;
+    }
+    const text = this.turnSegments.join(' ').replace(/\s+/g, ' ').trim();
+    this.turnSegments = [];
+    this.childSpeakingUntil = 0;
+    if (!text || this.closed) return;
+
+    // Something asked them a direct question and is waiting for the answer.
+    if (this.awaitingReply) {
+      const waiter = this.awaitingReply;
+      this.awaitingReply = null;
+      if (this.replyTimeout) clearTimeout(this.replyTimeout);
+      waiter(text);
+      return;
+    }
+
+    void this.routeTurn(text);
+  }
+
+  /**
+   * Reading, talking, or both?
+   *
+   * Deliberately NOT a guess about intent — a comparison against the words on
+   * screen. Scoring is the assessment layer's job either way; the only question
+   * here is whether anything the child said also needs an answer.
+   */
+  private async routeTurn(text: string) {
+    if (this.closed || this.mode === 'END') return;
+
+    const branch = branchUtterance({ text, passage: this.tracker?.passage ?? null });
+    this.debug('branch', {
+      text,
+      kind: branch.kind,
+      overlap: Number(branch.overlap.toFixed(2)),
+      reason: branch.reason,
+    });
+
+    if (branch.kind === 'reading') return; // the assessment layer has it
+
+    // Mixed: they read the line AND said something in the middle of it. The
+    // reading half is already scored; answer the half that was aimed at us.
+    const said = branch.kind === 'mixed' ? branch.conversationText : text;
+    if (!said.trim()) return;
+
+    // Nothing to answer with yet — still onboarding or still planning. Hold it so
+    // the next thing that listens picks it up instead of losing it.
+    if (!this.plan || !this.narrator) {
+      this.pendingSpeech = said;
+      return;
+    }
+
+    await this.handleChildSpeech(said, branch.kind === 'mixed' ? 'aside' : 'off_script');
+  }
+
+  /**
+   * Wait for the child to answer a direct question.
+   *
+   * No recognizer is created or destroyed here — the ear is already listening and
+   * has been since the session began. This just says who the next complete turn
+   * belongs to. Resolves null if they say nothing at all.
+   */
+  private waitForReply(waitForStartMs: number): Promise<string | null> {
     return new Promise((resolve) => {
       if (this.closed) {
         resolve(null);
         return;
       }
 
-      // They already answered — over the top of the question. Do not make a child
+      // They already answered — over the top of the question. Never make a child
       // who spoke first say it again.
       if (this.pendingSpeech) {
         const early = this.pendingSpeech;
@@ -431,69 +575,40 @@ export class Session {
         return;
       }
 
-      const heard: string[] = [];
-      let startTimer: NodeJS.Timeout;
-      let quietTimer: NodeJS.Timeout | null = null;
-      let ceiling: NodeJS.Timeout;
       let settled = false;
-
       const finish = (text: string | null) => {
         if (settled) return;
         settled = true;
-        clearTimeout(startTimer);
-        clearTimeout(ceiling);
-        if (quietTimer) clearTimeout(quietTimer);
-        this.endListen = null;
-        const recognizer = this.talk;
-        this.talk = null;
-        void recognizer?.close();
-        this.send({ t: 'listening', on: false });
+        if (this.replyTimeout) clearTimeout(this.replyTimeout);
+        this.replyTimeout = null;
+        this.awaitingReply = null;
         resolve(text);
       };
 
-      const settleWithWhatWeHeard = () =>
-        finish(heard.length ? heard.join(' ').replace(/\s+/g, ' ').trim() : null);
+      this.awaitingReply = finish;
 
-      this.endListen = () => settleWithWhatWeHeard();
-      this.send({ t: 'listening', on: true });
+      // If they are mid-sentence when this is called, whatever they are saying is
+      // the answer — do not start a no-answer countdown over the top of it.
+      const alreadyTalking = this.turnSegments.length > 0 || Date.now() < this.childSpeakingUntil;
+      if (alreadyTalking) return;
 
-      this.talk = new TalkRecognizer({
-        continuous: true,
-        onPartial: (text) => {
-          this.debug('talkPartial', text);
-          // Still going. Cancel any pending "they have finished" decision, and
-          // stop the no-answer timer — they are answering, just slowly.
-          if (quietTimer) {
-            clearTimeout(quietTimer);
-            quietTimer = null;
-          }
-          clearTimeout(startTimer);
-        },
-        onFinal: (text) => {
-          heard.push(text);
-          this.debug('listenSegments', heard);
-          clearTimeout(startTimer);
-          if (quietTimer) clearTimeout(quietTimer);
-          quietTimer = setTimeout(settleWithWhatWeHeard, REPLY_QUIET_MS);
-        },
-        onError: (m) => console.error('[azure listen]', m),
-      });
-
-      // Do not start the clock until the mic is actually open. The half-duplex
-      // gate is still shut for the tail of the question we just asked, and a
-      // window that expires while the child is still being spoken to reads to
-      // them as being ignored — the exact thing this is here to prevent.
+      // Do not start the clock until our own audio has finished: a window that
+      // expires while the child is still being spoken to is not a window.
       const gateDelay = Math.max(0, this.gateOpenAt - Date.now());
-      startTimer = setTimeout(() => finish(null), gateDelay + waitForStartMs);
-
-      // Only a backstop against a recognizer that never reports silence. Long
-      // enough that no child reaches it by talking.
-      ceiling = setTimeout(settleWithWhatWeHeard, gateDelay + waitForStartMs + REPLY_CEILING_MS);
+      this.replyTimeout = setTimeout(() => {
+        // One more check — they may have started talking during the wait.
+        if (this.turnSegments.length > 0 || Date.now() < this.childSpeakingUntil) {
+          this.replyTimeout = setTimeout(() => finish(null), REPLY_QUIET_MS + 1_000);
+          return;
+        }
+        finish(null);
+      }, gateDelay + waitForStartMs);
     });
   }
 
-  private stopListening() {
-    this.endListen?.(null);
+  /** Give up on a pending answer (an on-screen tap arrived instead). */
+  private stopWaitingForReply() {
+    this.awaitingReply?.(null);
   }
 
   async handleMessage(msg: ClientMessage) {
@@ -506,12 +621,6 @@ export class Session {
         // fast tap during the question is not thrown away.
         if (this.answerFromUi) this.answerFromUi(msg.value);
         else this.stashedAnswer = msg.value;
-        break;
-      case 'talk_start':
-        await this.openTalk();
-        break;
-      case 'talk_end':
-        await this.closeTalk();
         break;
       case 'resume':
         if (this.mode === 'PAUSED') {
@@ -535,27 +644,23 @@ export class Session {
     }
   }
 
-  /** Mic frames from the browser. The server-side gate is authoritative. §8.2 */
+  /**
+   * Mic frames from the browser. They never stop arriving and they always reach
+   * the conversation layer — there is no state in which the child is not heard.
+   *
+   * The half-duplex rule (PLAN.md §8.2) survives where it matters: while we are
+   * speaking, and for the speaker tail afterwards, nothing reaches pronunciation
+   * assessment. Scoring a child against a line while our own voice is in the
+   * microphone is the failure that rule exists to prevent, and it still cannot
+   * happen. Going deaf was never the point.
+   */
   onAudio(pcm: Buffer) {
     if (this.closed) return;
 
-    // While we are speaking, the ONLY thing listening is the barge-in recognizer,
-    // and everything it hears is echo-checked before it counts. Nothing reaches
-    // pronunciation assessment or a conversational listen until we have stopped —
-    // that part of the half-duplex rule (§8.2) still holds absolutely.
-    if (this.isSpeaking) {
-      this.bargeIn?.write(pcm);
-      return;
-    }
+    this.ear?.write(pcm);
 
-    if (Date.now() < this.gateOpenAt) return; // swallow the speaker tail
-
-    // An open conversational recognizer wins: onboarding and check-ins listen
-    // outside TALK mode.
-    if (this.talk) {
-      this.talk.write(pcm);
-      return;
-    }
+    if (this.isSpeaking) return; // never score over our own voice
+    if (Date.now() < this.gateOpenAt) return; // nor over the speaker tail
     if (this.mode === 'CHILD_READS' || this.mode === 'COACH') {
       this.pron?.write(pcm);
     }
@@ -565,11 +670,12 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     if (this.tick) clearInterval(this.tick);
-    if (this.talkTimer) clearTimeout(this.talkTimer);
+    if (this.turnTimer) clearTimeout(this.turnTimer);
+    if (this.replyTimeout) clearTimeout(this.replyTimeout);
     // Anything awaiting a reply must not hang once the socket is gone.
-    this.endListen?.(null);
+    this.awaitingReply?.(null);
     this.speaking?.cancel();
-    await Promise.all([this.pron?.close(), this.talk?.close(), this.bargeIn?.close()]);
+    await Promise.all([this.pron?.close(), this.ear?.close()]);
   }
 
   // -------------------------------------------------------------------------
@@ -602,14 +708,17 @@ export class Session {
   private async speakNow(text: string): Promise<void> {
     if (!text.trim() || this.closed) return;
 
+    // Never start a sentence on top of one of theirs. The child has priority,
+    // and "priority" that only applies when it is convenient is not priority.
+    await this.holdWhileChildSpeaks();
+    if (this.closed) return;
+
     this.isSpeaking = true;
     this.speakingText = text;
-    this.gateOpenAt = Number.MAX_SAFE_INTEGER; // close the gate for the whole utterance
-    this.send({ t: 'tts_start', bargeIn: true });
+    this.gateOpenAt = Number.MAX_SAFE_INTEGER; // no scoring over our own voice
+    this.send({ t: 'tts_start' });
     this.send({ t: 'speak', text });
     this.log('narrator', text);
-
-    this.openBargeIn(text);
 
     // Count what actually leaves the server. When a founder reports "I can't hear
     // anything", this line is the difference between a server-side and a
@@ -642,8 +751,7 @@ export class Session {
       this.speaking = null;
       this.isSpeaking = false;
       this.speakingText = '';
-      void this.closeBargeIn();
-      // Keep the gate shut for the audio tail so we don't hear our own voice.
+      // Keep the gate shut for the audio tail so we don't score our own voice.
       this.gateOpenAt = Date.now() + AUDIO.gateTailMs;
       this.send({ t: 'tts_end' });
       this.lastSpeechAt = Date.now();
@@ -651,73 +759,20 @@ export class Session {
   }
 
   /**
-   * Listen over our own voice.
+   * Wait until the child has stopped talking.
    *
-   * PLAN.md §8.2 shut the mic for the whole of every utterance, which is correct
-   * for echo and wrong for children: a child who says "I'm bored" while the
-   * story is being told is, with the gate shut, talking to nothing. They do not
-   * know to wait for a turn, and the owl button is not a thing a five-year-old
-   * reaches for mid-thought.
-   *
-   * So a second recognizer runs during playback. Everything it hears is checked
-   * against the exact words being spoken (`isInterruption`), and only speech
-   * that clearly is not our own echo counts. When it does count, this is a real
-   * barge-in: playback is killed on the spot and the child gets an answer.
+   * The one rule this enforces: the AI never talks over the child. A reply that
+   * is ready is not a reason to start speaking — them being quiet is. The cap
+   * exists only so a stuck partial cannot mute the narrator forever.
    */
-  private openBargeIn(spokenText: string) {
-    if (this.mode === 'IDLE' || this.closed) return;
-
-    void this.closeBargeIn();
-    this.bargeIn = new TalkRecognizer({
-      continuous: true,
-      onFinal: (heard) => {
-        if (!this.isSpeaking || this.bargeInHandled) return;
-        if (!isInterruption(heard, spokenText)) {
-          this.debug('bargeInIgnored', heard);
-          return;
-        }
-        this.bargeInHandled = true;
-        this.debug('bargeIn', heard);
-        console.log(`[barge-in] "${heard}" over "${spokenText.slice(0, 40)}…"`);
-        void this.onBargeIn(heard);
-      },
-      onError: (m) => console.error('[azure barge-in]', m),
-    });
-  }
-
-  private async closeBargeIn() {
-    const recognizer = this.bargeIn;
-    this.bargeIn = null;
-    this.bargeInHandled = false;
-    await recognizer?.close();
-  }
-
-  /** The child talked over the story. Stop talking and deal with what they said. */
-  private async onBargeIn(transcript: string) {
-    // Cut the narrator off mid-word. Being talked over by a machine that will not
-    // stop is the whole reason a child gives up on talking to it.
-    this.stopSpeaking();
-    await this.closeBargeIn();
-
-    if (this.closed || this.mode === 'END') return;
-
-    if (this.mode === 'ONBOARDING') {
-      // Mid-onboarding, the interruption IS the answer to the question we were
-      // asking, so hand it to the loop rather than routing it as an intent. If
-      // the loop has not started listening yet — they cut in before we finished
-      // the question — it is held so the next listen picks it up instead of
-      // making them repeat themselves.
-      if (this.endListen) this.endListen(transcript);
-      else this.pendingSpeech = transcript;
-      return;
+  private async holdWhileChildSpeaks(): Promise<void> {
+    const until = Date.now() + MAX_HOLD_MS;
+    while (!this.closed && Date.now() < this.childSpeakingUntil && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 100));
     }
-
-    if (!this.plan || !this.narrator) return;
-
-    await this.handleChildSpeech(transcript, 'barge_in');
   }
 
-  /** Barge-in: kill playback instantly and reopen the mic. */
+  /** Stop mid-word. Called the instant the child starts talking. */
   private stopSpeaking() {
     if (this.speaking) {
       this.speaking.cancel();
@@ -910,20 +965,12 @@ export class Session {
     this.nudgeStage = 0;
     this.debug('azureRecognized', recognized);
 
-    // Was that reading, or was it the child talking to us? Being ignored is what
-    // teaches a child that the thing does not really listen, so every utterance
-    // gets this question asked of it. lib/offscript.ts errs towards "reading".
-    const verdict = detectOffScript({ recognized, words: this.tracker.words });
-    if (verdict.offScript) {
-      this.debug('offScript', {
-        recognized,
-        matchRatio: Number(verdict.matchRatio.toFixed(2)),
-        reason: verdict.reason,
-      });
-      await this.handleChildSpeech(recognized, 'off_script');
-      return;
-    }
-
+    // Scoring only. Whether the child MEANT to read this is not asked here and
+    // must not be: this layer is strict on purpose, and the conversation layer
+    // is already looking at the same words to decide whether anything they said
+    // needs answering. An aside mixed into a line comes back from Azure as
+    // Insertions, which the tracker discards (§9.4/§9.6), so talking mid-line
+    // cannot corrupt a score either.
     const result = this.tracker.ingest(words);
     this.debug('lastWords', this.tracker.summary());
 
@@ -1134,14 +1181,14 @@ export class Session {
       const tapped = new Promise<'yes' | 'no'>((resolve) => {
         this.answerFromUi = resolve;
       });
-      const spoken = this.listen(ANSWER_LISTEN_MS).then((text) => {
+      const spoken = this.waitForReply(ANSWER_LISTEN_MS).then((text: string | null) => {
         if (text) this.log('child_talk', text);
         return parseYesNo(text);
       });
 
       const answer = await Promise.race([tapped, spoken]);
       this.answerFromUi = null;
-      this.stopListening();
+      this.stopWaitingForReply();
 
       if (answer) return answer;
       if (this.closed) return null;
@@ -1203,101 +1250,56 @@ export class Session {
   }
 
   // -------------------------------------------------------------------------
-  // TALK mode + intent router (PLAN.md §5)
+  // Answering the child (PLAN.md §5)
   // -------------------------------------------------------------------------
 
-  private async openTalk() {
-    if (this.mode === 'END' || this.closed) return;
-    // Nothing to interrupt yet, and no story to route an intent against.
-    if (this.mode === 'ONBOARDING' || !this.plan) return;
-    // A conversational listen is already open — the child is being heard.
-    if (this.talk) return;
-
-    // 1. Kill playback instantly and stop pronunciation assessment.
-    this.stopSpeaking();
-    await this.pron?.close();
-    this.pron = null;
-
-    this.setMode('TALK', 'talk button');
-    this.send({ t: 'talk_open' });
-
-    // Same listener as everywhere else, so the button cannot truncate a child
-    // mid-sentence when nothing else does. No speech within TALK_TIMEOUT_MS and
-    // it resolves null -> playful nudge, resume where we were.
-    const said = await this.listen(TALK_TIMEOUT_MS);
-    await this.routeTalk(said);
-  }
-
-  private async closeTalk() {
-    // Push-to-talk release. Give the tail a moment to arrive rather than cutting
-    // at the instant their finger leaves the button — children let go early, and
-    // the last word is usually the one that mattered.
-    if (this.mode !== 'TALK') return;
-    if (this.talkTimer) clearTimeout(this.talkTimer);
-    this.talkTimer = setTimeout(() => this.stopListening(), 900);
-  }
-
-  private async routeTalk(transcript: string | null) {
-    if (this.closed) return;
-
-    if (!transcript || transcript.trim().length < 2) {
-      this.send({ t: 'talk_closed', transcript: null, intent: null });
-      await this.speak(T.talkTimeoutLine());
-      this.resumeReading();
-      return;
-    }
-
-    await this.handleChildSpeech(transcript, 'button');
-  }
-
   /**
-   * Everything the child says that is not reading arrives here — whether they
-   * tapped the owl or simply spoke up mid-passage. One path, so speaking up gets
-   * the same answer either way, and so nothing a child says goes unanswered.
+   * Everything the child says that was not reading arrives here.
+   *
+   * One path for every route in — speaking up mid-passage, talking over the
+   * narrator, or an aside in the middle of a line — so being heard never depends
+   * on how they got our attention.
+   *
+   * One LLM call, not three. Working out what they meant and deciding what to say
+   * back used to be a Haiku call, then a Sonnet call, then a Haiku safety pass,
+   * all in series, before any audio could start: four to six seconds of silence
+   * after a child said something. At five years old that is long enough to
+   * conclude nobody is listening, which is the one thing this whole feature
+   * exists to prevent.
    */
-  private async handleChildSpeech(
-    transcript: string,
-    source: 'button' | 'off_script' | 'barge_in',
-  ) {
+  private async handleChildSpeech(transcript: string, source: 'off_script' | 'barge_in' | 'aside') {
     if (this.closed) return;
 
     this.setMode(
       'TALK',
-      source === 'barge_in'
-        ? 'child interrupted'
-        : source === 'off_script'
-          ? 'child spoke up'
-          : 'talk button',
+      source === 'barge_in' ? 'child interrupted' : source === 'aside' ? 'aside mid-line' : 'child spoke up',
     );
     this.log('child_talk', transcript);
-
-    // Assessment must stop: they are talking, and anything they say now would be
-    // scored against a passage they are not reading.
-    await this.pron?.close();
-    this.pron = null;
 
     const currentWord =
       this.tracker && this.tracker.cursor < this.tracker.words.length
         ? this.tracker.words[this.tracker.cursor].expected
         : null;
 
-    const { intent, interestTopic, fact, factKind, requestedTopic, reasoning } =
-      await classifyIntent({
-        transcript,
-        currentPassage: this.tracker?.passage ?? null,
-        currentWord,
-        storyPremise: this.plan.premise,
-        source,
-      });
+    const reply = await respondToChild({
+      childName: this.child.name,
+      transcript,
+      currentPassage: this.tracker?.passage ?? null,
+      currentWord,
+      storyPremise: this.plan.premise,
+      learned: this.facts.summaryLines(),
+      socraticSoFar: this.socraticCount,
+      socraticLimit: MAX_SOCRATIC_QUESTIONS,
+      source,
+    });
 
-    this.debug('lastIntent', { transcript, intent, reasoning, source, requestedTopic });
-    this.send({ t: 'talk_closed', transcript, intent });
+    this.debug('lastIntent', { transcript, intent: reply.intent, source, requestedTopic: reply.requestedTopic });
+    this.send({ t: 'talk_closed', transcript, intent: reply.intent });
 
-    // Remember before replying, so the reply is generated by a narrator that
-    // already knows this about them.
-    this.rememberFact(fact, interestTopic, factKind);
+    // Remember before replying, so anything generated afterwards already knows it.
+    this.rememberFact(reply.fact, reply.interestTopic, reply.factKind);
 
-    await this.handleIntent(intent, transcript, interestTopic, currentWord, requestedTopic);
+    await this.actOnIntent(reply.intent, transcript, reply);
   }
 
   /** The child's strongest known interest — what to steer towards when they only said "no". */
@@ -1326,85 +1328,77 @@ export class Session {
     this.narrator?.updateLearned(this.facts.summaryLines());
   }
 
-  private async handleIntent(
-    intent: Intent,
-    transcript: string,
-    interestTopic: string | null,
-    currentWord: string | null,
-    requestedTopic: string | null = null,
-  ) {
+  /**
+   * What happens next, given what they meant.
+   *
+   * The reply itself has already been written and is spoken immediately — this
+   * decides only what the SESSION does afterwards. Which is the split that has
+   * to hold: the model chose the words, code chooses the mode.
+   */
+  private async actOnIntent(intent: Intent, transcript: string, reply: ChildResponse) {
     switch (intent) {
-      // Procedural help is never Socratic. Answer directly, then keep reading.
-      case 'help_with_word':
-        await this.narrate(
-          'ANSWER_DIRECTLY',
-          `The child asked: "${transcript}". They are on the word "${currentWord ?? 'unknown'}". Tell them what it says and how to sound it out.`,
-        );
-        this.resumeReading();
-        return;
-
-      case 'question_about_story_or_world': {
-        this.discardBuffer();
-        this.socraticCount += 1;
-        this.setMode('SOCRATIC', `question #${this.socraticCount}`);
-
-        if (this.socraticCount > MAX_SOCRATIC_QUESTIONS) {
-          // Patience beats pedagogy purity. Edge case #8.
-          this.socraticCount = 0;
-          await this.narrate(
-            'ANSWER_DIRECTLY',
-            `The child asked: "${transcript}". You have already asked them several guiding questions. Give them the answer warmly now, then weave back to the story in one sentence.`,
-          );
-        } else {
-          await this.narrate(
-            'SOCRATIC',
-            `The child asked: "${transcript}". This is guiding question ${this.socraticCount} of ${MAX_SOCRATIC_QUESTIONS}.`,
-          );
-        }
+      // Never improvised, never from the model, always flagged. PLAN.md §5.
+      case 'sensitive_topic': {
+        const character = this.plan.characters[0] ?? 'our friend';
+        const line = T.sensitiveTopicLine(character);
+        await this.flag('sensitive_topic', transcript);
+        this.send({ t: 'flag', type: 'sensitive_topic', detail: transcript });
+        this.log('narrator', line, { template: 'sensitive_topic' });
+        await this.speak(line);
         this.resumeReading();
         return;
       }
+
+      case 'want_to_stop':
+        await this.flag('early_exit', transcript);
+        this.send({ t: 'flag', type: 'early_exit', detail: transcript });
+        await this.end('child wants to stop');
+        return;
 
       case 'change_request': {
         this.discardBuffer();
         this.setMode('REMIX', transcript);
 
+        // Say something back BEFORE any of the story work. Rebuilding a plan is
+        // seconds of silence, and they have just told us they are not enjoying it.
+        await this.speak(reply.speakText);
+
         // "I'm bored" is a change request with nothing to change to. Rebuilding
         // the story around the word "bored" is not an answer — asking them what
-        // they would rather hear is, and it is what a person would do.
-        let topic = requestedTopic?.trim() || null;
+        // they would rather have is, and it is what a person would do.
+        let topic = reply.requestedTopic?.trim() || null;
         if (!topic) {
           const favourite = this.favouriteTopic();
-          await this.speak(T.whatWouldYouLikeLine(favourite));
-          const said = await this.listen(ANSWER_LISTEN_MS);
+          // The reply almost certainly already asked; only add a prompt if not.
+          if (!/\?/.test(reply.speakText)) await this.speak(T.whatWouldYouLikeLine(favourite));
+
+          const said = await this.waitForReply(ANSWER_LISTEN_MS);
           if (said) {
             this.log('child_talk', said);
             this.send({ t: 'talk_closed', transcript: said, intent: 'change_request' });
-            const answer = await classifyIntent({
+            const answer = await respondToChild({
+              childName: this.child.name,
               transcript: said,
               currentPassage: null,
               currentWord: null,
               storyPremise: this.plan.premise,
-              source: 'button',
+              learned: this.facts.summaryLines(),
+              socraticSoFar: this.socraticCount,
+              socraticLimit: MAX_SOCRATIC_QUESTIONS,
+              source: 'off_script',
             });
             this.rememberFact(answer.fact, answer.interestTopic, answer.factKind);
             topic = answer.requestedTopic?.trim() || answer.interestTopic?.trim() || said;
           } else {
-            // They did not answer. Their favourite thing is a far better guess
-            // than carrying on with the story they just told us they were bored of.
+            // No answer. Their favourite thing is a far better guess than carrying
+            // on with the story they just said they were bored of.
             topic = favourite;
           }
         }
 
         this.debug('remixTopic', topic);
-        await this.narrate(
-          'REMIX',
-          `The child said: "${transcript}". They want the story to be about: ${
-            topic ?? 'something completely new'
-          }. Rebuild the next beat around that — really change it, do not just mention it once. Keep difficulty ${this.plan.difficulty}, the same target skills, and the same must-use words: ${this.plan.vocab_constraints.must_use_words.join(', ')}.`,
-        );
 
-        // Steer the REST of the story too, not just one beat. A child who asked
+        // Steer the REST of the story, not just the next beat. A child who asked
         // for cars and got one car-shaped sentence has been humoured, not heard.
         if (topic) {
           this.plan = {
@@ -1417,42 +1411,39 @@ export class Session {
           this.narrator.updatePlan(this.plan);
           this.debug('plan', this.plan);
         }
+
+        await this.narrate(
+          'REMIX',
+          `The child said: "${transcript}". They want the story to be about: ${
+            topic ?? 'something completely new'
+          }. Rebuild the next beat around that — really change it, do not just mention it once. Keep difficulty ${this.plan.difficulty}, the same target skills, and the same must-use words: ${this.plan.vocab_constraints.must_use_words.join(', ')}.`,
+        );
         return;
       }
+
+      case 'question_about_story_or_world':
+        // Counted here, in code, so the "three guiding questions then just tell
+        // them" rule cannot drift (edge case #8). The reply already knows the
+        // count and answered accordingly.
+        this.socraticCount = this.socraticCount >= MAX_SOCRATIC_QUESTIONS ? 0 : this.socraticCount + 1;
+        this.setMode('SOCRATIC', `question #${this.socraticCount}`);
+        await this.speak(reply.speakText);
+        this.resumeReading();
+        return;
 
       case 'chitchat':
-        if (interestTopic) {
-          this.interestSignals.push(interestTopic);
+        if (reply.interestTopic) {
+          this.interestSignals.push(reply.interestTopic);
           this.debug('interestSignals', this.interestSignals);
         }
-        await this.narrate(
-          'CHITCHAT',
-          `The child said: "${transcript}". Answer them warmly and briefly — two short sentences at the very most — then invite them back to the line they were reading. Do not turn this into a scene, and do not put what they said into the story now.`,
-        );
+        await this.speak(reply.speakText);
         this.resumeReading();
         return;
 
-      case 'want_to_stop':
-        await this.flag('early_exit', transcript);
-        this.send({ t: 'flag', type: 'early_exit', detail: transcript });
-        await this.end('child wants to stop');
-        return;
-
-      case 'sensitive_topic': {
-        // FIXED template. Never improvised. Flagged for the parent. PLAN.md §5.
-        const character = this.plan.characters[0] ?? 'our friend';
-        const line = T.sensitiveTopicLine(character);
-        await this.flag('sensitive_topic', transcript);
-        this.send({ t: 'flag', type: 'sensitive_topic', detail: transcript });
-        this.log('narrator', line, { template: 'sensitive_topic' });
-        await this.speak(line);
-        this.resumeReading();
-        return;
-      }
-
-      case 'unclear':
+      // help_with_word, unclear, and anything else: say the reply and carry on.
+      // There is no branch here that stays silent.
       default:
-        await this.speak(T.unclearLine());
+        await this.speak(reply.speakText);
         this.resumeReading();
         return;
     }
@@ -1594,7 +1585,7 @@ export class Session {
     if (this.mode === 'END' || this.closed) return;
     this.discardBuffer();
     this.setMode('END', reason);
-    this.stopListening();
+    this.stopWaitingForReply();
 
     await this.pron?.close();
     this.pron = null;
@@ -1667,6 +1658,7 @@ export class Session {
       }
     }
 
+    this.send({ t: 'listening', on: false });
     this.send({ t: 'ended', sessionId: this.sessionId ?? '' });
     await this.close();
   }

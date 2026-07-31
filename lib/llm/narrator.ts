@@ -20,14 +20,19 @@ export const narratorSchema = z.object({
 
 export type NarratorTurn = z.infer<typeof narratorSchema>;
 
+/**
+ * The narrator writes STORY. It no longer writes conversation.
+ *
+ * Answering the child — a question, a comment, a "this is boring" — is one fast
+ * call in lib/llm/respond.ts, because a reply that arrives four seconds late is
+ * not a reply. What is left here is the content the child actually reads and the
+ * beats around it, where quality is worth the extra second and the full safety
+ * pass earns its place.
+ */
 export type NarratorMode =
   | 'OPENING'
   | 'NEXT_BEAT'
-  | 'COACH'
   | 'ENCOURAGE'
-  | 'SOCRATIC'
-  | 'ANSWER_DIRECTLY'
-  | 'CHITCHAT'
   | 'REMIX'
   | 'ADAPT'
   | 'CHECK_IN'
@@ -85,7 +90,7 @@ function buildSystemPrompt(args: {
     '',
     '# Hard rules',
     '1. Warm, playful, age-appropriate. Short sentences. Never lecture.',
-    '2. Socratic behavior applies ONLY to thinking questions. When in SOCRATIC mode, reply with ONE simpler guiding question and praise the attempt. After at most 3 guiding questions give a strong hint and let the child say the answer. Procedural questions (what a word says, whether they can stop, how the app works) always get a direct, kind answer.',
+    '2. You are not answering the child here — that happens elsewhere and has already happened. Tell the story.',
     "3. The child's passage must obey the vocab constraints and work in the must-use words naturally.",
     '4. Nothing scary, nothing violent, nothing sad about family. No brand or IP content (no Elsa, no Pokemon) even if the child asks — offer an original stand-in instead, e.g. "a snow queen named Elka".',
     '5. Stay inside the story world. Weave any interruption back into the story within one sentence.',
@@ -93,7 +98,7 @@ function buildSystemPrompt(args: {
     '',
     '# Output',
     'speak_text is read aloud by a text-to-speech voice — write it to be spoken, never with stage directions, markdown, or emoji.',
-    "child_passage is displayed for the child to read aloud. Keep it to 1-2 sentences. Set it to null when the child should not be reading (closing, or a pure conversational turn).",
+    "child_passage is displayed for the child to read aloud. Keep it to 1-2 sentences. Set it to null when the child should not be reading (a closing, or a check-in).",
     'current_beat_index is which plan beat you are on.',
   ]
     .filter(Boolean)
@@ -109,16 +114,8 @@ const MODE_INSTRUCTIONS: Record<NarratorMode, string> = {
     // before the child finishes). So react to the STORY here, and do not open
     // with praise of your own or the child hears two compliments in a row.
     'The child just finished reading their passage. React to the story, advance to the next beat in 2-3 sentences, then give the next passage. Do not praise or comment on their reading — that is handled elsewhere. Do not greet them.',
-  COACH:
-    'The child is stuck on a word. Give ONE short, encouraging coaching line that helps them sound it out. Do not re-tell the story. Set child_passage to null.',
   ENCOURAGE:
     'The child has read two passages beautifully. Give ONE short praise line that names something specific they did well, then continue the story with the next beat and passage.',
-  SOCRATIC:
-    'The child asked a thinking question. Respond with ONE guiding question that helps them find the answer themselves. Praise their curiosity first. Then weave back toward the story in one sentence. Set child_passage to null.',
-  ANSWER_DIRECTLY:
-    'The child asked a procedural question (what a word says, how something works). Answer it directly and kindly in one or two sentences, then invite them to keep reading. Set child_passage to null.',
-  CHITCHAT:
-    'The child shared something about their life. Acknowledge it warmly in ONE sentence, connect it to the story in one more sentence, and invite them back to reading. Set child_passage to null.',
   REMIX:
     "The child asked for something different. Acknowledge their idea enthusiastically, then regenerate the NEXT beat and passage with their new theme. Keep the SAME difficulty, the SAME target skills, and the SAME must-use words. The child changes the costume; the lesson stays.",
   ADAPT:

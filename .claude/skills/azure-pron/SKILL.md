@@ -6,7 +6,7 @@ description: Conventions for Azure Pronunciation Assessment integration in this 
 # Azure Pronunciation Assessment
 
 Implementation lives in `server/azure.ts`. Two modes, never both at once:
-`PronunciationSession` (reading) and `TalkRecognizer` (talk button).
+`PronunciationSession` (per passage, scoring only) and `ConversationEar` (opened once at session start, never closed, hears everything).
 
 ## Final config values
 

@@ -14,7 +14,12 @@ import { AUDIO } from '../lib/env';
 import { floatPcmToWav } from '../lib/wav';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
-import { detectOffScript, looksLikeEcho, isInterruption } from '../lib/offscript';
+import {
+  branchUtterance,
+  looksLikeEcho,
+  isInterruption,
+  soundsUnfinished,
+} from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
 import { shouldCheckIn, summarizeProgress, parseYesNo } from '../lib/sessionflow';
 import {
@@ -442,50 +447,42 @@ console.log('\nWAV encoding (audio-check isolation path)');
 }
 
 // --------------------------------------------------------------------------
-console.log('\nOff-script detection (talking vs reading)');
+console.log('\nBranching an utterance: reading, talking, or both');
 // --------------------------------------------------------------------------
 {
-  const passageWords = (text: string): TrackedWord[] =>
-    tokenize(text).map((expected, index) => ({
-      index,
-      expected,
-      bestScore: null,
-      errorType: null,
-      attempts: 0,
-      status: index === 0 ? 'current' : 'pending',
-    }));
+  const passage = 'The blue dragon flew over the hill.';
+  const branch = (text: string, p: string | null = passage) => branchUtterance({ text, passage: p });
 
-  const words = passageWords('The blue dragon flew over the hill.');
-  const verdict = (recognized: string) => detectOffScript({ recognized, words });
-
-  // The whole reason this exists: a child who says something mid-passage and is
-  // ignored learns the thing does not listen.
-  ok('"I am really bored of this" is off-script', verdict('I am really bored of this').offScript);
+  // Reading. The assessment layer owns these; the conversation layer says nothing.
+  ok('reading the line is reading', branch('The blue dragon flew over the hill').kind === 'reading');
+  ok('a partial read is reading', branch('The blue dragon flew').kind === 'reading');
   ok(
-    '"can we read about trucks instead" is off-script',
-    verdict('can we read about trucks instead').offScript,
-  );
-  ok('"I lost my tooth yesterday" is off-script', verdict('I lost my tooth yesterday').offScript);
-
-  // The expensive failure: interrupting a child who was reading.
-  ok('reading the passage is not off-script', !verdict('The blue dragon flew over the hill').offScript);
-  ok('a partial read is not off-script', !verdict('The blue dragon flew').offScript);
-  ok(
-    'a misread keeps enough overlap to stay reading',
-    !verdict('The bloo dragon flew over the hill').offScript,
-    JSON.stringify(verdict('The bloo dragon flew over the hill')),
+    'a misread is still reading',
+    branch('The bloo dragon flew over the hill').kind === 'reading',
+    JSON.stringify(branch('The bloo dragon flew over the hill')),
   );
 
-  // Short utterances need an unmistakable cue, and only when the passage does
-  // not contain it.
-  ok('"bored" alone is off-script', verdict('bored').offScript);
-  ok('"the hill" alone is not off-script', !verdict('the hill').offScript);
-  ok('a word from the passage is never a cue', !detectOffScript({ recognized: 'stop', words: passageWords('We stop at the top.') }).offScript);
-  ok('"stop" outside the passage is a cue', detectOffScript({ recognized: 'stop', words }).offScript);
+  // Talking. Every one of these has to get an answer.
+  ok('"I am really bored of this" is conversation', branch('I am really bored of this').kind === 'conversation');
+  ok('"can we read about trucks instead" is conversation', branch('can we read about trucks instead').kind === 'conversation');
+  ok('"I lost my tooth yesterday" is conversation', branch('I lost my tooth yesterday').kind === 'conversation');
+  ok('with no line on screen it is all conversation', branch('hello ollie', null).kind === 'conversation');
 
-  // Noise fragments into tiny tokens that match nothing — not a conversation.
-  ok('noise fragments are not off-script', !verdict('a uh oh').offScript);
-  ok('empty recognition is not off-script', !verdict('').offScript);
+  // Both, in one breath — the case the old design could not express at all.
+  const mixed = branch('The blue dragon flew can we do cars instead over the hill');
+  ok('an aside mid-line is mixed', mixed.kind === 'mixed', JSON.stringify(mixed));
+  ok('the aside is extracted', mixed.conversationText.toLowerCase().includes('cars'), mixed.conversationText);
+  ok('the reading half is kept', mixed.readingText.toLowerCase().includes('dragon'), mixed.readingText);
+
+  // A single wrong word inside a line is a stumble, not an interruption.
+  ok('one odd word does not make it mixed', branch('The blue dragon flapped over the hill').kind === 'reading');
+
+  // Knowing when they have not finished talking.
+  ok('"I like cars and" is unfinished', soundsUnfinished('I like cars and'));
+  ok('"I like cars, like" is unfinished', soundsUnfinished('I like cars, like'));
+  ok('"I like cars" is finished', !soundsUnfinished('I like cars'));
+  ok('one bare word is treated as unfinished', soundsUnfinished('Lamborghini'));
+  ok('but a cue word on its own is a whole turn', !soundsUnfinished('bored'));
 }
 
 // --------------------------------------------------------------------------
