@@ -32,6 +32,7 @@ async function main() {
   console.log('\nRealtime connectivity check\n');
   line('model', env.realtimeModel);
   line('voice', env.realtimeVoice);
+  line('transcription', env.transcribeModel || 'auto (falls back on model_not_found)');
   line('key', `${env.openaiKey.slice(0, 7)}…${env.openaiKey.slice(-4)}`);
   console.log('');
 
@@ -103,7 +104,12 @@ async function main() {
     process.exit(1);
   }
 
-  console.log('\nRealtime is working on this machine.\n');
+  console.log(`\nRealtime is working on this machine.`);
+  console.log(
+    'Note: transcription is NOT proven here — this only sends silence, so there is\n' +
+      'nothing to transcribe. Watch the dev log for `[realtime] heard "..."` on the\n' +
+      'first thing a child says; if it never appears, transcription is the problem.\n',
+  );
   process.exit(0);
 }
 

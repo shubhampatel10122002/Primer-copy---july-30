@@ -22,6 +22,26 @@ import { env, AUDIO } from '../lib/env';
 
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 
+/**
+ * Transcription models to try, best first.
+ *
+ * Which of these a project may actually use varies — ours was refused
+ * `gpt-4o-mini-transcribe` outright ("Project does not have access to model"),
+ * and a session with no working transcription is a session where nothing the
+ * child says is ever heard. So the list is walked on `model_not_found` rather
+ * than being one name we hope is right.
+ *
+ * `gpt-realtime-whisper` is the one the Realtime docs use and is part of the
+ * same family as the session model; `whisper-1` is the oldest and most widely
+ * enabled. Override with OPENAI_TRANSCRIBE_MODEL to pin one.
+ */
+const TRANSCRIBE_MODELS = [
+  'gpt-realtime-whisper',
+  'whisper-1',
+  'gpt-4o-mini-transcribe',
+  'gpt-4o-transcribe',
+] as const;
+
 export interface RealtimeCallbacks {
   /** The child started speaking. Fires from server VAD, not from a transcript. */
   onSpeechStarted: () => void;
@@ -84,6 +104,12 @@ export class RealtimeVoice {
   private pendingCancel = false;
   private configureAttempts = 0;
   private readyTimer: NodeJS.Timeout | null = null;
+  /** Events asked for before the socket opened. */
+  private outbox: string[] = [];
+  /** Transcription models to try, in order, as the project allows them. */
+  private transcribeModels: string[] = env.transcribeModel
+    ? [env.transcribeModel]
+    : [...TRANSCRIBE_MODELS];
 
   constructor(private cb: RealtimeCallbacks) {
     this.ws = new WebSocket(`${REALTIME_URL}?model=${encodeURIComponent(env.realtimeModel)}`, {
@@ -91,7 +117,13 @@ export class RealtimeVoice {
     });
 
     this.ws.on('open', () => {
+      // Configure FIRST, then release anything that was asked for while we were
+      // still connecting — order matters, the session has to exist before a
+      // response can be created in it.
       this.configure();
+      const queued = this.outbox.splice(0, this.outbox.length);
+      for (const data of queued) this.ws.send(data);
+      if (queued.length) console.log(`[realtime] session ready (${queued.length} message(s) queued during setup)`);
       this.cb.onOpen?.();
     });
 
@@ -112,9 +144,31 @@ export class RealtimeVoice {
     });
   }
 
+  /**
+   * Queue anything sent before the socket is open.
+   *
+   * This used to `return` on a socket that was still connecting, which quietly
+   * threw the event away. `Session.start()` creates this object and asks for the
+   * greeting in the same tick — about a second before the WebSocket finishes its
+   * handshake — so the very first `response.create` of every session went in the
+   * bin. Nothing was ever spoken, `done` never resolved because `response.done`
+   * never came, and the session hung until a stray noise triggered the VAD and
+   * cancelled a response that had never existed.
+   *
+   * That was the "few seconds of nothing at the start", the "produced NO audio",
+   * and the phantom barge-in, all from one dropped message.
+   */
   private send(event: Record<string, unknown>) {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify(event));
+    const data = JSON.stringify(event);
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+      return;
+    }
+    if (this.ws.readyState === WebSocket.CONNECTING) {
+      this.outbox.push(data);
+      return;
+    }
+    // Closing or closed: there is nobody to tell.
   }
 
   /**
@@ -154,7 +208,7 @@ export class RealtimeVoice {
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-            transcription: { model: 'gpt-4o-mini-transcribe', language: 'en' },
+            transcription: { model: this.transcribeModels[0], language: 'en' },
             // Laptop speakers and a laptop microphone in the same room.
             ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
             turn_detection: {
@@ -225,10 +279,26 @@ export class RealtimeVoice {
         break;
       }
 
-      case 'conversation.item.input_audio_transcription.failed':
-        console.warn('[realtime] transcription failed', JSON.stringify(event.error ?? {}));
+      case 'conversation.item.input_audio_transcription.failed': {
         this.partialTranscript = '';
+        const err = event.error ?? {};
+        console.warn('[realtime] transcription failed', JSON.stringify(err));
+
+        // The project cannot use this model. Nothing the child says will ever be
+        // heard until we pick one it can, so move down the list and reconfigure.
+        if (err.code === 'model_not_found' && this.transcribeModels.length > 1) {
+          const dead = this.transcribeModels.shift();
+          console.warn(`[realtime] no access to ${dead} — switching to ${this.transcribeModels[0]}`);
+          this.send({
+            type: 'session.update',
+            session: {
+              type: 'realtime',
+              audio: { input: { transcription: { model: this.transcribeModels[0], language: 'en' } } },
+            },
+          });
+        }
         break;
+      }
 
       // Audio out. The event name changed across model versions; accept both.
       case 'response.output_audio.delta':
@@ -344,8 +414,24 @@ export class RealtimeVoice {
     // between the two, so make it safe here too.
     this.cancelActive();
 
-    let resolve!: () => void;
-    const done = new Promise<void>((r) => (resolve = r));
+    let settle!: () => void;
+    const done = new Promise<void>((r) => (settle = r));
+
+    // Never wait forever for a `response.done` that is not coming. A silently
+    // dropped event once left the whole session hanging on this promise, and the
+    // only thing that unstuck it was a stray noise triggering the VAD.
+    const watchdog = setTimeout(() => {
+      if (this.active === entry) {
+        console.error('[realtime] no response.done after 30s — releasing the utterance');
+        this.active = null;
+        settle();
+      }
+    }, 30_000);
+    const resolve = () => {
+      clearTimeout(watchdog);
+      settle();
+    };
+
     const entry = { id: null as string | null, resolve, cancelled: false, started: false };
     this.active = entry;
     this.pendingCancel = false;
@@ -391,6 +477,11 @@ export class RealtimeVoice {
     if (entry.started) this.send({ type: 'response.cancel' });
     else this.pendingCancel = true;
     entry.resolve();
+  }
+
+  /** Which transcription model is currently configured. */
+  get transcriptionModel(): string {
+    return this.transcribeModels[0];
   }
 
   async close(): Promise<void> {

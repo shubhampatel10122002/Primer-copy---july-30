@@ -104,14 +104,17 @@ const DIALOGUE_MEMORY = 10;
 const MAX_HOLD_MS = 15_000;
 
 /**
- * Ignore "the child started speaking" for this long after WE start speaking.
+ * Ignore "the child started speaking" for this long after they first HEAR us.
  *
  * Echo cancellation takes a moment to adapt to a new sound, so the onset of our
- * own voice is the single most likely thing to be mistaken for the child's. And
- * an interruption inside this window is an interruption of nothing — they cannot
- * have reacted to a sentence they have not heard yet.
+ * own voice is the single most likely thing to be mistaken for the child's.
+ * Measured from the first audible byte, not from when we asked the model to
+ * speak — those can be most of a second apart.
  */
 const INTERRUPT_GUARD_MS = 400;
+
+/** Below this much audio heard, a cancelled line is worth saying again. */
+const UNHEARD_AUDIBLE_MS = 1_200;
 
 /** If an interruption produces no words at all, assume it was noise and retry. */
 const UNHEARD_RETRY_MS = 1_800;
@@ -149,8 +152,8 @@ export class Session {
   private speakingText = '';
   /** While this is in the future, the child is mid-sentence and we stay quiet. */
   private childSpeakingUntil = 0;
-  /** When the current utterance began, for the interrupt guard. */
-  private speakingSince = 0;
+  /** When the child first actually HEARD the current utterance. */
+  private speakingFirstAudioAt = 0;
   /** A line cut off before a word of it was audible, and its recovery timer. */
   private unheard: string | null = null;
   private unheardTimer: NodeJS.Timeout | null = null;
@@ -235,6 +238,9 @@ export class Session {
 
   private sendAudio(pcm: Buffer) {
     if (this.ws.readyState !== 1) return;
+    // The first byte out is the first moment the child could possibly be
+    // reacting to us, which is what makes an interruption an interruption.
+    if (this.isSpeaking && this.speakingFirstAudioAt === 0) this.speakingFirstAudioAt = Date.now();
     this.audioBytesOut += pcm.length;
     this.ws.send(pcm, { binary: true });
   }
@@ -515,32 +521,48 @@ export class Session {
   private onChildStartedSpeaking() {
     if (this.closed) return;
 
-    // The first fraction of a second of our own audio is when echo cancellation
-    // is still adapting, and it is far and away the most common false trigger.
-    // A child genuinely cutting in this fast is cutting in on nothing — they
-    // have not heard a word yet.
-    if (this.isSpeaking && Date.now() - this.speakingSince < INTERRUPT_GUARD_MS) {
-      this.debug('bargeInIgnored', 'too soon after we started — probably our own voice');
+    if (this.isSpeaking) {
+      const bytes = this.audioBytesOut - this.audioBytesAtSpeakStart;
+      const audibleFor = this.speakingFirstAudioAt ? Date.now() - this.speakingFirstAudioAt : 0;
+
+      // You cannot interrupt something you have not heard.
+      //
+      // Nothing has reached their ears yet, so whatever the microphone picked up
+      // was not a reaction to us — it was the room, a sibling, or the tail of our
+      // own greeting coming back before echo cancellation had settled. Cancelling
+      // here is how the first thing Ollie ever says gets killed before a syllable
+      // of it plays, which is exactly what kept happening.
+      if (bytes === 0) {
+        this.debug('bargeInIgnored', 'nothing had played yet — not a reaction to us');
+        return;
+      }
+
+      // And for a moment after the sound starts, echo cancellation is still
+      // adapting to it, which is the other reliable false trigger.
+      if (audibleFor < INTERRUPT_GUARD_MS) {
+        this.debug('bargeInIgnored', `only ${audibleFor}ms audible — too soon to be a reply`);
+        return;
+      }
+
+      this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
+      this.lastSpeechAt = Date.now();
+      this.nudgeStage = 0;
+
+      console.log(`[barge-in] child spoke over "${this.speakingText.slice(0, 40)}…"`);
+      this.debug('bargeIn', { by: 'vad', over: this.speakingText.slice(0, 60), audibleFor });
+
+      // Barely heard any of it and then nothing follows? That was a noise, and
+      // the line is worth saying again rather than losing.
+      if (audibleFor < UNHEARD_AUDIBLE_MS) this.armUnheard(this.speakingText);
+
+      this.stopSpeaking();
+      this.send({ t: 'hearing', on: true });
       return;
     }
 
     this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
     this.lastSpeechAt = Date.now();
     this.nudgeStage = 0;
-
-    if (this.isSpeaking) {
-      const bytes = this.audioBytesOut - this.audioBytesAtSpeakStart;
-      console.log(`[barge-in] child spoke over "${this.speakingText.slice(0, 40)}…"`);
-      this.debug('bargeIn', { by: 'vad', over: this.speakingText.slice(0, 60), bytes });
-
-      // Cut off before a single sample reached them. Either they interrupted
-      // impossibly fast, or that was not a child at all — a door, a sibling, our
-      // own voice. Hold the line so it can be said again if nothing follows:
-      // a greeting silently swallowed is a session that never starts.
-      if (bytes === 0) this.armUnheard(this.speakingText);
-
-      this.stopSpeaking();
-    }
     this.send({ t: 'hearing', on: true });
   }
 
@@ -859,7 +881,7 @@ export class Session {
 
     this.isSpeaking = true;
     this.speakingText = text;
-    this.speakingSince = Date.now();
+    this.speakingFirstAudioAt = 0;
     this.gateOpenAt = Number.MAX_SAFE_INTEGER; // no scoring over our own voice
     this.send({ t: 'tts_start' });
     this.send({ t: 'speak', text });
@@ -891,6 +913,7 @@ export class Session {
       this.speaking = null;
       this.isSpeaking = false;
       this.speakingText = '';
+      this.speakingFirstAudioAt = 0;
       // Keep the gate shut for the audio tail so we don't score our own voice.
       this.gateOpenAt = Date.now() + AUDIO.gateTailMs;
       this.send({ t: 'tts_end' });
@@ -947,6 +970,7 @@ export class Session {
     }
     this.isSpeaking = false;
     this.speakingText = '';
+    this.speakingFirstAudioAt = 0;
     this.gateOpenAt = 0;
     this.speechGeneration += 1; // anything queued behind this is now stale
     // Cancelling Cartesia stops us SENDING audio; the browser is still holding a

@@ -117,6 +117,16 @@ For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
   captured room noise the moment it is ready fires `speech_started` on the first
   syllable of the greeting, every session. Audio from before the session is
   configured is dropped.
+- **Outgoing events are queued until the socket opens.** `Session.start()` asks
+  for the greeting a second before the WebSocket finishes its handshake. Dropping
+  that `response.create` meant `response.done` never came and the whole session
+  hung on an utterance that was never sent.
+- **You cannot interrupt what you have not heard.** Barge-in is ignored until
+  audio has actually reached the child, and for 400ms after — measured from the
+  first audible byte, not from when we asked the model to speak.
+- **Transcription models vary by project.** `gpt-4o-mini-transcribe` was refused
+  outright on ours. `TRANSCRIBE_MODELS` is walked on `model_not_found`; without
+  that, nothing the child says is ever heard and there is no other symptom.
 - **Cancel only what exists.** `response.cancel` before `response.created`
   produces "Cancellation failed: no active response found"; the cancel is
   deferred until the server confirms the response. Errors of that class are
