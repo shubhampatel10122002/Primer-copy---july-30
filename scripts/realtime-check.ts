@@ -11,7 +11,9 @@
  * drifted — a renamed field, a model that rejects the session shape — it shows
  * up here in ten seconds rather than as a silent owl in front of a child.
  *
- * Add --verbose to print every event including audio deltas.
+ * Add --verbose to print audio deltas. Set REALTIME_TRACE=1 to print the session
+ * configuration the server actually accepted, plus every unfamiliar event — that
+ * is the fastest way to find a field a model has rejected.
  */
 import 'dotenv/config';
 import { config } from 'dotenv';
@@ -69,6 +71,14 @@ async function main() {
     await new Promise((r) => setTimeout(r, 100));
   }
   line('sent', `1s of silence (upsampled to ${AUDIO.realtimeSampleRate}Hz)`);
+
+  // Interrupting is the thing that has to work, so prove the cancel path too.
+  line('cancel test', 'speaking, then cancelling immediately');
+  const doomed = voice.speak('This line should be cut off before you hear much of it.');
+  setTimeout(() => doomed.cancel(), 150);
+  await doomed.done;
+  line('cancel', 'returned cleanly (watch for a "no active response" error above)');
+  console.log('');
 
   const say = 'Hi there! I am Ollie, and I am ready to read with you.';
   line('speaking', JSON.stringify(say));
