@@ -99,24 +99,28 @@ async function main() {
     return 'credentials accepted, push stream opened';
   });
 
-  await check(`OpenAI Realtime (${env.realtimeModel})`, async () => {
-    // The voice and the ears are one connection now, and it is the hardest thing
-    // to debug from inside a live session — so prove it separately.
+  await check('OpenAI text-to-speech', async () => {
+    const { checkTts } = await import('../server/tts');
+    const { bytes, model } = await checkTts();
+    return `${bytes} bytes (~${(bytes / 2 / 24000).toFixed(2)}s) via ${model}, voice ${env.ttsVoice}`;
+  });
+
+  await check(`OpenAI Realtime ears (${env.realtimeModel})`, async () => {
+    // Connect only. This session never speaks, so there is nothing else to test
+    // here — `npm run realtime:check` lists the transcription models available.
     const { RealtimeVoice } = await import('../server/realtime');
-    let bytes = 0;
-    const voice = await new Promise<InstanceType<typeof RealtimeVoice>>((resolve, reject) => {
-      const v = new RealtimeVoice({
+    const voice = await new Promise<any>((resolve, reject) => {
+      const v: any = new RealtimeVoice({
         onSpeechStarted: () => {},
         onUtterance: () => {},
-        onAudio: (pcm) => (bytes += pcm.length),
         onOpen: () => resolve(v),
-        onError: (m) => reject(new Error(m)),
+        onError: (m: string) => reject(new Error(m)),
       });
+      setTimeout(() => reject(new Error('no connection within 15s')), 15_000);
     });
-    await voice.speak('Ready.').done;
+    const model = voice.transcriptionModel;
     await voice.close();
-    if (bytes === 0) throw new Error('connected but produced no audio — try `npm run realtime:check --verbose`');
-    return `${bytes} bytes of audio (~${(bytes / 2 / 24000).toFixed(2)}s), voice ${env.realtimeVoice}`;
+    return `connected, transcribing with ${model}`;
   });
 
   const failed = results.filter((r) => !r.ok);

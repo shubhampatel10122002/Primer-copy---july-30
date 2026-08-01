@@ -20,7 +20,8 @@ import { config } from 'dotenv';
 config({ path: '.env.local', override: false, quiet: true });
 
 import { env, AUDIO } from '../lib/env';
-import { RealtimeVoice, upsample16to24 } from '../server/realtime';
+import { RealtimeVoice } from '../server/realtime';
+import { speak as speakAloud, pcmSeconds } from '../server/tts';
 
 const verbose = process.argv.includes('--verbose');
 
@@ -28,12 +29,51 @@ function line(label: string, detail = '') {
   console.log(`  ${label.padEnd(28)} ${detail}`);
 }
 
+/**
+ * Ask the project which transcription models it can actually use.
+ *
+ * The model names move faster than any document, and getting one wrong has no
+ * symptom other than the child never being heard. This machine can reach the
+ * API; the machine that wrote this code could not.
+ */
+async function listAudioModels(): Promise<string[]> {
+  try {
+    const res = await fetch('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${env.openaiKey}` },
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { data?: { id: string }[] };
+    return (body.data ?? [])
+      .map((m) => m.id)
+      .filter((id) => /transcribe|whisper|realtime|tts|audio/.test(id))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 async function main() {
   console.log('\nRealtime connectivity check\n');
   line('model', env.realtimeModel);
-  line('voice', env.realtimeVoice);
+  line('voice', env.ttsVoice);
   line('transcription', env.transcribeModel || 'auto (falls back on model_not_found)');
   line('key', `${env.openaiKey.slice(0, 7)}…${env.openaiKey.slice(-4)}`);
+  console.log('');
+
+  const audioModels = await listAudioModels();
+  if (audioModels.length) {
+    console.log('  Audio models this project can use:');
+    for (const id of audioModels) console.log(`    ${id}`);
+    const transcribers = audioModels.filter((id) => /transcribe|whisper/.test(id));
+    console.log('');
+    console.log(
+      transcribers.length
+        ? `  -> set OPENAI_TRANSCRIBE_MODEL to one of: ${transcribers.join(', ')}`
+        : '  -> NO transcription models available. Nothing the child says can be heard.',
+    );
+  } else {
+    console.log('  (could not list models — check the key)');
+  }
   console.log('');
 
   let audioBytes = 0;
@@ -49,11 +89,6 @@ async function main() {
     onSpeechStarted: () => line('speech_started', 'VAD fired (barge-in signal)'),
     onSpeechStopped: () => line('speech_stopped', ''),
     onUtterance: (text) => line('transcript', JSON.stringify(text)),
-    onAudio: (pcm) => {
-      if (firstAudioMs < 0) firstAudioMs = Date.now() - started;
-      audioBytes += pcm.length;
-      if (verbose) line('audio delta', `${pcm.length} bytes`);
-    },
     onError: (m) => line('ERROR', m),
     onClose: (code, reason) => line('socket closed', `${code} ${reason}`),
   });
@@ -73,26 +108,27 @@ async function main() {
   }
   line('sent', `1s of silence (upsampled to ${AUDIO.realtimeSampleRate}Hz)`);
 
-  // Interrupting is the thing that has to work, so prove the cancel path too.
-  line('cancel test', 'speaking, then cancelling immediately');
-  const doomed = voice.speak('This line should be cut off before you hear much of it.');
-  setTimeout(() => doomed.cancel(), 150);
-  await doomed.done;
-  line('cancel', 'returned cleanly (watch for a "no active response" error above)');
-  console.log('');
-
+  // The voice is a separate service now, so test it separately.
   const say = 'Hi there! I am Ollie, and I am ready to read with you.';
   line('speaking', JSON.stringify(say));
-  const handle = voice.speak(say);
-
-  const timeout = setTimeout(() => {
-    line('TIMEOUT', 'no response.done within 20s');
-    handle.cancel();
-  }, 20_000);
+  const handle = speakAloud(say, (pcm) => {
+    if (firstAudioMs < 0) firstAudioMs = Date.now() - started;
+    audioBytes += pcm.length;
+    if (verbose) line('audio chunk', `${pcm.length} bytes`);
+  });
   await handle.done;
-  clearTimeout(timeout);
 
-  const seconds = audioBytes / 2 / AUDIO.ttsSampleRate;
+  // Barge-in aborts this mid-sentence, so prove it stops cleanly.
+  line('cancel test', 'speaking, then cancelling after 150ms');
+  let cancelledBytes = 0;
+  const doomed = speakAloud('This line should be cut off long before it finishes.', (pcm) => {
+    cancelledBytes += pcm.length;
+  });
+  setTimeout(() => doomed.cancel(), 150);
+  await doomed.done;
+  line('cancel', `stopped after ${cancelledBytes} bytes`);
+
+  const seconds = pcmSeconds(audioBytes);
   console.log('');
   line('audio received', `${audioBytes} bytes (~${seconds.toFixed(2)}s)`);
   line('first audio', firstAudioMs < 0 ? 'never' : `${firstAudioMs}ms after connect`);

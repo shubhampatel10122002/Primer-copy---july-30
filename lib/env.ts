@@ -26,9 +26,9 @@ export const env = {
   get realtimeModel() {
     return process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
   },
-  /** Any of the Realtime voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, cedar, marin. */
-  get realtimeVoice() {
-    return process.env.OPENAI_REALTIME_VOICE || 'coral';
+  /** alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer. */
+  get ttsVoice() {
+    return process.env.OPENAI_TTS_VOICE || process.env.OPENAI_REALTIME_VOICE || 'coral';
   },
   /** Pin a transcription model. Empty means walk the fallback list. */
   get transcribeModel() {

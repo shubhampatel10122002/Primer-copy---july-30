@@ -158,7 +158,7 @@ export class AudioEngine {
    * How much audio is still queued ahead of the playback position.
    *
    * The server sends the text of an utterance before streaming its audio, and it
-   * considers itself finished when Cartesia stops *sending* — not when the
+   * considers itself finished when it stops *sending* — not when the
    * browser stops *playing*. This is what the UI uses to hold a caption back
    * until the previous utterance has actually finished out loud.
    */

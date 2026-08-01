@@ -18,7 +18,8 @@ mode and asked for words.
 | `server/session.ts` | The state machine. Owns modes, timers, half-duplex gate, persistence. |
 | `server/tracker.ts` | Word-by-word passage following: best-attempt scoring, repeats, reading ahead. |
 | `server/azure.ts` | `PronunciationSession` — per passage, scoring ONLY. |
-| `server/realtime.ts` | The voice and the ears: one OpenAI Realtime socket. Server VAD, transcripts, speech. |
+| `server/realtime.ts` | The EARS: one OpenAI Realtime socket. Server VAD + transcripts. Never speaks. |
+| `server/tts.ts` | The VOICE: `/v1/audio/speech`, streamed PCM, cancellable. Verbatim, no opinion. |
 | `lib/leniency.ts` | Developmental-speech table. Extend this during kid testing. |
 | `lib/conversation.ts` | Was that reading, talking, or both? Plus the echo guard and "have they finished?". |
 | `lib/facts.ts` | What the child told us today, and which beat may use it. |
@@ -33,7 +34,8 @@ mode and asked for words.
 ## Conventions
 
 - **Model IDs** live in `lib/env.ts` (`MODELS`). Sonnet writes the story; Haiku
-  answers the child and runs the safety pass; the Realtime model is the voice.
+  answers the child and runs the safety pass. OpenAI does the ears and the voice,
+  as two separate services that never overlap.
 - **Never call the Anthropic API without `lib/llm/client.ts`.** It normalises
   `ANTHROPIC_BASE_URL`, which is set without `/v1` on any machine with Claude
   Code installed and otherwise 404s every request.
@@ -59,9 +61,16 @@ mode and asked for words.
   `input_audio_buffer.speech_started` from the audio itself, ~200ms after the
   first syllable. Every previous design had to wait for a transcript and was
   therefore always too late. Do not put word-matching back in this path.
-- **`create_response: false` is load-bearing.** The Realtime model must never
-  reply on its own — it would answer a child reading their passage aloud. We use
-  its ears and its voice; the state machine keeps its judgment.
+- **The Realtime session cannot speak, and that is deliberate.**
+  `output_modalities: ['text']` plus `create_response: false`. When it WAS the
+  voice — `response.create` with "read this aloud, word for word" — it read back
+  what the child had just said instead of the line it was given. Narration goes
+  through `server/tts.ts`, which has no conversation and no opinion.
+- **A child reporting that the app is broken is the most useful thing they can
+  say.** `needs_help` takes "I can't see anything" literally: it flags for the
+  grown-up and re-pushes the whole visible state (`resync`). It used to land in
+  `unclear`, which answered "Hmm, I didn't catch that!" — telling a child their
+  correct description of a real bug was their mistake.
 - **When the child takes the floor, `yieldFloor()`.** Queued and held speech is
   dropped, not just the sentence in the air. A coaching line written before they
   said "I don't want to read any more" is about a moment that no longer exists.
@@ -93,9 +102,10 @@ npm run smoke           # verifies Postgres, Anthropic, Azure, OpenAI credential
 npm run dev             # Next.js on :3000 + WS server on :3001
 ```
 
-**Run `npm run realtime:check` first when voice misbehaves.** It exercises the
-connection, the session config and one spoken line in isolation, and prints every
-event — far easier to read than the same failure buried in a live session.
+**Run `npm run realtime:check` first when voice or hearing misbehaves.** It asks
+your project which audio models it can actually use (the names move faster than
+any document), connects the ears, speaks a line, and cancels one mid-sentence.
+Far easier to read than the same failure buried in a live session.
 
 Run `npm run selftest` after touching `tracker.ts`, `leniency.ts`, `pedagogy.ts`,
 `skills.ts`, `conversation.ts`, `facts.ts`, `sessionflow.ts`, or `profile.ts` —

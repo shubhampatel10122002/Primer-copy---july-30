@@ -2,22 +2,24 @@ import WebSocket from 'ws';
 import { env, AUDIO } from '../lib/env';
 
 /**
- * The voice and the ears, on one connection.
+ * The ears. Not the voice.
  *
- * This replaces two things that used to be separate and separately imperfect:
- * an always-on Azure recognizer that told us what the child said, and Cartesia,
- * which said things back. The problem was never either of them individually —
- * it was that nothing in that arrangement knew the child had started talking
- * until a transcript arrived, which is far too late to stop a sentence.
+ * We are here for exactly one event: `input_audio_buffer.speech_started`, which
+ * server-side VAD emits from the audio itself within a couple of hundred
+ * milliseconds of the child's first syllable. Every design before this had to
+ * infer "they have started talking" from a transcript, which arrives a second
+ * late — long enough that the narrator had finished its sentence anyway.
  *
- * The Realtime API detects speech itself, in the audio, and says so
- * (`input_audio_buffer.speech_started`) within a couple of hundred milliseconds
- * of the first syllable. That single event is why we are here: barge-in stops
- * being something we infer and becomes something we are told.
+ * This session cannot speak, structurally: `output_modalities: ['text']` means
+ * it has no audio to emit even if something asked it to, and
+ * `create_response: false` means nothing asks. Narration goes through
+ * `server/tts.ts`, which is a text-to-speech endpoint with no conversation and
+ * no opinion — because when this file WAS the voice, it once read back what the
+ * child had just said instead of the line it was handed.
  *
- * What has NOT moved: pronunciation assessment. Azure still scores every
- * passage, because no general-purpose speech model returns per-phoneme accuracy
- * for a five-year-old reading "bridge". The two run on the same audio.
+ * Pronunciation assessment stays on Azure, on the same audio: no general-purpose
+ * speech model returns per-phoneme accuracy for a five-year-old reading
+ * "bridge".
  */
 
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
@@ -25,17 +27,18 @@ const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 /**
  * Transcription models to try, best first.
  *
- * Which of these a project may actually use varies — ours was refused
- * `gpt-4o-mini-transcribe` outright ("Project does not have access to model"),
- * and a session with no working transcription is a session where nothing the
- * child says is ever heard. So the list is walked on `model_not_found` rather
- * than being one name we hope is right.
+ * Which of these a project may use varies, and getting it wrong has no symptom
+ * other than the child never being heard — ours was refused
+ * `gpt-4o-mini-transcribe` outright ("Project does not have access to model").
+ * So this is a list that gets walked on `model_not_found`, not one name we hope
+ * is right.
  *
- * `gpt-realtime-whisper` is the one the Realtime docs use and is part of the
- * same family as the session model; `whisper-1` is the oldest and most widely
- * enabled. Override with OPENAI_TRANSCRIBE_MODEL to pin one.
+ * The names move faster than any document. `npm run realtime:check` asks your
+ * project directly which ones it has and prints them; pin one with
+ * OPENAI_TRANSCRIBE_MODEL if you want to stop guessing entirely.
  */
 const TRANSCRIBE_MODELS = [
+  'gpt-live-transcribe',
   'gpt-realtime-whisper',
   'whisper-1',
   'gpt-4o-mini-transcribe',
@@ -49,18 +52,10 @@ export interface RealtimeCallbacks {
   onSpeechStopped?: () => void;
   /** A complete utterance from the child, transcribed. */
   onUtterance: (text: string) => void;
-  /** Audio to play, 24kHz mono PCM16. */
-  onAudio: (pcm: Buffer) => void;
   onError?: (message: string) => void;
   /** The connection came up or went down. */
   onOpen?: () => void;
   onClose?: (code: number, reason: string) => void;
-}
-
-export interface SpeakHandle {
-  /** Resolves when the utterance has finished generating (or was cancelled). */
-  done: Promise<void>;
-  cancel: () => void;
 }
 
 /** Upsample 16kHz PCM16 to the 24kHz PCM16 the Realtime API expects. */
@@ -90,18 +85,7 @@ export class RealtimeVoice {
   /** Fatal errors reach the UI; benign races only reach the log. */
   private seenEventTypes = new Set<string>();
 
-  /** The response currently being spoken, if any. */
-  private active: {
-    id: string | null;
-    resolve: () => void;
-    cancelled: boolean;
-    /** True once the server has confirmed a response exists to cancel. */
-    started: boolean;
-  } | null = null;
-
   private partialTranscript = '';
-  /** A cancel that arrived before the server confirmed the response existed. */
-  private pendingCancel = false;
   private configureAttempts = 0;
   private readyTimer: NodeJS.Timeout | null = null;
   /** Events asked for before the socket opened. */
@@ -200,11 +184,10 @@ export class RealtimeVoice {
       type: 'session.update',
       session: {
         type: 'realtime',
-        output_modalities: ['audio'],
-        instructions:
-          'You are Ollie, a warm, playful owl who reads stories with young children. ' +
-          'You will be told exactly what to say. Say it warmly and clearly, at an unhurried ' +
-          'pace, as if reading a picture book aloud to a five-year-old.',
+        // TEXT, not audio. This session is ears; it has nothing to say and now
+        // has no way to say it. See the note at the top of the file.
+        output_modalities: ['text'],
+        instructions: 'Do not respond. You are only listening.',
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
@@ -218,23 +201,12 @@ export class RealtimeVoice {
               // Children pause mid-sentence constantly. This is the "have they
               // finished?" window, and it is deliberately longer than the default.
               silence_duration_ms: 900,
-              // We decide when to reply. See above.
+              // Nothing here ever replies. Both of these exist to make sure of
+              // it from two directions.
               create_response: false,
-              // And we do the interrupting, on speech_started, so that exactly
-              // one thing is responsible for it. With both, the server cancels
-              // the response and then our cancel arrives to find nothing there.
               interrupt_response: false,
             },
           },
-          output: minimal
-            ? { format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate }, voice: env.realtimeVoice }
-            : {
-                format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-                voice: env.realtimeVoice,
-                // Unhurried, like reading a picture book. Dropped on the retry
-                // in case a model rejects the field.
-                speed: 0.95,
-              },
         },
       },
     });
@@ -300,36 +272,6 @@ export class RealtimeVoice {
         break;
       }
 
-      // Audio out. The event name changed across model versions; accept both.
-      case 'response.output_audio.delta':
-      case 'response.audio.delta': {
-        if (this.active?.cancelled) break;
-        if (typeof event.delta === 'string') {
-          this.cb.onAudio(Buffer.from(event.delta, 'base64'));
-        }
-        break;
-      }
-
-      case 'response.created':
-        if (this.active && !this.active.id) this.active.id = event.response?.id ?? null;
-        if (this.active) this.active.started = true;
-        // Cancelled before the server had even created it. Send the cancel NOW,
-        // when there is finally something to cancel — sending it earlier is what
-        // produced "Cancellation failed: no active response found" on the very
-        // first barge-in of every session.
-        if (this.pendingCancel) {
-          this.pendingCancel = false;
-          this.send({ type: 'response.cancel' });
-        }
-        break;
-
-      case 'response.done': {
-        const done = this.active;
-        this.active = null;
-        done?.resolve();
-        break;
-      }
-
       case 'error': {
         const message = event.error?.message ?? JSON.stringify(event.error);
         console.error('[realtime]', message);
@@ -353,11 +295,6 @@ export class RealtimeVoice {
         if (!benign) this.cb.onError?.(`realtime: ${message}`);
 
         // An error usually kills the in-flight response; do not hang on it.
-        if (this.active) {
-          const done = this.active;
-          this.active = null;
-          done.resolve();
-        }
         break;
       }
 
@@ -397,88 +334,6 @@ export class RealtimeVoice {
     this.send({ type: 'input_audio_buffer.append', audio: pcm24k.toString('base64') });
   }
 
-  /**
-   * Say exactly this.
-   *
-   * The story, the passages, the coaching lines and the fixed comfort template
-   * are all written elsewhere — by the narrator on Sonnet, or by hand — and this
-   * only voices them. So the instruction is verbatim-or-nothing: the model is a
-   * mouth here, not an author.
-   */
-  speak(text: string): SpeakHandle {
-    if (this.closed || !text.trim()) {
-      return { done: Promise.resolve(), cancel: () => {} };
-    }
-
-    // One utterance at a time. The caller serialises, but a barge-in can land
-    // between the two, so make it safe here too.
-    this.cancelActive();
-
-    let settle!: () => void;
-    const done = new Promise<void>((r) => (settle = r));
-
-    // Never wait forever for a `response.done` that is not coming. A silently
-    // dropped event once left the whole session hanging on this promise, and the
-    // only thing that unstuck it was a stray noise triggering the VAD.
-    const watchdog = setTimeout(() => {
-      if (this.active === entry) {
-        console.error('[realtime] no response.done after 30s — releasing the utterance');
-        this.active = null;
-        settle();
-      }
-    }, 30_000);
-    const resolve = () => {
-      clearTimeout(watchdog);
-      settle();
-    };
-
-    const entry = { id: null as string | null, resolve, cancelled: false, started: false };
-    this.active = entry;
-    this.pendingCancel = false;
-
-    this.send({
-      type: 'response.create',
-      response: {
-        // Out of band: this is narration we wrote, not the model's turn in a
-        // conversation, and it must not accumulate as "things I decided to say".
-        conversation: 'none',
-        output_modalities: ['audio'],
-        instructions: [
-          'Read the following aloud, word for word, exactly as written.',
-          'Do not add anything. Do not greet. Do not comment. Do not paraphrase.',
-          'Do not read this instruction aloud.',
-          '',
-          text,
-        ].join('\n'),
-      },
-    });
-
-    return {
-      done,
-      cancel: () => {
-        if (entry.cancelled) return;
-        entry.cancelled = true;
-        if (this.active === entry) this.active = null;
-        // Audio stops reaching the child either way — `cancelled` gates that.
-        // Telling the server is only about not paying for tokens nobody hears,
-        // and it can only be told once it knows the response exists.
-        if (entry.started) this.send({ type: 'response.cancel' });
-        else this.pendingCancel = true;
-        resolve();
-      },
-    };
-  }
-
-  private cancelActive() {
-    if (!this.active) return;
-    const entry = this.active;
-    this.active = null;
-    entry.cancelled = true;
-    if (entry.started) this.send({ type: 'response.cancel' });
-    else this.pendingCancel = true;
-    entry.resolve();
-  }
-
   /** Which transcription model is currently configured. */
   get transcriptionModel(): string {
     return this.transcribeModels[0];
@@ -488,7 +343,6 @@ export class RealtimeVoice {
     if (this.closed) return;
     this.closed = true;
     if (this.readyTimer) clearTimeout(this.readyTimer);
-    this.cancelActive();
     try {
       this.ws.close();
     } catch {

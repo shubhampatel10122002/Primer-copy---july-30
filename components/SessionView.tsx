@@ -59,7 +59,11 @@ export default function SessionView() {
    * word-level timing.
    */
   const afterCurrentAudio = useCallback((fn: () => void) => {
-    const delay = engineRef.current?.playbackRemainingMs() ?? 0;
+    // Capped. If the queue is somehow long — a burst of audio, a stalled clock —
+    // holding the passage back any further just leaves the child staring at an
+    // empty screen, and text on screen early is far better than text that never
+    // arrives.
+    const delay = Math.min(engineRef.current?.playbackRemainingMs() ?? 0, 4_000);
     if (delay < 120) {
       fn();
       return;
