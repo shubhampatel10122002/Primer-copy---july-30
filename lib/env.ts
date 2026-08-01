@@ -30,6 +30,10 @@ export const env = {
   get realtimeVoice() {
     return process.env.OPENAI_REALTIME_VOICE || 'coral';
   },
+  /** Pin a transcription model. Empty means walk the fallback list. */
+  get transcribeModel() {
+    return process.env.OPENAI_TRANSCRIBE_MODEL || '';
+  },
   get databaseUrl() {
     return process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/primer';
   },
