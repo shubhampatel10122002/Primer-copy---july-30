@@ -503,3 +503,11 @@ button {
   0%, 100% { transform: scale(1); opacity: 1; }
   50% { transform: scale(1.35); opacity: 0.55; }
 }
+
+/* Server VAD is hearing the child right now — the same signal that stops the
+   narrator mid-word. Showing it makes "it heard me" visible instead of implied. */
+.ear.hearing {
+  border-color: var(--good);
+  color: var(--good);
+  background: var(--good-soft);
+}

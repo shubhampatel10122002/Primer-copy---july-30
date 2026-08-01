@@ -6,7 +6,6 @@ import { generateText } from 'ai';
 import { pool, query, getDemoChild, schemaIsReady, describeTarget } from '../lib/db';
 import { model } from '../lib/llm/client';
 import { checkAzureCredentials } from '../server/azure';
-import { checkCartesia } from '../server/cartesia';
 import { respondToChild } from '../lib/llm/respond';
 import { env } from '../lib/env';
 
@@ -16,7 +15,7 @@ const TIMEOUT_MS = 25_000;
 
 /**
  * Every check is bounded. A blocked network (corporate proxy, firewall) makes
- * the Azure and Cartesia SDKs hang silently rather than error, so a hard timeout
+ * the Azure SDK hangs silently rather than erroring, so a hard timeout
  * is the difference between a diagnosable failure and a mystery.
  */
 async function check(name: string, fn: () => Promise<string>) {
@@ -100,10 +99,24 @@ async function main() {
     return 'credentials accepted, push stream opened';
   });
 
-  await check(`Cartesia (${env.cartesiaModel})`, async () => {
-    const bytes = await checkCartesia();
-    const seconds = bytes / 4 / 44100;
-    return `${bytes} bytes of audio (~${seconds.toFixed(2)}s)`;
+  await check(`OpenAI Realtime (${env.realtimeModel})`, async () => {
+    // The voice and the ears are one connection now, and it is the hardest thing
+    // to debug from inside a live session — so prove it separately.
+    const { RealtimeVoice } = await import('../server/realtime');
+    let bytes = 0;
+    const voice = await new Promise<InstanceType<typeof RealtimeVoice>>((resolve, reject) => {
+      const v = new RealtimeVoice({
+        onSpeechStarted: () => {},
+        onUtterance: () => {},
+        onAudio: (pcm) => (bytes += pcm.length),
+        onOpen: () => resolve(v),
+        onError: (m) => reject(new Error(m)),
+      });
+    });
+    await voice.speak('Ready.').done;
+    await voice.close();
+    if (bytes === 0) throw new Error('connected but produced no audio — try `npm run realtime:check --verbose`');
+    return `${bytes} bytes of audio (~${(bytes / 2 / 24000).toFixed(2)}s), voice ${env.realtimeVoice}`;
   });
 
   const failed = results.filter((r) => !r.ok);

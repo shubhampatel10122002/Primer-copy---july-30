@@ -118,12 +118,6 @@ export interface WordAssessment {
 
 export type ClientMessage =
   | { t: 'start' }
-  /**
-   * The browser heard the child's voice over our own playback and has already
-   * stopped it locally. Sent from an energy detector, not from a transcript —
-   * waiting for words is waiting too long.
-   */
-  | { t: 'barge_in'; level: number; floor: number }
   | { t: 'resume' }
   | { t: 'stop' }
   /** Tapping the on-screen answer to a yes/no question, instead of saying it. */
@@ -147,6 +141,8 @@ export type ServerMessage =
   | { t: 'talk_closed'; transcript: string | null; intent: Intent | null }
   /** The microphone is live. It is live for the whole session. */
   | { t: 'listening'; on: boolean }
+  /** Server VAD hears the child right now — the interruption signal, live. */
+  | { t: 'hearing'; on: boolean }
   /** Onboarding progress, so the panel can show the profile filling in. */
   | { t: 'profile'; name: string | null; age: number | null; interests: string[] }
   /** Something the child told us, now in the session's memory. */
