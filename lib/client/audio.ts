@@ -9,7 +9,8 @@
  * gate is authoritative; this is the belt-and-suspenders half).
  */
 
-const TTS_SAMPLE_RATE = 44100;
+/** What the Realtime API sends back: 24kHz mono PCM16, little-endian. */
+const TTS_SAMPLE_RATE = 24000;
 const MIC_SAMPLE_RATE = 16000;
 /** Buffer this much audio before starting playback, to survive network jitter. */
 const JITTER_BUFFER_SEC = 0.12;
@@ -35,16 +36,12 @@ export class AudioEngine {
   async init(): Promise<void> {
     if (this.ctx) return;
 
-    this.ctx = new AudioContext({ sampleRate: TTS_SAMPLE_RATE });
+    // Let the browser pick its native rate and resample our 24kHz buffers for us.
+    // Forcing the context to 24kHz used to be worth it when playback and capture
+    // shared a rate; now they do not, and a mismatched context is the thing most
+    // likely to make the voice sound pitched.
+    this.ctx = new AudioContext();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
-
-    if (this.ctx.sampleRate !== TTS_SAMPLE_RATE) {
-      // The browser refused our requested rate. Playback still works (it
-      // resamples), but flag it — it changes the maths if TTS ever sounds pitched.
-      console.warn(
-        `[audio] AudioContext runs at ${this.ctx.sampleRate}Hz, requested ${TTS_SAMPLE_RATE}Hz`,
-      );
-    }
 
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -107,11 +104,16 @@ export class AudioEngine {
       void this.ctx.resume().catch(() => {});
     }
 
-    // Float32Array needs a 4-byte-aligned length; drop any ragged tail.
-    const usable = pcm.byteLength - (pcm.byteLength % 4);
+    // PCM16 is two bytes per sample; drop any ragged tail.
+    const usable = pcm.byteLength - (pcm.byteLength % 2);
     if (usable <= 0) return;
 
-    const samples = new Float32Array(pcm, 0, usable / 4);
+    const ints = new Int16Array(pcm, 0, usable / 2);
+    const samples = new Float32Array(ints.length);
+    for (let i = 0; i < ints.length; i++) samples[i] = ints[i] / 32768;
+
+    // Declaring the buffer at 24kHz is what tells Web Audio to resample it to the
+    // context rate. Get this wrong and Ollie sounds like a chipmunk.
     const buffer = this.ctx.createBuffer(1, samples.length, TTS_SAMPLE_RATE);
     buffer.copyToChannel(samples, 0);
 

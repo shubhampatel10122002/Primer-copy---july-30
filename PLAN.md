@@ -27,10 +27,11 @@ Scope: single child, no auth, no payments, web app only, English only.
 3. Resource group `primer-dev`, region `eastus`, pricing tier `F0` (free, 5 audio hours/month) or `S0`.
 4. After deploy, open the resource → **Keys and Endpoint** → copy **KEY 1** and the **Region**.
 
-### 0.2 Cartesia TTS
-1. cartesia.ai → sign up.
-2. **Voice Library** → audition voices → pick ONE warm friendly narrator voice → copy its **voice ID**.
-3. **API Keys** → create a key.
+### 0.2 OpenAI (voice, ears and turn detection)
+1. platform.openai.com → **API keys** → create a key.
+2. Put it in `.env.local` as `OPENAI_API_KEY`. Optionally set `OPENAI_REALTIME_VOICE`
+   (alloy, ash, ballad, coral, echo, sage, shimmer, verse, cedar, marin).
+3. Verify before anything else: `npm run realtime:check`.
 
 ### 0.3 Anthropic API
 Create a key at console.anthropic.com.
@@ -45,8 +46,7 @@ Create `.env.local` at repo root (see `.env.example` for the full list):
 ANTHROPIC_API_KEY=...
 AZURE_SPEECH_KEY=...
 AZURE_SPEECH_REGION=eastus
-CARTESIA_API_KEY=...
-CARTESIA_VOICE_ID=...
+OPENAI_API_KEY=...
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/primer
 ```
 
@@ -57,7 +57,7 @@ claude mcp add --transport http microsoft-learn https://learn.microsoft.com/api/
 claude mcp add --transport http context7 https://mcp.context7.com/mcp
 ```
 
-Microsoft Learn for Azure Speech SDK docs. Context7 for current Cartesia, Vercel AI SDK, and Drizzle docs. A Postgres MCP is not needed: use `psql` through the shell.
+Microsoft Learn for Azure Speech SDK docs. Context7 for the current OpenAI Realtime and Vercel AI SDK docs — the Realtime event schema moves, so check it rather than recalling it. A Postgres MCP is not needed: use `psql` through the shell.
 
 ### 0.7 Skills for Claude Code
 Maintained in `.claude/skills/` as decisions solidify:
@@ -75,8 +75,8 @@ Plus a short `CLAUDE.md` at repo root pointing here.
 | Frontend | Next.js (App Router). One session page + a debug/memory panel |
 | Backend | Next.js API routes + one standalone Node WebSocket server (`ws`) for the live session |
 | LLM | Claude Sonnet (`claude-sonnet-4-6`) for narrator, story planning, consolidation. Claude Haiku (`claude-haiku-4-5`) for intent classification and the safety pass. Via Vercel AI SDK (`@ai-sdk/anthropic`, `generateObject` / `generateText`) |
-| Listening | Azure Speech SDK. Two recognizers on the same audio at once: a plain one open for the whole session (conversation), and Pronunciation Assessment per passage (scoring) |
-| Voice out | Cartesia streaming TTS, one fixed voice ID |
+| Listening + voice | OpenAI Realtime API over one WebSocket: server-side VAD (turn detection), transcription, and speech out. `create_response: false` — we ask it to speak, it never decides to |
+| Reading assessment | Azure Speech SDK Pronunciation Assessment, per passage, on the same audio |
 | DB | PostgreSQL (Docker), raw SQL via `pg` |
 | Agent frameworks | None. Plain TypeScript functions and a deterministic state machine |
 
@@ -86,7 +86,7 @@ Rule of the whole codebase: **deterministic code decides what happens; the LLM o
 
 ## 2. System components
 
-1. **Session WebSocket server**: owns the live session. State machine, relays audio to Azure, streams Cartesia audio down, calls the narrator LLM. One concurrent session is fine.
+1. **Session WebSocket server**: owns the live session. State machine, fans mic audio to the Realtime socket and to Azure, streams Realtime audio down, calls the narrator LLM. One concurrent session is fine.
 2. **Audio pipeline** (browser + server): capture, playback, half-duplex control (§8).
 3. **Narrator agent**: one continuous LLM conversation per session, receives mode instructions from the state machine, returns structured output (§7).
 4. **Pedagogy module**: pure TypeScript, no LLM calls (§11).
@@ -261,27 +261,24 @@ Safety pass: before TTS, run `speak_text` + `child_passage` through one Haiku ca
 ### 8.2 Half-duplex rule (echo prevention)
 
 The rule is **"never score ourselves"**, not "never listen". Capture never stops
-on the client and the conversation layer never stops on the server. What the
-half-duplex gate still governs is narrower and absolute:
+and the Realtime connection never stops hearing. What the gate still governs is
+narrow and absolute: while audio is playing, and for 300ms after, no frame
+reaches pronunciation assessment. Scoring a child against a line while our own
+voice is in the room is the failure that rule exists to prevent.
 
-- While Cartesia audio is playing, and for 300ms after, **no** frame reaches
-  pronunciation assessment. Scoring a child against a line while our own voice is
-  in the room is the failure the rule exists to prevent, and it still cannot
-  happen.
-- The conversation layer hears those frames, and every utterance it produces is
-  checked against the exact words currently being spoken (`looksLikeEcho`).
-  Anything that substantially *is* those words is dropped.
-- `getUserMedia` runs with `echoCancellation: true`, which is what makes this
-  work on laptop speakers without headphones.
+Interruption is no longer inferred. The Realtime session runs server-side VAD on
+the input and emits `input_audio_buffer.speech_started` within ~200ms of the
+child's first syllable; the state machine cancels the in-flight response on that
+event and tells the browser to drop its queued audio (`stop_playback`). Every
+earlier design had to wait for a transcript, which arrives a second or more late
+— long enough that the narrator had usually finished the sentence anyway, making
+"stopping" indistinguishable from not stopping.
 
-Going deaf during narration was the original design and it was wrong: a child who
-speaks while the story is being told was heard by nothing at all. Accepting a
-barge-in kills playback instantly and tells the browser to drop its queued audio
-too (`stop_playback`) — cancelling the TTS stream only stops the server *sending*,
-and without the flush the narrator keeps talking over the child who interrupted.
+`getUserMedia` still runs with `echoCancellation: true`, and `looksLikeEcho`
+remains as a backstop for a stray word that gets through at high volume.
 
 ### 8.3 Playback
-Cartesia streaming output is forwarded over the WebSocket and played via Web Audio with a small jitter buffer. Target: first audible audio < 1s. While the child reads passage N, beat N+1 is already generated.
+Realtime audio (24kHz mono PCM16) is forwarded over the WebSocket and played via Web Audio with a small jitter buffer. While the child reads passage N, beat N+1 is already generated by the narrator.
 
 ### 8.4 Mic check onboarding
 A 15-second "say hi to Ollie!" screen. Verifies mic permission, audio path, and volume, and gives the child one successful voice interaction before any reading. If mic fails, show parent-facing fix instructions. Never start a session with an unverified mic — with no button anywhere, a dead microphone is a dead session.

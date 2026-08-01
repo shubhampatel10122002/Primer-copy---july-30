@@ -8,13 +8,7 @@ import { generateAcknowledgment } from '../lib/llm/acknowledge';
 import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
-import {
-  branchUtterance,
-  isInterruption,
-  looksLikeEcho,
-  settleDelay,
-  startsAnInterruption,
-} from '../lib/conversation';
+import { branchUtterance, looksLikeEcho, settleDelay } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
   shouldCheckIn,
@@ -34,8 +28,8 @@ import {
   type OnboardingDraft,
 } from '../lib/profile';
 import * as T from '../lib/templates';
-import { PronunciationSession, ConversationEar } from './azure';
-import { tts, type SpeakHandle } from './cartesia';
+import { PronunciationSession } from './azure';
+import { RealtimeVoice, type SpeakHandle } from './realtime';
 import { PassageTracker, tokenize } from './tracker';
 import type {
   Child,
@@ -118,26 +112,29 @@ export class Session {
   private tracker: PassageTracker | null = null;
 
   /**
-   * Two ears, two jobs, no contention.
+   * Two layers, two jobs, no contention.
    *
-   * `ear` is the conversation layer: open from the first moment of the session
-   * to the last, hears everything, never rebuilt. `pron` is the assessment
-   * layer: created per passage, strict, and only ever asked how well the words
-   * on screen were said. They run at the same time on the same audio, so a child
-   * who talks mid-line is heard by one while being scored by the other.
+   * `voice` is the conversation layer AND the mouth: one Realtime connection,
+   * open from the first moment of the session to the last. It detects speech in
+   * the audio itself and says so within a couple of hundred milliseconds, which
+   * is what finally makes interruption immediate — we are told the child has
+   * started, rather than inferring it from a transcript that arrives long after.
+   *
+   * `pron` is the assessment layer: created per passage, strict, and only ever
+   * asked how well the words on screen were said. Both get the same audio.
    */
-  private ear: ConversationEar | null = null;
+  private voice: RealtimeVoice | null = null;
   private pron: PronunciationSession | null = null;
 
   private speaking: SpeakHandle | null = null;
+  /** Running total of TTS bytes sent, so one utterance can be measured. */
+  private audioBytesOut = 0;
   private gateOpenAt = 0; // mic frames before this timestamp are dropped
   private isSpeaking = false;
   /** What we are saying right now — the echo guard needs the exact words. */
   private speakingText = '';
   /** While this is in the future, the child is mid-sentence and we stay quiet. */
   private childSpeakingUntil = 0;
-  /** The previous partial, so we can judge only the words that just arrived. */
-  private lastPartial = '';
   /**
    * Bumped whenever playback is cut short. Utterances queued behind the one that
    * was interrupted check this and drop themselves — otherwise the narrator
@@ -219,6 +216,7 @@ export class Session {
 
   private sendAudio(pcm: Buffer) {
     if (this.ws.readyState !== 1) return;
+    this.audioBytesOut += pcm.length;
     this.ws.send(pcm, { binary: true });
   }
 
@@ -251,16 +249,22 @@ export class Session {
   async start() {
     this.tick = setInterval(() => this.onTick(), 500);
 
-    // Open the ear FIRST, before anything is said. From this moment to the end of
-    // the session the child is being listened to, in every mode, with no gap for
-    // a recognizer to be torn down and rebuilt in. Everything else — onboarding,
+    // Connect FIRST, before anything is said. From this moment to the end of the
+    // session the child is being listened to, in every mode, with no gap for a
+    // recognizer to be torn down and rebuilt in. Everything else — onboarding,
     // reading, check-ins — happens on top of a microphone that never closes.
-    this.ear = new ConversationEar({
-      onPartial: (text) => this.onChildPartial(text),
+    this.voice = new RealtimeVoice({
+      onSpeechStarted: () => this.onChildStartedSpeaking(),
+      onSpeechStopped: () => this.onChildStoppedSpeaking(),
       onUtterance: (text) => this.onChildUtterance(text),
-      onError: (m) => console.error('[ear]', m),
+      onAudio: (pcm) => this.sendAudio(pcm),
+      onError: (m) => {
+        console.error('[realtime]', m);
+        this.send({ t: 'error', message: m });
+      },
+      onOpen: () => this.send({ t: 'listening', on: true }),
+      onClose: (code, reason) => console.warn(`[realtime] closed ${code} ${reason}`),
     });
-    this.send({ t: 'listening', on: true });
 
     // A child with no profile is met, not greeted: we cannot personalise a story
     // for someone we know nothing about, and planning before onboarding would
@@ -478,36 +482,38 @@ export class Session {
   // -------------------------------------------------------------------------
 
   /**
-   * A partial from the always-on ear. This is how we know the child is talking
-   * RIGHT NOW, which is how we know not to.
+   * The child started speaking. From the audio itself, not from a transcript.
+   *
+   * This is the event the whole rewrite was for. Every previous attempt at
+   * interruption had to wait for words — a partial, then a final — and words
+   * arrive hundreds of milliseconds to a second after the first syllable, by
+   * which point the narrator has usually finished its sentence and "stopping"
+   * is indistinguishable from not stopping. Server-side VAD hears the sound.
+   *
+   * So there is no cleverness left here. They are talking, so we stop. What they
+   * MEANT is decided later, when the transcript arrives.
    */
-  private onChildPartial(text: string) {
+  private onChildStartedSpeaking() {
     if (this.closed) return;
 
-    if (this.isSpeaking) {
-      // Stop HERE, on the partial — and judge only the words that have appeared
-      // since the last one, because everything before them is very likely our own
-      // voice being transcribed back at us.
-      //
-      // The browser's energy detector usually beats this by a couple of hundred
-      // milliseconds; this is the backstop for a child who speaks quietly enough
-      // to stay under the loudness bar but is still perfectly intelligible.
-      const previous = this.lastPartial;
-      this.lastPartial = text;
-      if (startsAnInterruption(text, this.speakingText, previous)) {
-        console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
-        this.debug('bargeIn', { by: 'words', text });
-        this.stopSpeaking();
-      } else {
-        return; // our own echo, or a noise
-      }
-    }
-
-    this.lastPartial = text;
     this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
     this.lastSpeechAt = Date.now();
     this.nudgeStage = 0;
-    this.debug('hearing', text);
+
+    if (this.isSpeaking) {
+      console.log(`[barge-in] child spoke over "${this.speakingText.slice(0, 40)}…"`);
+      this.debug('bargeIn', { by: 'vad', over: this.speakingText.slice(0, 60) });
+      this.stopSpeaking();
+    }
+    this.send({ t: 'hearing', on: true });
+  }
+
+  private onChildStoppedSpeaking() {
+    if (this.closed) return;
+    // Keep the floor for a moment longer: VAD calls the end of a breath, not the
+    // end of a thought, and the turn buffer is what decides they have finished.
+    this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
+    this.send({ t: 'hearing', on: false });
   }
 
   /**
@@ -522,21 +528,17 @@ export class Session {
    */
   private onChildUtterance(text: string) {
     if (this.closed || !text.trim()) return;
-    this.lastPartial = '';
 
-    // Usually we have already stopped, on the partial. This is the backstop for
-    // an utterance that arrived without one.
+    // Our own voice, heard through the speaker. Much rarer now — the Realtime
+    // session suppresses echo on the input and VAD would have stopped us long
+    // before this arrived — but a laptop at full volume in a small room can
+    // still land a word, and crediting that to the child derails the story.
+    if (this.isSpeaking && looksLikeEcho(text, this.speakingText)) {
+      this.debug('echoIgnored', text);
+      return;
+    }
     if (this.isSpeaking) {
-      if (looksLikeEcho(text, this.speakingText)) {
-        this.debug('echoIgnored', text);
-        return;
-      }
-      if (!isInterruption(text, this.speakingText)) {
-        this.debug('noiseIgnored', text);
-        return;
-      }
-      console.log(`[barge-in] "${text}" over "${this.speakingText.slice(0, 40)}…"`);
-      this.debug('bargeIn', text);
+      this.debug('bargeIn', { by: 'words', text });
       this.stopSpeaking();
     }
 
@@ -704,20 +706,6 @@ export class Session {
         if (this.answerFromUi) this.answerFromUi(msg.value);
         else this.stashedAnswer = msg.value;
         break;
-      // The browser heard a voice over our own playback and has already stopped
-      // it. No transcript is involved and none is waited for: the words arrive a
-      // moment later through the ear and decide what it MEANT. This only decides
-      // that we stop.
-      case 'barge_in':
-        if (this.isSpeaking) {
-          console.log(`[barge-in] heard over playback (rms ${msg.level} > ${msg.floor})`);
-          this.debug('bargeIn', { by: 'sound', level: msg.level, floor: msg.floor });
-          this.stopSpeaking();
-        }
-        // Either way they are talking, so hold anything queued.
-        this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
-        break;
-
       case 'resume':
         if (this.mode === 'PAUSED') {
           this.lastSpeechAt = Date.now();
@@ -753,7 +741,7 @@ export class Session {
   onAudio(pcm: Buffer) {
     if (this.closed) return;
 
-    this.ear?.write(pcm);
+    this.voice?.write(pcm);
 
     if (this.isSpeaking) return; // never score over our own voice
     if (Date.now() < this.gateOpenAt) return; // nor over the speaker tail
@@ -771,7 +759,7 @@ export class Session {
     // Anything awaiting a reply must not hang once the socket is gone.
     this.awaitingReply?.(null);
     this.speaking?.cancel();
-    await Promise.all([this.pron?.close(), this.ear?.close()]);
+    await Promise.all([this.pron?.close(), this.voice?.close()]);
   }
 
   // -------------------------------------------------------------------------
@@ -801,7 +789,7 @@ export class Session {
   }
 
   private async speakNow(text: string, generation = this.speechGeneration): Promise<void> {
-    if (!text.trim() || this.closed) return;
+    if (!text.trim() || this.closed || !this.voice) return;
 
     // Never start a sentence on top of one of theirs. The child has priority,
     // and "priority" that only applies when it is convenient is not priority.
@@ -813,39 +801,32 @@ export class Session {
 
     this.isSpeaking = true;
     this.speakingText = text;
-    this.lastPartial = '';
     this.gateOpenAt = Number.MAX_SAFE_INTEGER; // no scoring over our own voice
     this.send({ t: 'tts_start' });
     this.send({ t: 'speak', text });
     this.log('narrator', text);
 
     // Count what actually leaves the server. When a founder reports "I can't hear
-    // anything", this line is the difference between a server-side and a
+    // anything", this counter is the difference between a server-side and a
     // browser-side problem — and it costs one integer.
-    let bytes = 0;
+    const before = this.audioBytesOut;
     const started = Date.now();
-    let firstChunkMs = -1;
 
-    const handle = tts().speak(text, (chunk) => {
-      if (firstChunkMs < 0) firstChunkMs = Date.now() - started;
-      bytes += chunk.length;
-      this.sendAudio(chunk);
-    });
+    const handle = this.voice!.speak(text);
     this.speaking = handle;
 
     try {
       await handle.done;
-      const seconds = bytes / 4 / AUDIO.ttsSampleRate;
+      const bytes = this.audioBytesOut - before;
+      const seconds = bytes / 2 / AUDIO.ttsSampleRate;
       if (bytes === 0) {
         console.error(
-          `[tts] produced NO audio for "${text.slice(0, 50)}…" — check CARTESIA_API_KEY, CARTESIA_VOICE_ID and CARTESIA_MODEL`,
+          `[voice] produced NO audio for "${text.slice(0, 50)}…" — run \`npm run realtime:check\``,
         );
       } else {
-        console.log(
-          `[tts] ${bytes} bytes (~${seconds.toFixed(2)}s audio), first chunk in ${firstChunkMs}ms`,
-        );
+        console.log(`[voice] ${bytes} bytes (~${seconds.toFixed(2)}s audio) in ${Date.now() - started}ms`);
       }
-      this.debug('lastTts', { bytes, seconds: Number(seconds.toFixed(2)), firstChunkMs });
+      this.debug('lastTts', { bytes, seconds: Number(seconds.toFixed(2)), firstChunkMs: -1 });
     } finally {
       this.speaking = null;
       this.isSpeaking = false;

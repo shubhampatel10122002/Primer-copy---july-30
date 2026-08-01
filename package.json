@@ -13,7 +13,8 @@
     "db:reset": "tsx db/migrate.ts --reset && tsx db/seed.ts",
     "check": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "selftest": "tsx scripts/selftest.ts"
+    "selftest": "tsx scripts/selftest.ts",
+    "realtime:check": "tsx scripts/realtime-check.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^2.0.0",

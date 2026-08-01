@@ -20,17 +20,15 @@ export const env = {
   get azureRegion() {
     return process.env.AZURE_SPEECH_REGION || 'eastus';
   },
-  get cartesiaKey() {
-    return required('CARTESIA_API_KEY');
+  get openaiKey() {
+    return required('OPENAI_API_KEY');
   },
-  get cartesiaVoiceId() {
-    return required('CARTESIA_VOICE_ID');
+  get realtimeModel() {
+    return process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
   },
-  get cartesiaModel() {
-    return process.env.CARTESIA_MODEL || 'sonic-3';
-  },
-  get cartesiaVersion() {
-    return process.env.CARTESIA_VERSION || '2026-03-01';
+  /** Any of the Realtime voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, cedar, marin. */
+  get realtimeVoice() {
+    return process.env.OPENAI_REALTIME_VOICE || 'coral';
   },
   get databaseUrl() {
     return process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/primer';
@@ -49,10 +47,20 @@ export const MODELS = {
   safety: 'claude-haiku-4-5',
 } as const;
 
-/** Audio constants. Mic is 16k mono PCM16 (Azure); TTS is 44.1k mono f32 (Web Audio). */
+/**
+ * Audio constants.
+ *
+ * The microphone is captured at 16kHz because that is what Azure's pronunciation
+ * assessment wants, and scoring is the thing with the strict requirement. The
+ * Realtime API wants 24kHz, so the server upsamples on the way in — cheap, and it
+ * keeps the assessment path bit-for-bit what it always was.
+ *
+ * Playback is 24kHz PCM16 because that is what Realtime returns.
+ */
 export const AUDIO = {
   micSampleRate: 16000,
-  ttsSampleRate: 44100,
-  /** Keep the mic gate closed this long after playback ends, to swallow the speaker tail. */
+  realtimeSampleRate: 24000,
+  ttsSampleRate: 24000,
+  /** Keep assessment closed this long after playback ends, to swallow the speaker tail. */
   gateTailMs: 300,
 } as const;
