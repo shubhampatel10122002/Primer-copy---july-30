@@ -113,6 +113,16 @@ For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
 - Realtime audio is **24kHz PCM16** in both directions. The mic is still captured
   at 16kHz because Azure's assessment wants it, and upsampled server-side
   (`upsample16to24`) — so scoring keeps exactly the audio it always had.
+- **Never buffer mic audio across session setup.** Handing the VAD a second of
+  captured room noise the moment it is ready fires `speech_started` on the first
+  syllable of the greeting, every session. Audio from before the session is
+  configured is dropped.
+- **Cancel only what exists.** `response.cancel` before `response.created`
+  produces "Cancellation failed: no active response found"; the cancel is
+  deferred until the server confirms the response. Errors of that class are
+  logged, never shown to the child as "Something went wrong".
+- **`interrupt_response: false`.** With it true, the server cancels the response
+  and then our cancel arrives to find nothing. Exactly one thing interrupts.
 - Azure's typed `detailResult` omits per-phoneme scores. Parse the raw
   `SpeechServiceResponse_JsonResult` instead (`server/azure.ts` does).
 - Leniency false positives are expensive: forgiving a word silently switches

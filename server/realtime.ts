@@ -67,17 +67,23 @@ export class RealtimeVoice {
   private ws: WebSocket;
   private ready = false;
   private closed = false;
-  /** Audio buffered until the session is configured. */
-  private pending: Buffer[] = [];
+  /** Fatal errors reach the UI; benign races only reach the log. */
+  private seenEventTypes = new Set<string>();
 
   /** The response currently being spoken, if any. */
   private active: {
     id: string | null;
     resolve: () => void;
     cancelled: boolean;
+    /** True once the server has confirmed a response exists to cancel. */
+    started: boolean;
   } | null = null;
 
   private partialTranscript = '';
+  /** A cancel that arrived before the server confirmed the response existed. */
+  private pendingCancel = false;
+  private configureAttempts = 0;
+  private readyTimer: NodeJS.Timeout | null = null;
 
   constructor(private cb: RealtimeCallbacks) {
     this.ws = new WebSocket(`${REALTIME_URL}?model=${encodeURIComponent(env.realtimeModel)}`, {
@@ -121,7 +127,21 @@ export class RealtimeVoice {
    * counts as reading, what needs an answer, and what happens next are decided by
    * the state machine, exactly as before.
    */
-  private configure() {
+  private configure(minimal = false) {
+    this.configureAttempts += 1;
+
+    // If the server never confirms, we would drop mic audio forever and the
+    // session would be silently deaf. Fall forward instead, loudly.
+    if (this.readyTimer) clearTimeout(this.readyTimer);
+    this.readyTimer = setTimeout(() => {
+      if (this.ready || this.closed) return;
+      console.warn(
+        '[realtime] no session.updated after 4s — proceeding on the default config. ' +
+          'Run `REALTIME_TRACE=1 npm run realtime:check` to see what the server said.',
+      );
+      this.ready = true;
+    }, 4_000);
+
     this.send({
       type: 'session.update',
       session: {
@@ -136,7 +156,7 @@ export class RealtimeVoice {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
             transcription: { model: 'gpt-4o-mini-transcribe', language: 'en' },
             // Laptop speakers and a laptop microphone in the same room.
-            noise_reduction: { type: 'far_field' },
+            ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
             turn_detection: {
               type: 'server_vad',
               threshold: 0.5,
@@ -146,15 +166,21 @@ export class RealtimeVoice {
               silence_duration_ms: 900,
               // We decide when to reply. See above.
               create_response: false,
-              // But DO stop talking the moment they start.
-              interrupt_response: true,
+              // And we do the interrupting, on speech_started, so that exactly
+              // one thing is responsible for it. With both, the server cancels
+              // the response and then our cancel arrives to find nothing there.
+              interrupt_response: false,
             },
           },
-          output: {
-            format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-            voice: env.realtimeVoice,
-            speed: 0.95,
-          },
+          output: minimal
+            ? { format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate }, voice: env.realtimeVoice }
+            : {
+                format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
+                voice: env.realtimeVoice,
+                // Unhurried, like reading a picture book. Dropped on the retry
+                // in case a model rejects the field.
+                speed: 0.95,
+              },
         },
       },
     });
@@ -166,11 +192,14 @@ export class RealtimeVoice {
         break;
 
       case 'session.updated': {
+        if (this.readyTimer) clearTimeout(this.readyTimer);
+        this.readyTimer = null;
+        if (process.env.REALTIME_TRACE) {
+          console.log('[realtime] effective session', JSON.stringify(event.session, null, 2));
+        }
         if (this.ready) break;
         this.ready = true;
-        // Anything captured while we were connecting still belongs to the child.
-        for (const chunk of this.pending) this.appendAudio(chunk);
-        this.pending = [];
+        console.log('[realtime] session ready — listening');
         break;
       }
 
@@ -191,11 +220,13 @@ export class RealtimeVoice {
       case 'conversation.item.input_audio_transcription.completed': {
         const text = (event.transcript ?? this.partialTranscript ?? '').trim();
         this.partialTranscript = '';
+        console.log(`[realtime] heard "${text}"`);
         if (text) this.cb.onUtterance(text);
         break;
       }
 
       case 'conversation.item.input_audio_transcription.failed':
+        console.warn('[realtime] transcription failed', JSON.stringify(event.error ?? {}));
         this.partialTranscript = '';
         break;
 
@@ -211,6 +242,15 @@ export class RealtimeVoice {
 
       case 'response.created':
         if (this.active && !this.active.id) this.active.id = event.response?.id ?? null;
+        if (this.active) this.active.started = true;
+        // Cancelled before the server had even created it. Send the cancel NOW,
+        // when there is finally something to cancel — sending it earlier is what
+        // produced "Cancellation failed: no active response found" on the very
+        // first barge-in of every session.
+        if (this.pendingCancel) {
+          this.pendingCancel = false;
+          this.send({ type: 'response.cancel' });
+        }
         break;
 
       case 'response.done': {
@@ -220,8 +260,28 @@ export class RealtimeVoice {
         break;
       }
 
-      case 'error':
-        this.cb.onError?.(`realtime: ${event.error?.message ?? JSON.stringify(event.error)}`);
+      case 'error': {
+        const message = event.error?.message ?? JSON.stringify(event.error);
+        console.error('[realtime]', message);
+
+        // A cancel that raced a response into existence is a bookkeeping detail,
+        // not something to put in front of a five-year-old as "Something went
+        // wrong". Only things that actually break the session reach the UI.
+        // A rejected session config is recoverable: try again without the
+        // optional fields. Some models do not accept every one of them, and the
+        // difference between "no noise reduction" and "deaf" is the whole app.
+        if (!this.ready && this.configureAttempts === 1 && /session|param|unknown|invalid/i.test(message)) {
+          console.warn('[realtime] session config rejected, retrying without optional fields');
+          this.configure(true);
+          break;
+        }
+
+        const benign =
+          /no active response|cancellation failed|already has an active response|buffer is empty/i.test(
+            message,
+          );
+        if (!benign) this.cb.onError?.(`realtime: ${message}`);
+
         // An error usually kills the in-flight response; do not hang on it.
         if (this.active) {
           const done = this.active;
@@ -229,22 +289,37 @@ export class RealtimeVoice {
           done.resolve();
         }
         break;
+      }
 
       default:
+        // Log each unfamiliar event once. When transcription silently does not
+        // arrive, this is the only way to find out that it never fired.
+        if (!this.seenEventTypes.has(event.type)) {
+          this.seenEventTypes.add(event.type);
+          if (process.env.REALTIME_TRACE) console.log('[realtime] first', event.type);
+        }
         break;
     }
   }
 
   /** Mic audio, 16kHz PCM16 as captured. Upsampled here. */
   write(pcm16k: Buffer) {
-    if (this.closed) return;
-    const pcm24k = upsample16to24(pcm16k);
-    if (pcm24k.length === 0) return;
-    if (!this.ready) {
-      // Bounded: a couple of seconds is plenty to cover session setup.
-      if (this.pending.length < 60) this.pending.push(pcm24k);
+    if (this.closed || !this.ready) {
+      // DROPPED, not buffered.
+      //
+      // Buffering it seemed kind — a second of audio captured while the socket
+      // was still configuring, handed over as soon as it was ready. What it
+      // actually did was hand a whole second of sound to the VAD in one burst,
+      // at the exact moment the greeting started. The mic check screen has the
+      // child say "Hi Ollie!" out loud thirty seconds earlier, the room is not
+      // silent, and the very first thing that happened in every session was a
+      // barge-in that killed the greeting before a word of it was audible.
+      //
+      // Nothing said before the session is configured is addressed to us.
       return;
     }
+    const pcm24k = upsample16to24(pcm16k);
+    if (pcm24k.length === 0) return;
     this.appendAudio(pcm24k);
   }
 
@@ -271,8 +346,9 @@ export class RealtimeVoice {
 
     let resolve!: () => void;
     const done = new Promise<void>((r) => (resolve = r));
-    const entry = { id: null as string | null, resolve, cancelled: false };
+    const entry = { id: null as string | null, resolve, cancelled: false, started: false };
     this.active = entry;
+    this.pendingCancel = false;
 
     this.send({
       type: 'response.create',
@@ -297,7 +373,11 @@ export class RealtimeVoice {
         if (entry.cancelled) return;
         entry.cancelled = true;
         if (this.active === entry) this.active = null;
-        this.send({ type: 'response.cancel' });
+        // Audio stops reaching the child either way — `cancelled` gates that.
+        // Telling the server is only about not paying for tokens nobody hears,
+        // and it can only be told once it knows the response exists.
+        if (entry.started) this.send({ type: 'response.cancel' });
+        else this.pendingCancel = true;
         resolve();
       },
     };
@@ -308,13 +388,15 @@ export class RealtimeVoice {
     const entry = this.active;
     this.active = null;
     entry.cancelled = true;
-    this.send({ type: 'response.cancel' });
+    if (entry.started) this.send({ type: 'response.cancel' });
+    else this.pendingCancel = true;
     entry.resolve();
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.readyTimer) clearTimeout(this.readyTimer);
     this.cancelActive();
     try {
       this.ws.close();

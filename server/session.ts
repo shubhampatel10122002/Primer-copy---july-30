@@ -103,6 +103,19 @@ const DIALOGUE_MEMORY = 10;
 /** Longest we will hold a reply waiting for a child to stop talking. */
 const MAX_HOLD_MS = 15_000;
 
+/**
+ * Ignore "the child started speaking" for this long after WE start speaking.
+ *
+ * Echo cancellation takes a moment to adapt to a new sound, so the onset of our
+ * own voice is the single most likely thing to be mistaken for the child's. And
+ * an interruption inside this window is an interruption of nothing — they cannot
+ * have reacted to a sentence they have not heard yet.
+ */
+const INTERRUPT_GUARD_MS = 400;
+
+/** If an interruption produces no words at all, assume it was noise and retry. */
+const UNHEARD_RETRY_MS = 1_800;
+
 export class Session {
   private mode: Mode = 'IDLE';
   private sessionId: string | null = null;
@@ -129,12 +142,18 @@ export class Session {
   private speaking: SpeakHandle | null = null;
   /** Running total of TTS bytes sent, so one utterance can be measured. */
   private audioBytesOut = 0;
+  private audioBytesAtSpeakStart = 0;
   private gateOpenAt = 0; // mic frames before this timestamp are dropped
   private isSpeaking = false;
   /** What we are saying right now — the echo guard needs the exact words. */
   private speakingText = '';
   /** While this is in the future, the child is mid-sentence and we stay quiet. */
   private childSpeakingUntil = 0;
+  /** When the current utterance began, for the interrupt guard. */
+  private speakingSince = 0;
+  /** A line cut off before a word of it was audible, and its recovery timer. */
+  private unheard: string | null = null;
+  private unheardTimer: NodeJS.Timeout | null = null;
   /**
    * Bumped whenever playback is cut short. Utterances queued behind the one that
    * was interrupted check this and drop themselves — otherwise the narrator
@@ -496,16 +515,52 @@ export class Session {
   private onChildStartedSpeaking() {
     if (this.closed) return;
 
+    // The first fraction of a second of our own audio is when echo cancellation
+    // is still adapting, and it is far and away the most common false trigger.
+    // A child genuinely cutting in this fast is cutting in on nothing — they
+    // have not heard a word yet.
+    if (this.isSpeaking && Date.now() - this.speakingSince < INTERRUPT_GUARD_MS) {
+      this.debug('bargeInIgnored', 'too soon after we started — probably our own voice');
+      return;
+    }
+
     this.childSpeakingUntil = Date.now() + CHILD_SPEAKING_GRACE_MS;
     this.lastSpeechAt = Date.now();
     this.nudgeStage = 0;
 
     if (this.isSpeaking) {
+      const bytes = this.audioBytesOut - this.audioBytesAtSpeakStart;
       console.log(`[barge-in] child spoke over "${this.speakingText.slice(0, 40)}…"`);
-      this.debug('bargeIn', { by: 'vad', over: this.speakingText.slice(0, 60) });
+      this.debug('bargeIn', { by: 'vad', over: this.speakingText.slice(0, 60), bytes });
+
+      // Cut off before a single sample reached them. Either they interrupted
+      // impossibly fast, or that was not a child at all — a door, a sibling, our
+      // own voice. Hold the line so it can be said again if nothing follows:
+      // a greeting silently swallowed is a session that never starts.
+      if (bytes === 0) this.armUnheard(this.speakingText);
+
       this.stopSpeaking();
     }
     this.send({ t: 'hearing', on: true });
+  }
+
+  /** Say it again if that "interruption" turns out to have been nobody. */
+  private armUnheard(text: string) {
+    this.clearUnheard();
+    this.unheard = text;
+    this.unheardTimer = setTimeout(() => {
+      const line = this.unheard;
+      this.clearUnheard();
+      if (!line || this.closed || this.mode === 'END') return;
+      console.log(`[voice] nothing followed that interruption — saying it again`);
+      void this.speak(line);
+    }, UNHEARD_RETRY_MS);
+  }
+
+  private clearUnheard() {
+    if (this.unheardTimer) clearTimeout(this.unheardTimer);
+    this.unheardTimer = null;
+    this.unheard = null;
   }
 
   private onChildStoppedSpeaking() {
@@ -528,6 +583,8 @@ export class Session {
    */
   private onChildUtterance(text: string) {
     if (this.closed || !text.trim()) return;
+    // Somebody really was talking, so the line we cut off was rightly cut off.
+    this.clearUnheard();
 
     // Our own voice, heard through the speaker. Much rarer now — the Realtime
     // session suppresses echo on the input and VAD would have stopped us long
@@ -756,6 +813,7 @@ export class Session {
     if (this.tick) clearInterval(this.tick);
     if (this.turnTimer) clearTimeout(this.turnTimer);
     if (this.replyTimeout) clearTimeout(this.replyTimeout);
+    this.clearUnheard();
     // Anything awaiting a reply must not hang once the socket is gone.
     this.awaitingReply?.(null);
     this.speaking?.cancel();
@@ -801,6 +859,7 @@ export class Session {
 
     this.isSpeaking = true;
     this.speakingText = text;
+    this.speakingSince = Date.now();
     this.gateOpenAt = Number.MAX_SAFE_INTEGER; // no scoring over our own voice
     this.send({ t: 'tts_start' });
     this.send({ t: 'speak', text });
@@ -810,6 +869,7 @@ export class Session {
     // anything", this counter is the difference between a server-side and a
     // browser-side problem — and it costs one integer.
     const before = this.audioBytesOut;
+    this.audioBytesAtSpeakStart = before;
     const started = Date.now();
 
     const handle = this.voice!.speak(text);
