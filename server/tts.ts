@@ -82,11 +82,30 @@ export function speak(text: string, onChunk: (pcm: Buffer) => void): SpeakHandle
         workingModel = model;
         if (!res.body) throw new Error('no response body');
 
+        // PCM16 is TWO bytes per sample, and the network does not care.
+        //
+        // A chunk with an odd byte count leaves half a sample dangling. Emit it
+        // as-is and the receiver pairs the bytes off by one from there on — every
+        // subsequent sample built from the low byte of one and the high byte of
+        // the next. That is not a glitch, it is white noise: the "bad radio
+        // signal" hiss over the whole voice. So the odd byte is carried into the
+        // next chunk and every buffer that leaves here is sample-aligned.
         const reader = res.body.getReader();
+        let carry: Buffer | null = null;
+
         for (;;) {
           const { done: finished, value } = await reader.read();
           if (finished || cancelled) break;
-          if (value?.length) onChunk(Buffer.from(value));
+          if (!value?.length) continue;
+
+          let chunk: Buffer = carry ? Buffer.concat([carry, Buffer.from(value)]) : Buffer.from(value);
+          carry = null;
+
+          if (chunk.length % 2 === 1) {
+            carry = chunk.subarray(chunk.length - 1);
+            chunk = chunk.subarray(0, chunk.length - 1);
+          }
+          if (chunk.length) onChunk(chunk);
         }
         return;
       } catch (err) {

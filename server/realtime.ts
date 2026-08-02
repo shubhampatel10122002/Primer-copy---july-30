@@ -38,11 +38,14 @@ const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
  * OPENAI_TRANSCRIBE_MODEL if you want to stop guessing entirely.
  */
 const TRANSCRIBE_MODELS = [
-  'gpt-live-transcribe',
-  'gpt-realtime-whisper',
+  // Least likely to be refused first. Being listed in /v1/models is NOT the same
+  // as the project being allowed to use it — this project can see
+  // gpt-live-transcribe and gpt-4o-mini-transcribe and is refused both.
   'whisper-1',
-  'gpt-4o-mini-transcribe',
   'gpt-4o-transcribe',
+  'gpt-4o-mini-transcribe',
+  'gpt-realtime-whisper',
+  'gpt-live-transcribe',
 ] as const;
 
 export interface RealtimeCallbacks {
@@ -79,7 +82,7 @@ export function upsample16to24(pcm16k: Buffer): Buffer {
 }
 
 export class RealtimeVoice {
-  private ws: WebSocket;
+  private ws!: WebSocket;
   private ready = false;
   private closed = false;
   /** Fatal errors reach the UI; benign races only reach the log. */
@@ -96,6 +99,18 @@ export class RealtimeVoice {
     : [...TRANSCRIBE_MODELS];
 
   constructor(private cb: RealtimeCallbacks) {
+    this.connect();
+  }
+
+  /**
+   * Open the socket. Called again when a transcription model is refused.
+   *
+   * A model the project cannot use does not fail politely — the server closes
+   * the whole connection (1001) with the refusal as the reason. So walking the
+   * list on a per-item transcription failure never got a chance to run; the
+   * session was already gone. Reconnecting is the only way down the list.
+   */
+  private connect() {
     this.ws = new WebSocket(`${REALTIME_URL}?model=${encodeURIComponent(env.realtimeModel)}`, {
       headers: { Authorization: `Bearer ${env.openaiKey}` },
     });
@@ -121,11 +136,37 @@ export class RealtimeVoice {
       this.handle(event);
     });
 
-    this.ws.on('error', (err) => this.cb.onError?.(`realtime socket: ${String(err)}`));
+    this.ws.on('error', (err) => {
+      // A refused model surfaces here as well as on close; the close handler
+      // owns the recovery, so do not shout about it twice.
+      const message = String(err);
+      if (this.refusedModel(message)) return;
+      this.cb.onError?.(`realtime socket: ${message}`);
+    });
+
     this.ws.on('close', (code, reason) => {
       this.ready = false;
-      this.cb.onClose?.(code, reason.toString());
+      const why = reason.toString();
+
+      if (this.refusedModel(why) && this.transcribeModels.length > 1) {
+        const dead = this.transcribeModels.shift();
+        console.warn(
+          `[realtime] no access to ${dead} — reconnecting with ${this.transcribeModels[0]}`,
+        );
+        if (!this.closed) {
+          setTimeout(() => this.connect(), 150);
+          return;
+        }
+      }
+
+      this.cb.onClose?.(code, why);
     });
+  }
+
+  /** Was this failure "the project cannot use that transcription model"? */
+  private refusedModel(message: string): boolean {
+    if (!/does not have access to model|model_not_found/i.test(message)) return false;
+    return this.transcribeModels.some((m) => message.includes(m));
   }
 
   /**
@@ -220,6 +261,7 @@ export class RealtimeVoice {
       case 'session.updated': {
         if (this.readyTimer) clearTimeout(this.readyTimer);
         this.readyTimer = null;
+        console.log(`[realtime] transcribing with ${this.transcribeModels[0]}`);
         if (process.env.REALTIME_TRACE) {
           console.log('[realtime] effective session', JSON.stringify(event.session, null, 2));
         }
@@ -258,7 +300,7 @@ export class RealtimeVoice {
 
         // The project cannot use this model. Nothing the child says will ever be
         // heard until we pick one it can, so move down the list and reconfigure.
-        if (err.code === 'model_not_found' && this.transcribeModels.length > 1) {
+        if (/model_not_found|does not have access/i.test(JSON.stringify(err)) && this.transcribeModels.length > 1) {
           const dead = this.transcribeModels.shift();
           console.warn(`[realtime] no access to ${dead} — switching to ${this.transcribeModels[0]}`);
           this.send({

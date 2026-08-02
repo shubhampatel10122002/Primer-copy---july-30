@@ -108,8 +108,12 @@ export default function DebugPanel({
 
   const words = (debug.lastWords as any[]) ?? [];
   const wovenFact = debug.wovenFact as { text: string; beat: number } | undefined;
-  const tts = debug.lastTts as { bytes: number; seconds: number; firstChunkMs: number } | undefined;
+  const tts = debug.lastTts as
+    | { bytes: number; seconds: number; totalSent?: number; firstChunkMs: number }
+    | undefined;
   const sentBytes = tts?.bytes ?? null;
+  // Compare like with like: both totals are for the whole session.
+  const totalSent = tts?.totalSent ?? null;
   const sentSeconds = tts?.seconds ?? 0;
   const firstChunkMs = tts && tts.firstChunkMs >= 0 ? tts.firstChunkMs : null;
 
@@ -160,7 +164,7 @@ export default function DebugPanel({
           <span>Received by browser</span>
           <span>{audioBytes} B</span>
         </div>
-        {sentBytes !== null && sentBytes > 0 && audioBytes === 0 && (
+        {totalSent !== null && totalSent > 0 && audioBytes === 0 && (
           <div className="flag sensitive_topic" style={{ marginTop: 8 }}>
             <b>audio not arriving</b>
             <div>The server produced audio but this browser received none.</div>
