@@ -32,6 +32,8 @@ export type Intent =
   | 'chitchat'
   | 'want_to_stop'
   | 'sensitive_topic'
+  /** Something about the app is wrong: blank screen, no sound, nothing to read. */
+  | 'needs_help'
   | 'unclear';
 
 export interface SessionPlan {

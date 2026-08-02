@@ -29,7 +29,8 @@ import {
 } from '../lib/profile';
 import * as T from '../lib/templates';
 import { PronunciationSession } from './azure';
-import { RealtimeVoice, type SpeakHandle } from './realtime';
+import { RealtimeVoice } from './realtime';
+import { speak as speakAloud, pcmSeconds, type SpeakHandle } from './tts';
 import { PassageTracker, tokenize } from './tracker';
 import type {
   Child,
@@ -282,7 +283,6 @@ export class Session {
       onSpeechStarted: () => this.onChildStartedSpeaking(),
       onSpeechStopped: () => this.onChildStoppedSpeaking(),
       onUtterance: (text) => this.onChildUtterance(text),
-      onAudio: (pcm) => this.sendAudio(pcm),
       onError: (m) => {
         console.error('[realtime]', m);
         this.send({ t: 'error', message: m });
@@ -440,9 +440,16 @@ export class Session {
       if (heard) {
         this.log('child_talk', heard);
         silences = 0;
-      } else if (++silences >= 2 && canStartAtAll(this.draft)) {
-        // Twice with no answer. Start with what we have rather than interviewing
-        // an empty room — a story is a better invitation than another question.
+      } else if (++silences >= 2) {
+        // Twice with no answer. Start anyway.
+        //
+        // This used to require a name before giving up, which meant a session
+        // where the microphone or transcription was broken asked all six
+        // questions into silence — a minute and a half before any story
+        // appeared, which reads as the app being dead. If we cannot hear them,
+        // asking again will not help; a story on screen at least gives them
+        // something to do, and something to talk to us about.
+        console.warn('[onboarding] no answers — starting without a full profile');
         break;
       }
     }
@@ -796,8 +803,8 @@ export class Session {
         await this.end('child asked to stop');
         break;
       case 'tts_test':
-        // Exercises the real audio path — Cartesia -> WebSocket -> Web Audio —
-        // with no LLM involved, so "can I hear anything at all?" is one click.
+        // Exercises the real audio path — TTS -> WebSocket -> Web Audio — with no
+        // LLM involved, so "can I hear anything at all?" is one click.
         await this.speak(
           "Hello! This is Ollie testing the sound. If you can hear me, the audio is working.",
         );
@@ -848,9 +855,8 @@ export class Session {
 
   /**
    * Serialise speech. Two utterances must never overlap: the narrator would talk
-   * over itself, and Cartesia's free tier caps concurrent contexts at 2 — which
-   * is exactly the "concurrency limit of 2" error a nudge firing mid-utterance
-   * (or a Test-sound click during a story beat) produces.
+   * over itself, and two overlapping voices is the single most confusing thing
+   * a five-year-old can be handed.
    */
   private async speak(text: string): Promise<void> {
     const previous = this.speechChain;
@@ -869,7 +875,7 @@ export class Session {
   }
 
   private async speakNow(text: string, generation = this.speechGeneration): Promise<void> {
-    if (!text.trim() || this.closed || !this.voice) return;
+    if (!text.trim() || this.closed) return;
 
     // Never start a sentence on top of one of theirs. The child has priority,
     // and "priority" that only applies when it is convenient is not priority.
@@ -894,13 +900,13 @@ export class Session {
     this.audioBytesAtSpeakStart = before;
     const started = Date.now();
 
-    const handle = this.voice!.speak(text);
+    const handle = speakAloud(text, (pcm) => this.sendAudio(pcm));
     this.speaking = handle;
 
     try {
       await handle.done;
       const bytes = this.audioBytesOut - before;
-      const seconds = bytes / 2 / AUDIO.ttsSampleRate;
+      const seconds = pcmSeconds(bytes);
       if (bytes === 0) {
         console.error(
           `[voice] produced NO audio for "${text.slice(0, 50)}…" — run \`npm run realtime:check\``,
@@ -973,7 +979,7 @@ export class Session {
     this.speakingFirstAudioAt = 0;
     this.gateOpenAt = 0;
     this.speechGeneration += 1; // anything queued behind this is now stale
-    // Cancelling Cartesia stops us SENDING audio; the browser is still holding a
+    // Aborting the request stops us SENDING audio; the browser is still holding a
     // second or two of it. Without this the narrator carries on talking over the
     // child who just interrupted, which is worse than not letting them interrupt.
     this.send({ t: 'stop_playback' });
@@ -1011,9 +1017,8 @@ export class Session {
         dialogue: this.dialogue,
       }));
 
-    // Prepend rather than speak separately: one Cartesia context instead of two
-    // (the free tier allows 2 concurrent), and it reads as a single natural
-    // utterance rather than two clips butted together.
+    // Prepend rather than speak separately: one request instead of two, and it
+    // reads as a single natural utterance rather than two clips butted together.
     if (opts.speakPrefix) turn.speak_text = `${opts.speakPrefix} ${turn.speak_text}`;
     this.beatIndex = turn.current_beat_index ?? this.beatIndex;
     this.debug('lastNarratorTurn', { mode, ...turn });
@@ -1583,6 +1588,21 @@ export class Session {
         await this.end('child wants to stop');
         return;
 
+      // "I can't see anything." Take it literally and fix it.
+      //
+      // A child reporting that the thing is broken used to land in `unclear`,
+      // which answered "Hmm, I didn't catch that!" — telling a five-year-old
+      // that their clear, correct description of a real problem was their
+      // mistake. It is the most useful thing they can possibly say.
+      case 'needs_help': {
+        await this.flag('needs_help', transcript);
+        this.send({ t: 'flag', type: 'needs_help', detail: transcript });
+        await sayReply();
+        this.resync();
+        this.resumeReading();
+        return;
+      }
+
       case 'change_request': {
         this.discardBuffer();
         this.setMode('REMIX', transcript);
@@ -1676,6 +1696,31 @@ export class Session {
         this.resumeReading();
         return;
     }
+  }
+
+  /**
+   * Push the whole visible state down again.
+   *
+   * A dropped message, a reconnect, a caption that never landed — any of them
+   * leave a child looking at a screen with nothing on it, and they have no way
+   * to fix that except to tell us. So when they do, we say everything again
+   * rather than assuming the client already knows it.
+   */
+  private resync() {
+    this.send({ t: 'mode', mode: this.mode });
+    if (this.plan) this.send({ t: 'ready', childName: this.child.name, plan: this.plan });
+    if (this.tracker) {
+      this.send({
+        t: 'passage',
+        text: this.tracker.passage,
+        words: tokenize(this.tracker.passage),
+      });
+      for (const w of this.tracker.words) {
+        this.send({ t: 'word', index: w.index, status: w.status, score: w.bestScore, errorType: w.errorType });
+      }
+      this.send({ t: 'cursor', index: this.tracker.cursor });
+    }
+    this.debug('resync', { passage: this.tracker?.passage ?? null, mode: this.mode });
   }
 
   /** Return to the passage the child was on, restarting assessment on it. */

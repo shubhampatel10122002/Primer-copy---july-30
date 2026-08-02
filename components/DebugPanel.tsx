@@ -169,7 +169,10 @@ export default function DebugPanel({
         {sentBytes === 0 && (
           <div className="flag sensitive_topic" style={{ marginTop: 8 }}>
             <b>no audio produced</b>
-            <div>Cartesia returned nothing — check the voice id and model in .env.local.</div>
+            <div>
+              Text-to-speech returned nothing. Run <code>npm run realtime:check</code> —
+              it tests the voice on its own.
+            </div>
           </div>
         )}
         {audioBytes > 0 && (
