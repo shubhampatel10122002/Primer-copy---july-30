@@ -23,6 +23,8 @@ export class AudioEngine {
 
   private playHead = 0;
   private scheduled: AudioBufferSourceNode[] = [];
+  /** Half a PCM16 sample left over from the previous chunk. See playChunk. */
+  private pcmCarry: Uint8Array | null = null;
   private destroyed = false;
   private warnedAfterDestroy = false;
 
@@ -104,13 +106,29 @@ export class AudioEngine {
       void this.ctx.resume().catch(() => {});
     }
 
-    // PCM16 is two bytes per sample; drop any ragged tail.
-    const usable = pcm.byteLength - (pcm.byteLength % 2);
-    if (usable <= 0) return;
+    // PCM16 is two bytes per sample. An odd-length chunk must NOT simply lose its
+    // last byte: the next chunk would then be read off by one, pairing the low
+    // byte of each sample with the high byte of the next, which sounds exactly
+    // like radio static. Carry the odd byte forward instead.
+    //
+    // The server aligns its chunks too; this is the second lock on the same door.
+    let bytes = new Uint8Array(pcm);
+    if (this.pcmCarry) {
+      const joined = new Uint8Array(this.pcmCarry.length + bytes.length);
+      joined.set(this.pcmCarry, 0);
+      joined.set(bytes, this.pcmCarry.length);
+      bytes = joined;
+      this.pcmCarry = null;
+    }
+    if (bytes.length % 2 === 1) {
+      this.pcmCarry = bytes.slice(bytes.length - 1);
+      bytes = bytes.slice(0, bytes.length - 1);
+    }
+    if (bytes.length === 0) return;
 
-    const ints = new Int16Array(pcm, 0, usable / 2);
-    const samples = new Float32Array(ints.length);
-    for (let i = 0; i < ints.length; i++) samples[i] = ints[i] / 32768;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const samples = new Float32Array(bytes.length / 2);
+    for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
 
     // Declaring the buffer at 24kHz is what tells Web Audio to resample it to the
     // context rate. Get this wrong and Ollie sounds like a chipmunk.
@@ -138,6 +156,7 @@ export class AudioEngine {
 
   /** Barge-in: kill everything already scheduled, immediately. */
   stopPlayback() {
+    this.pcmCarry = null;
     for (const src of this.scheduled) {
       try {
         src.stop();

@@ -134,9 +134,17 @@ For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
 - **You cannot interrupt what you have not heard.** Barge-in is ignored until
   audio has actually reached the child, and for 400ms after — measured from the
   first audible byte, not from when we asked the model to speak.
-- **Transcription models vary by project.** `gpt-4o-mini-transcribe` was refused
-  outright on ours. `TRANSCRIBE_MODELS` is walked on `model_not_found`; without
-  that, nothing the child says is ever heard and there is no other symptom.
+- **Transcription models vary by PROJECT, and `/v1/models` does not tell you.**
+  This project can see `gpt-live-transcribe` and `gpt-4o-mini-transcribe` in the
+  model list and is refused both. Worse, a refusal closes the whole socket (1001)
+  rather than failing the item — so `RealtimeVoice` reconnects down
+  `TRANSCRIBE_MODELS` on close. `npm run realtime:check` opens a session with
+  each candidate and tells you which actually work; pin one with
+  `OPENAI_TRANSCRIBE_MODEL`.
+- **PCM16 is two bytes per sample and the network does not care.** An odd-length
+  chunk emitted as-is makes the receiver pair bytes off by one from then on —
+  which is not a glitch but white noise over the entire voice. Both
+  `server/tts.ts` and `lib/client/audio.ts` carry the odd byte forward.
 - **Cancel only what exists.** `response.cancel` before `response.created`
   produces "Cancellation failed: no active response found"; the cancel is
   deferred until the server confirms the response. Errors of that class are

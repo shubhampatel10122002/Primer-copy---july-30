@@ -39,7 +39,14 @@ export default function SessionView() {
   } | null>(null);
   const [facts, setFacts] = useState<{ text: string; topic: string; kind: string }[]>([]);
   const [awaiting, setAwaiting] = useState<'continue' | null>(null);
-  /** Bytes of TTS audio this browser actually received for the current utterance. */
+  /**
+   * Total TTS audio this browser has received, for the whole session.
+   *
+   * Cumulative, not per-utterance: resetting it on `tts_start` meant the panel
+   * compared the PREVIOUS utterance's sent-bytes against the NEXT one's
+   * received-bytes-so-far, which is zero for a moment every single time, and
+   * cried "audio not arriving" at a browser that was receiving audio perfectly.
+   */
   const [audioBytes, setAudioBytes] = useState(0);
 
   const engineRef = useRef<AudioEngine | null>(null);
@@ -121,7 +128,6 @@ export default function SessionView() {
 
       case 'tts_start':
         setSpeaking(true);
-        setAudioBytes(0);
         // The microphone never closes. Detecting that the child has started
         // talking is the Realtime session's job now — it hears the audio itself
         // and tells us within a couple of hundred milliseconds, which is the

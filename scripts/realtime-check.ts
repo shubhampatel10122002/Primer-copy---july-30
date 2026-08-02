@@ -19,6 +19,7 @@ import 'dotenv/config';
 import { config } from 'dotenv';
 config({ path: '.env.local', override: false, quiet: true });
 
+import WebSocket from 'ws';
 import { env, AUDIO } from '../lib/env';
 import { RealtimeVoice } from '../server/realtime';
 import { speak as speakAloud, pcmSeconds } from '../server/tts';
@@ -52,6 +53,66 @@ async function listAudioModels(): Promise<string[]> {
   }
 }
 
+/**
+ * Actually try each transcription model.
+ *
+ * Being listed in /v1/models is NOT the same as this project being allowed to
+ * use it — this project can see `gpt-live-transcribe` and is refused it. The
+ * only reliable answer is to open a session with each one and see whether the
+ * server accepts it or hangs up.
+ */
+async function testTranscriptionModels(candidates: string[]): Promise<string[]> {
+  const working: string[] = [];
+
+  for (const model of candidates) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(
+        `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(env.realtimeModel)}`,
+        { headers: { Authorization: `Bearer ${env.openaiKey}` } },
+      );
+      const finish = (value: boolean) => {
+        clearTimeout(timer);
+        try {
+          ws.close();
+        } catch {
+          /* already gone */
+        }
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(false), 8_000);
+
+      ws.on('open', () =>
+        ws.send(
+          JSON.stringify({
+            type: 'session.update',
+            session: {
+              type: 'realtime',
+              output_modalities: ['text'],
+              audio: {
+                input: {
+                  format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
+                  transcription: { model, language: 'en' },
+                },
+              },
+            },
+          }),
+        ),
+      );
+      ws.on('message', (data) => {
+        const event = JSON.parse(data.toString());
+        if (event.type === 'session.updated') finish(true);
+        if (event.type === 'error') finish(false);
+      });
+      ws.on('close', () => finish(false));
+      ws.on('error', () => finish(false));
+    });
+
+    console.log(`    ${ok ? 'OK  ' : 'no  '} ${model}`);
+    if (ok) working.push(model);
+  }
+  return working;
+}
+
 async function main() {
   console.log('\nRealtime connectivity check\n');
   line('model', env.realtimeModel);
@@ -66,11 +127,19 @@ async function main() {
     for (const id of audioModels) console.log(`    ${id}`);
     const transcribers = audioModels.filter((id) => /transcribe|whisper/.test(id));
     console.log('');
-    console.log(
-      transcribers.length
-        ? `  -> set OPENAI_TRANSCRIBE_MODEL to one of: ${transcribers.join(', ')}`
-        : '  -> NO transcription models available. Nothing the child says can be heard.',
-    );
+    if (transcribers.length) {
+      console.log('  Which of those this PROJECT may actually open a session with:');
+      const working = await testTranscriptionModels(transcribers);
+      console.log('');
+      console.log(
+        working.length
+          ? `  -> put this in .env.local:  OPENAI_TRANSCRIBE_MODEL=${working[0]}`
+          : '  -> NONE of them work. Nothing the child says can be heard; this needs\n' +
+            '     fixing in the OpenAI project settings before the app is usable.',
+      );
+    } else {
+      console.log('  -> NO transcription models available at all.');
+    }
   } else {
     console.log('  (could not list models — check the key)');
   }

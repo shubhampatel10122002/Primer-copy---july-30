@@ -914,7 +914,12 @@ export class Session {
       } else {
         console.log(`[voice] ${bytes} bytes (~${seconds.toFixed(2)}s audio) in ${Date.now() - started}ms`);
       }
-      this.debug('lastTts', { bytes, seconds: Number(seconds.toFixed(2)), firstChunkMs: -1 });
+      this.debug('lastTts', {
+        bytes,
+        seconds: Number(seconds.toFixed(2)),
+        totalSent: this.audioBytesOut,
+        firstChunkMs: -1,
+      });
     } finally {
       this.speaking = null;
       this.isSpeaking = false;
