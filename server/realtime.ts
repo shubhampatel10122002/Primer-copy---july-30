@@ -2,61 +2,90 @@ import WebSocket from 'ws';
 import { env, AUDIO } from '../lib/env';
 
 /**
- * The ears. Not the voice.
+ * The ears. A Realtime TRANSCRIPTION session, and nothing else.
  *
- * We are here for exactly one event: `input_audio_buffer.speech_started`, which
- * server-side VAD emits from the audio itself within a couple of hundred
- * milliseconds of the child's first syllable. Every design before this had to
- * infer "they have started talking" from a transcript, which arrives a second
- * late — long enough that the narrator had finished its sentence anyway.
+ * Two things changed here when the mic button arrived, and both are the same
+ * change: turn-taking left this file.
  *
- * This session cannot speak, structurally: `output_modalities: ['text']` means
- * it has no audio to emit even if something asked it to, and
- * `create_response: false` means nothing asks. Narration goes through
- * `server/tts.ts`, which is a text-to-speech endpoint with no conversation and
- * no opinion — because when this file WAS the voice, it once read back what the
- * child had just said instead of the line it was handed.
+ * It used to be a full `type: 'realtime'` session running server VAD, and the
+ * event that mattered was `input_audio_buffer.speech_started` — the audio-level
+ * signal that the child had begun talking, which is what made barge-in fast
+ * enough to be worth having. A tap is faster and is never wrong, so that entire
+ * signal path is gone.
+ *
+ * What replaces it is better suited to what we actually want. A transcription
+ * session with `turn_detection: null` does no turn detection at all: it
+ * transcribes exactly the audio between an append and an explicit
+ * `input_audio_buffer.commit`. So "the child tapped to close the mic" and "the
+ * transcript is final" become the same instant, by construction, rather than two
+ * things a timer had to guess were related.
+ *
+ * The alternative was to leave server VAD on and ignore the parts we did not
+ * want. That does not work: with turn detection enabled the server commits the
+ * buffer itself at every pause it hears, which is a SECOND turn boundary
+ * competing with the button — and children pause constantly, so it would fire
+ * first and cut them off mid-list. Exactly the failure the settle-delay
+ * machinery existed to paper over. One boundary, owned by the child.
  *
  * Pronunciation assessment stays on Azure, on the same audio: no general-purpose
  * speech model returns per-phoneme accuracy for a five-year-old reading
  * "bridge".
  */
 
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
+/**
+ * `intent=transcription` selects a transcription session, which — unlike a
+ * conversation session — has no way to generate speech even in principle. The
+ * old session had to be talked out of speaking with `output_modalities: ['text']`
+ * AND `create_response: false`, after a version that WAS the voice read back
+ * what the child had just said instead of the line it was handed.
+ */
+const REALTIME_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
 
 /**
  * Transcription models to try, best first.
  *
- * Which of these a project may use varies, and getting it wrong has no symptom
- * other than the child never being heard — ours was refused
- * `gpt-4o-mini-transcribe` outright ("Project does not have access to model").
- * So this is a list that gets walked on `model_not_found`, not one name we hope
- * is right.
+ * `gpt-live-transcribe` (28 July 2026) is the current low-latency streaming
+ * model and the documented migration target for `gpt-realtime-whisper`. It is
+ * first because latency here is the child waiting to be answered.
  *
- * The names move faster than any document. `npm run realtime:check` asks your
- * project directly which ones it has and prints them; pin one with
- * OPENAI_TRANSCRIBE_MODEL if you want to stop guessing entirely.
+ * Which of these a project may use varies, and getting it wrong has no symptom
+ * other than the child never being heard — this project has been refused
+ * `gpt-4o-mini-transcribe` outright ("Project does not have access to model").
+ * So this is a list that gets walked on refusal, not one name we hope is right.
+ *
+ * `npm run realtime:check` asks your project directly which ones it has and
+ * prints them; pin one with OPENAI_TRANSCRIBE_MODEL to stop guessing entirely.
  */
 const TRANSCRIBE_MODELS = [
-  // Least likely to be refused first. Being listed in /v1/models is NOT the same
-  // as the project being allowed to use it — this project can see
-  // gpt-live-transcribe and gpt-4o-mini-transcribe and is refused both.
-  'whisper-1',
+  'gpt-live-transcribe',
+  'gpt-realtime-whisper',
   'gpt-4o-transcribe',
   'gpt-4o-mini-transcribe',
-  'gpt-realtime-whisper',
-  'gpt-live-transcribe',
+  'whisper-1',
 ] as const;
 
+/**
+ * How much audio context the model buys before emitting text.
+ *
+ * Lower settings produce earlier partials at some cost to word error rate. A
+ * child is waiting for an answer at the end of every turn, so this is the one
+ * place in the app where latency beats a fractional accuracy gain — the words
+ * that have to be scored precisely go to Azure, not here.
+ */
+const TRANSCRIBE_DELAY = process.env.OPENAI_TRANSCRIBE_DELAY || 'minimal';
+
 export interface RealtimeCallbacks {
-  /** The child started speaking. Fires from server VAD, not from a transcript. */
-  onSpeechStarted: () => void;
-  /** The child stopped speaking. */
-  onSpeechStopped?: () => void;
-  /** A complete utterance from the child, transcribed. */
-  onUtterance: (text: string) => void;
+  /**
+   * A finished transcript for one committed turn.
+   *
+   * `turnId` is whatever was passed to `commit()`, threaded back so a transcript
+   * that arrives after the child has already taken the floor again can be
+   * recognised as stale and dropped rather than answered.
+   */
+  onTranscript: (turnId: number, text: string) => void;
+  /** Streaming text for a turn still in progress. Display only. */
+  onPartial?: (turnId: number, text: string) => void;
   onError?: (message: string) => void;
-  /** The connection came up or went down. */
   onOpen?: () => void;
   onClose?: (code: number, reason: string) => void;
 }
@@ -85,20 +114,29 @@ export class RealtimeVoice {
   private ws!: WebSocket;
   private ready = false;
   private closed = false;
-  /** Fatal errors reach the UI; benign races only reach the log. */
   private seenEventTypes = new Set<string>();
 
-  private partialTranscript = '';
+  /**
+   * The turn whose audio is currently in the input buffer.
+   *
+   * Null between turns, which is also the gate on `write()`: with no open turn
+   * there is nothing to append audio to, so a stray frame cannot end up
+   * prepended to the child's next sentence.
+   */
+  private openTurn: number | null = null;
+  /** Turns committed and awaiting a transcript, oldest first. */
+  private awaiting: number[] = [];
+  /** Bytes appended for the open turn, so an empty commit can be skipped. */
+  private appended = 0;
+  private partial = '';
+
   private configureAttempts = 0;
   private readyTimer: NodeJS.Timeout | null = null;
   /** Events asked for before the socket opened. */
   private outbox: string[] = [];
-  /** Transcription models to try, in order, as the project allows them. */
   private transcribeModels: string[] = env.transcribeModel
     ? [env.transcribeModel]
     : [...TRANSCRIBE_MODELS];
-  /** Set once every candidate has been refused. VAD still works without it. */
-  private transcriptionDisabled = false;
 
   constructor(private cb: RealtimeCallbacks) {
     this.connect();
@@ -113,18 +151,19 @@ export class RealtimeVoice {
    * session was already gone. Reconnecting is the only way down the list.
    */
   private connect() {
-    this.ws = new WebSocket(`${REALTIME_URL}?model=${encodeURIComponent(env.realtimeModel)}`, {
+    this.ws = new WebSocket(REALTIME_URL, {
       headers: { Authorization: `Bearer ${env.openaiKey}` },
     });
 
     this.ws.on('open', () => {
-      // Configure FIRST, then release anything that was asked for while we were
-      // still connecting — order matters, the session has to exist before a
-      // response can be created in it.
+      // Configure FIRST, then release anything queued during the handshake —
+      // the session has to exist before audio can be appended to it.
       this.configure();
       const queued = this.outbox.splice(0, this.outbox.length);
       for (const data of queued) this.ws.send(data);
-      if (queued.length) console.log(`[realtime] session ready (${queued.length} message(s) queued during setup)`);
+      if (queued.length) {
+        console.log(`[realtime] session ready (${queued.length} message(s) queued during setup)`);
+      }
       this.cb.onOpen?.();
     });
 
@@ -161,50 +200,49 @@ export class RealtimeVoice {
           return;
         }
 
-        // Every candidate refused. Reconnect with transcription switched off
-        // rather than leaving the session dead: without it the child cannot be
-        // understood, but barge-in still works, so at least the narrator still
-        // stops when they talk. Say so loudly — this is not a degradation
-        // anyone should have to infer from the app being strange.
-        this.transcriptionDisabled = true;
+        // Every candidate refused. Unlike the old design there is nothing left
+        // to fall back to: without transcription this session has no other job,
+        // and a mic button that records into a void is worse than an error.
         console.error(
           '[realtime] NO transcription model is available to this project. ' +
-            'Barge-in will still work but nothing the child says can be understood. ' +
             'Run `npm run realtime:check` — it tests every model and tells you which to pin.',
         );
         this.cb.onError?.(
-          'Ollie can hear that you are talking but cannot understand the words yet — ' +
-            'no transcription model is available on this OpenAI project.',
+          'Ollie cannot understand speech right now — no transcription model is ' +
+            'available on this OpenAI project.',
         );
-        setTimeout(() => this.connect(), 150);
+        this.failAwaiting('no transcription model available');
         return;
       }
 
+      // Any turn still waiting for words is never going to get them. Say so
+      // rather than leaving the state machine in PROCESSING forever.
+      if (!this.closed) this.failAwaiting(`connection closed (${code})`);
       this.cb.onClose?.(code, why);
     });
   }
 
   /** Was this failure "the project cannot use that transcription model"? */
   private refusedModel(message: string): boolean {
-    if (this.transcriptionDisabled) return false;
     if (!/does not have access to model|model_not_found/i.test(message)) return false;
     return this.transcribeModels.some((m) => message.includes(m));
   }
 
   /**
-   * Queue anything sent before the socket is open.
+   * Resolve every pending turn with an empty transcript.
    *
-   * This used to `return` on a socket that was still connecting, which quietly
-   * threw the event away. `Session.start()` creates this object and asks for the
-   * greeting in the same tick — about a second before the WebSocket finishes its
-   * handshake — so the very first `response.create` of every session went in the
-   * bin. Nothing was ever spoken, `done` never resolved because `response.done`
-   * never came, and the session hung until a stray noise triggered the VAD and
-   * cancelled a response that had never existed.
-   *
-   * That was the "few seconds of nothing at the start", the "produced NO audio",
-   * and the phantom barge-in, all from one dropped message.
+   * A turn that never comes back is a session stuck in PROCESSING with the mic
+   * shut — the child tapped, nothing happened, and there is nothing they can do
+   * about it. An empty transcript at least reaches the state machine, which
+   * knows how to get back to a usable state from there.
    */
+  private failAwaiting(why: string) {
+    const stuck = this.awaiting.splice(0, this.awaiting.length);
+    if (stuck.length) console.warn(`[realtime] ${stuck.length} turn(s) lost: ${why}`);
+    for (const turnId of stuck) this.cb.onTranscript(turnId, '');
+  }
+
+  /** Queue anything sent before the socket is open. */
   private send(event: Record<string, unknown>) {
     const data = JSON.stringify(event);
     if (this.ws.readyState === WebSocket.OPEN) {
@@ -221,12 +259,9 @@ export class RealtimeVoice {
   /**
    * Configure the session.
    *
-   * `create_response: false` is the single most important line in this file. The
-   * model would otherwise reply to everything it hears — including a child
-   * reading their passage out loud, which it would treat as being talked to. We
-   * want its ears and its voice, not its judgment about when to use them: what
-   * counts as reading, what needs an answer, and what happens next are decided by
-   * the state machine, exactly as before.
+   * `turn_detection: null` is the single most important line in this file. It
+   * hands the turn boundary to the child's thumb: nothing is transcribed until
+   * we commit, and we commit exactly once, when they close the mic.
    */
   private configure(minimal = false) {
     this.configureAttempts += 1;
@@ -246,31 +281,26 @@ export class RealtimeVoice {
     this.send({
       type: 'session.update',
       session: {
-        type: 'realtime',
-        // TEXT, not audio. This session is ears; it has nothing to say and now
-        // has no way to say it. See the note at the top of the file.
-        output_modalities: ['text'],
-        instructions: 'Do not respond. You are only listening.',
+        type: 'transcription',
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-            ...(this.transcriptionDisabled
-              ? {}
-              : { transcription: { model: this.transcribeModels[0], language: 'en' } }),
             // Laptop speakers and a laptop microphone in the same room.
             ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              // Children pause mid-sentence constantly. This is the "have they
-              // finished?" window, and it is deliberately longer than the default.
-              silence_duration_ms: 900,
-              // Nothing here ever replies. Both of these exist to make sure of
-              // it from two directions.
-              create_response: false,
-              interrupt_response: false,
+            transcription: {
+              model: this.transcribeModels[0],
+              languages: ['en'],
+              ...(minimal ? {} : { delay: TRANSCRIBE_DELAY }),
+              // Children are the hardest speakers this model will meet: half
+              // words, invented ones, and a lot of sounding out. Telling it what
+              // it is listening to is free and measurably helps short phrases.
+              prompt:
+                'A young child, roughly four to seven years old, reading a short ' +
+                'story aloud or talking to a friendly companion. Expect partial ' +
+                'words, sounding out letter by letter, and enthusiasm.',
             },
+            // No automatic turn detection. The child's thumb is the boundary.
+            turn_detection: null,
           },
         },
       },
@@ -282,95 +312,91 @@ export class RealtimeVoice {
       case 'session.created':
         break;
 
+      case 'transcription_session.updated':
       case 'session.updated': {
         if (this.readyTimer) clearTimeout(this.readyTimer);
         this.readyTimer = null;
-        console.log(
-          this.transcriptionDisabled
-            ? '[realtime] listening WITHOUT transcription — barge-in only'
-            : `[realtime] transcribing with ${this.transcribeModels[0]}`,
-        );
         if (process.env.REALTIME_TRACE) {
           console.log('[realtime] effective session', JSON.stringify(event.session, null, 2));
         }
         if (this.ready) break;
         this.ready = true;
-        console.log('[realtime] session ready — listening');
+        console.log(
+          `[realtime] listening — ${this.transcribeModels[0]}, manual turns (delay=${TRANSCRIBE_DELAY})`,
+        );
         break;
       }
 
-      // The whole reason for this integration: speech detected in the audio
-      // itself, before any transcription has happened.
-      case 'input_audio_buffer.speech_started':
-        this.cb.onSpeechStarted();
-        break;
-
-      case 'input_audio_buffer.speech_stopped':
-        this.cb.onSpeechStopped?.();
-        break;
-
       case 'conversation.item.input_audio_transcription.delta':
-        if (event.delta) this.partialTranscript += event.delta;
+        if (event.delta) {
+          this.partial += event.delta;
+          const turnId = this.awaiting[0] ?? this.openTurn;
+          if (turnId !== null && turnId !== undefined) this.cb.onPartial?.(turnId, this.partial);
+        }
         break;
 
       case 'conversation.item.input_audio_transcription.completed': {
-        const text = (event.transcript ?? this.partialTranscript ?? '').trim();
-        this.partialTranscript = '';
-        console.log(`[realtime] heard "${text}"`);
-        if (text) this.cb.onUtterance(text);
+        const text = (event.transcript ?? this.partial ?? '').trim();
+        this.partial = '';
+        // Commits are answered in order, so the oldest outstanding turn owns
+        // this transcript. Threading the id through is what lets a late one be
+        // recognised as belonging to a turn the child has already moved past.
+        const turnId = this.awaiting.shift();
+        if (turnId === undefined) {
+          console.warn(`[realtime] transcript with no turn waiting: "${text}"`);
+          break;
+        }
+        console.log(`[realtime] turn ${turnId} heard "${text}"`);
+        this.cb.onTranscript(turnId, text);
         break;
       }
 
       case 'conversation.item.input_audio_transcription.failed': {
-        this.partialTranscript = '';
+        this.partial = '';
         const err = event.error ?? {};
         console.warn('[realtime] transcription failed', JSON.stringify(err));
-
-        // The project cannot use this model. Nothing the child says will ever be
-        // heard until we pick one it can, so move down the list and reconfigure.
-        if (/model_not_found|does not have access/i.test(JSON.stringify(err)) && this.transcribeModels.length > 1) {
-          const dead = this.transcribeModels.shift();
-          console.warn(`[realtime] no access to ${dead} — switching to ${this.transcribeModels[0]}`);
-          this.send({
-            type: 'session.update',
-            session: {
-              type: 'realtime',
-              audio: { input: { transcription: { model: this.transcribeModels[0], language: 'en' } } },
-            },
-          });
-        }
+        const turnId = this.awaiting.shift();
+        // An empty transcript, not silence: the state machine leaves PROCESSING
+        // either way, which is the only thing that must not fail to happen.
+        if (turnId !== undefined) this.cb.onTranscript(turnId, '');
         break;
       }
+
+      case 'input_audio_buffer.committed':
+        break;
 
       case 'error': {
         const message = event.error?.message ?? JSON.stringify(event.error);
         console.error('[realtime]', message);
 
-        // A cancel that raced a response into existence is a bookkeeping detail,
-        // not something to put in front of a five-year-old as "Something went
-        // wrong". Only things that actually break the session reach the UI.
         // A rejected session config is recoverable: try again without the
-        // optional fields. Some models do not accept every one of them, and the
+        // optional fields. Models differ in which they accept, and the
         // difference between "no noise reduction" and "deaf" is the whole app.
-        if (!this.ready && this.configureAttempts === 1 && /session|param|unknown|invalid/i.test(message)) {
+        if (
+          !this.ready &&
+          this.configureAttempts === 1 &&
+          /session|param|unknown|invalid/i.test(message)
+        ) {
           console.warn('[realtime] session config rejected, retrying without optional fields');
           this.configure(true);
           break;
         }
 
-        const benign =
-          /no active response|cancellation failed|already has an active response|buffer is empty/i.test(
-            message,
-          );
-        if (!benign) this.cb.onError?.(`realtime: ${message}`);
+        // Committing a buffer with nothing in it is a race, not a fault: the
+        // child tapped twice, or tapped and said nothing. It is handled where it
+        // happens, and must never reach a five-year-old as "Something went
+        // wrong".
+        if (/buffer is empty|buffer too small/i.test(message)) {
+          const turnId = this.awaiting.shift();
+          if (turnId !== undefined) this.cb.onTranscript(turnId, '');
+          break;
+        }
 
-        // An error usually kills the in-flight response; do not hang on it.
+        this.cb.onError?.(`realtime: ${message}`);
         break;
       }
 
       default:
-        // Log each unfamiliar event once. When transcription silently does not
-        // arrive, this is the only way to find out that it never fired.
         if (!this.seenEventTypes.has(event.type)) {
           this.seenEventTypes.add(event.type);
           if (process.env.REALTIME_TRACE) console.log('[realtime] first', event.type);
@@ -379,40 +405,82 @@ export class RealtimeVoice {
     }
   }
 
-  /** Mic audio, 16kHz PCM16 as captured. Upsampled here. */
-  write(pcm16k: Buffer) {
-    if (this.closed || !this.ready) {
-      // DROPPED, not buffered.
-      //
-      // Buffering it seemed kind — a second of audio captured while the socket
-      // was still configuring, handed over as soon as it was ready. What it
-      // actually did was hand a whole second of sound to the VAD in one burst,
-      // at the exact moment the greeting started. The mic check screen has the
-      // child say "Hi Ollie!" out loud thirty seconds earlier, the room is not
-      // silent, and the very first thing that happened in every session was a
-      // barge-in that killed the greeting before a word of it was audible.
-      //
-      // Nothing said before the session is configured is addressed to us.
-      return;
-    }
-    const pcm24k = upsample16to24(pcm16k);
-    if (pcm24k.length === 0) return;
-    this.appendAudio(pcm24k);
+  // -------------------------------------------------------------------------
+  // The turn API. Exactly mirrors the mic button.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The mic opened. Audio from here to `commit`/`discard` is one turn.
+   *
+   * The buffer is cleared first. Anything left in it belongs to a turn that was
+   * abandoned, and a room noise captured before the child started would
+   * otherwise arrive glued to the front of their first word.
+   */
+  beginTurn(turnId: number) {
+    this.openTurn = turnId;
+    this.appended = 0;
+    this.partial = '';
+    this.send({ type: 'input_audio_buffer.clear' });
   }
 
-  private appendAudio(pcm24k: Buffer) {
+  /**
+   * The mic closed. Transcribe what was said.
+   *
+   * Resolves through `onTranscript` — always, including when there was nothing
+   * to transcribe, because the state machine is in PROCESSING waiting for it.
+   */
+  commit(turnId: number) {
+    if (this.openTurn !== turnId) {
+      console.warn(`[realtime] commit for turn ${turnId}, but ${this.openTurn} is open`);
+    }
+    this.openTurn = null;
+
+    // Nothing was captured — a double tap, or a mic that produced no frames.
+    // Committing an empty buffer is an API error; answering it ourselves keeps
+    // the turn's promise without one.
+    if (this.appended === 0) {
+      this.cb.onTranscript(turnId, '');
+      return;
+    }
+
+    this.awaiting.push(turnId);
+    this.send({ type: 'input_audio_buffer.commit' });
+  }
+
+  /** The mic closed but the audio is not wanted. Nothing is transcribed. */
+  discard(turnId: number) {
+    if (this.openTurn === turnId) this.openTurn = null;
+    this.appended = 0;
+    this.partial = '';
+    this.send({ type: 'input_audio_buffer.clear' });
+  }
+
+  /**
+   * Mic audio, 16kHz PCM16 as captured. Upsampled here.
+   *
+   * Dropped rather than buffered when no turn is open or the session is not yet
+   * configured. Nothing said while the mic is closed is addressed to us, and
+   * handing a second of captured room noise to a turn the moment it opens is
+   * how a child's first word ends up behind a cough.
+   */
+  write(pcm16k: Buffer) {
+    if (this.closed || !this.ready || this.openTurn === null) return;
+    const pcm24k = upsample16to24(pcm16k);
+    if (pcm24k.length === 0) return;
+    this.appended += pcm24k.length;
     this.send({ type: 'input_audio_buffer.append', audio: pcm24k.toString('base64') });
   }
 
-  /** Which transcription model is currently configured, if any. */
+  /** Which transcription model is currently configured. */
   get transcriptionModel(): string {
-    return this.transcriptionDisabled ? 'none' : (this.transcribeModels[0] ?? 'none');
+    return this.transcribeModels[0] ?? 'none';
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     if (this.readyTimer) clearTimeout(this.readyTimer);
+    this.failAwaiting('session closed');
     try {
       this.ws.close();
     } catch {

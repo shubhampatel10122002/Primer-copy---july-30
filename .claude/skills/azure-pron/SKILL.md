@@ -5,8 +5,15 @@ description: Conventions for Azure Pronunciation Assessment integration in this 
 
 # Azure Pronunciation Assessment
 
-Implementation lives in `server/azure.ts`. Two modes, never both at once:
-`PronunciationSession` (per passage, scoring only) and `ConversationEar` (opened once at session start, never closed, hears everything).
+Implementation lives in `server/azure.ts`, and it does exactly one job: scoring.
+`PronunciationSession` is created per passage and answers only "how well were
+those words said" — never "did the child mean to read them", which the turn's
+transcript answers separately (`lib/conversation.ts`).
+
+Audio reaches it only while the mic is open, so it can never be handed Ollie's
+own voice. There used to be a second class here, `ConversationEar`, held open for
+the whole session; transcription moved to the Realtime session and it has been
+deleted.
 
 ## Final config values
 

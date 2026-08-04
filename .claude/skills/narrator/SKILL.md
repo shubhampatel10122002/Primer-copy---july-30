@@ -15,7 +15,7 @@ Every turn returns exactly this (zod-validated via `generateObject`):
 
 ```jsonc
 {
-  "speak_text": "text the AI says aloud (sent to Cartesia)",
+  "speak_text": "text the AI says aloud (sent to the speech endpoint)",
   "child_passage": "text the child reads next, or null",
   "plan_update": "optional: modified remaining beats, or null",
   "current_beat_index": 1
@@ -105,7 +105,7 @@ hardcoded, so it fits how the reading actually went.
 Why it cannot live in the NEXT_BEAT turn itself: that turn is **prefetched while
 the child is still reading**, so it has no idea how the reading went. The
 acknowledgment is therefore generated after the passage completes, concurrently
-with the beat, and prepended — one Cartesia context instead of two, and it reads
+with the beat, and prepended — one speech request instead of two, and it reads
 as a single natural utterance.
 
 Consequences to preserve:

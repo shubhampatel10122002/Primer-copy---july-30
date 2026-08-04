@@ -9,11 +9,16 @@
 
 A voice-based AI reading companion for one child, for a YC demo. The child reads a dynamically generated story aloud. The AI narrator listens with pronunciation assessment, coaches stuck words, encourages, answers questions Socratically, and adapts the story live.
 
-**The child never presses anything.** The microphone is on for the whole session
-and they can speak at any moment, including over the narrator, who stops
-mid-word when they do. A "Consolidate" button updates the child's memory model,
-which shapes the next session's plan — that is the only control on screen, and
-it is for the founder, not the child.
+**One control: the mic button.** The child taps the owl to talk and taps it
+again when they are done. That tap is the only thing that decides who holds the
+floor — it opens the microphone, it closes it, and pressing it while Ollie is
+speaking stops him mid-word. There is one exception, and it is the one that
+matters most: during a reading turn the system opens the mic for them when a
+passage ends, and closes it when they stop reading, so the story never asks a
+five-year-old to press anything to take their turn.
+
+A "Consolidate" button updates the child's memory model, which shapes the next
+session's plan — that one is for the founder, not the child.
 
 Scope: single child, no auth, no payments, web app only, English only.
 
@@ -27,11 +32,13 @@ Scope: single child, no auth, no payments, web app only, English only.
 3. Resource group `primer-dev`, region `eastus`, pricing tier `F0` (free, 5 audio hours/month) or `S0`.
 4. After deploy, open the resource → **Keys and Endpoint** → copy **KEY 1** and the **Region**.
 
-### 0.2 OpenAI (voice, ears and turn detection)
+### 0.2 OpenAI (voice and ears)
 1. platform.openai.com → **API keys** → create a key.
-2. Put it in `.env.local` as `OPENAI_API_KEY`. Optionally set `OPENAI_REALTIME_VOICE`
+2. Put it in `.env.local` as `OPENAI_API_KEY`. Optionally set `OPENAI_TTS_VOICE`
    (alloy, ash, ballad, coral, echo, sage, shimmer, verse, cedar, marin).
-3. Verify before anything else: `npm run realtime:check`.
+3. Verify before anything else: `npm run realtime:check`. It opens a real
+   transcription session, runs one complete turn through it, and tells you which
+   transcription models this project may actually use.
 
 ### 0.3 Anthropic API
 Create a key at console.anthropic.com.
@@ -115,12 +122,12 @@ Runs on the WebSocket server. Deterministic code picks the mode; the LLM writes 
 
 | Mode | Trigger to enter | What happens |
 |---|---|---|
-| ONBOARDING | Session start with a blank profile (`lib/profile.ts`) | A short spoken conversation — name, then what they love. Mic opens between questions; no button. Writes the profile, then hands off with "I'm making a story just for you". Capped at 6 questions and 2 silences. |
-| NARRATE | Session start, or child finished a passage | Narrator produces next story beat (2-3 spoken sentences) + the child's next passage (1-2 sentences). TTS speaks the beat. The mic stays open — the child can cut in at any point. |
+| ONBOARDING | Session start with a blank profile (`lib/profile.ts`) | A short spoken conversation — name, then what they love. **Fully manual**: the child taps to talk and taps again when done, and silence never ends their turn. Writes the profile, then hands off with "I'm making a story just for you". Capped at 6 questions and 2 silences. |
+| NARRATE | Session start, or child finished a passage | Narrator produces next story beat (2-3 spoken sentences) + the child's next passage (1-2 sentences). TTS speaks the beat with the mic **closed**. When the last sample has been heard the mic opens by itself for the child's reading turn. They can tap to cut in at any point. |
 | CHILD_READS | Narrator hands over | Mic streams to Azure Pronunciation Assessment with the passage as referenceText. Tracker follows word by word. |
-| COACH | Word AccuracyScore < 60 (after leniency table, §9.3), or Omission, or pause > 3000ms on a word | Short coaching line ("Let's sound it out: b... l... ue"). Back to CHILD_READS on the same word. Max 2 coach attempts per word, then narrator says the word warmly and moves on. |
+| COACH | Word AccuracyScore < 60 (after leniency table, §9.3), or Omission | Short coaching line ("Let's sound it out: b... l... ue"), said **after the child's turn closes**, never over it. Back to CHILD_READS on the same word, mic reopened for them. Max 2 coach attempts per word, then narrator says the word warmly and moves on. |
 | ENCOURAGE | 2 consecutive passages with all words >= 80 accuracy | One short praise line naming something specific, then NARRATE. |
-| TALK | The child says anything that is not the line on screen (`lib/conversation.ts`) — while reading, or over the narrator | Stop speaking if we were. Answer them, then resume or transition (§5). There is no button and no other way in. |
+| TALK | A closed turn whose words are not the line on screen (`lib/conversation.ts`) | Answer them, then resume or transition (§5). Reached by tapping — during a reading turn, or over the narrator, which cancels him mid-word. |
 | SOCRATIC | intent = question_about_story_or_world | Narrator responds with ONE guiding question. Max 3 guiding questions, then a strong hint, then let the child conclude. Weave back to the story in one sentence, then NARRATE. |
 | REMIX | intent = change_request ("I want dragons", "this is boring") | Discard the buffered next beat. Acknowledge immediately, get a topic (§5), then regenerate the remaining beats with the new theme but the SAME difficulty, SAME target skills, SAME must_use words. |
 | ADAPT | 3+ COACH entries within one passage, or frustration detected | Difficulty down one level. Discard buffered beat. Regenerate next passage, shorter and simpler. |
@@ -137,27 +144,30 @@ Cross-cutting rules:
   next sentence: `lib/facts.ts` releases at most one detail per beat, at least two
   beats after hearing it. Feelings are answered in the moment and never woven.
 - Every Azure word result is written to `reading_events` immediately.
-- Silence in CHILD_READS: 8s gentle prompt, 20s more a friendly check-in, 45s total pause the session with a resume screen. Never nag more than twice.
+- Nobody taking a turn in CHILD_READS: 12s gentle prompt, 30s a friendly check-in, 50s pause the session with a resume screen. Never nag more than twice. Measured from the last turn, not from the last sound — the mic is shut most of the time and silence no longer means anything.
 - All mode transitions are appended to the session transcript with timestamps.
 
 ---
 
 ## 5. TALK mode and the intent router
 
-**There is no button.** The microphone is live from the moment the session opens
-until it ends, and the child can say anything at any time, over anything.
+**The mic button is the way in.** A turn begins when the child opens the mic —
+by tapping, or because the system opened it for them at the end of a passage —
+and ends when it closes. Nothing else is a turn.
 
-Two layers listen to the same audio and never contend for it:
+Two layers get the same audio, for the duration of that turn, and never contend
+for it:
 
-- **The conversation layer** (`ConversationEar`, `server/azure.ts`) is one plain
-  recognizer, opened once at session start and never torn down. It hears
-  everything, in every mode, including while the narrator is speaking.
+- **The transcription layer** (`RealtimeVoice`, `server/realtime.ts`) is a
+  Realtime transcription session with `turn_detection: null`. It does not decide
+  anything about turns: the audio between opening and closing the mic is
+  committed as one unit and comes back as one transcript.
 - **The assessment layer** (`PronunciationSession`) is created per passage and
   answers exactly one question: how well were the words on screen said. It is
   strict, and it is never asked whether the child *meant* to read them.
 
-Every complete utterance goes through `branchUtterance` (`lib/conversation.ts`),
-which compares it to the line on screen and returns one of three things:
+Every closed turn goes through `branchUtterance` (`lib/conversation.ts`), which
+compares it to the line on screen and returns one of three things:
 
 | Branch | Meaning | What happens |
 |---|---|---|
@@ -168,24 +178,24 @@ which compares it to the line on screen and returns one of three things:
 There is no fourth branch and none of the three is "ignore". An utterance that
 reaches the branch always ends in a score, a reply, or both.
 
-Interruption is decided on **partial** results, not final ones. A final arrives a
-second or more after the child's first syllable, by which point the narrator has
-usually finished the sentence — an interruption that lands after you would have
-stopped anyway is not one. Two words that are not our own echo, or a single
-unmistakable cue, and playback stops.
+Interruption is not decided at all. A tap while the narrator is speaking cancels
+him in the same transition that opens the mic (`lib/voice/machine.ts`), in the
+browser, before a byte reaches the server. Every earlier design had to infer it —
+from a partial transcript, then from server VAD plus two guard windows — and each
+inference had a false-positive that killed the greeting and a false-negative that
+let him talk over a child.
 
-An utterance is not one recognizer result. Azure ends an utterance at every
-pause and children pause constantly, so results are buffered into a *turn* and
-only acted on after `REPLY_QUIET_MS` of real silence — longer when the last thing
-they said trails off in a way that means they have not finished
-(`soundsUnfinished`). This is what stops "I like cars, like Lamborghini... and
-Bugatti" from being answered after the third word.
+"Have they finished?" is not decided either. That question owned the largest and
+most delicate machinery in the codebase: results buffered into a turn, settled
+after 350ms to 3.8s depending on whether the last word was "and". The child
+closing the mic is the end of their turn, so `input_audio_buffer.commit` and
+"they are done" are the same instant. "I like cars, like Lamborghini... and
+Bugatti" is one turn because they held the floor for all of it.
 
 Flow once a turn closes as conversation:
 
 
-1. If the narrator was speaking, it has already stopped — mid-word, at the first
-   utterance that was not our own echo.
+1. If the narrator was speaking, he stopped the moment they tapped.
 2. **One** call (`lib/llm/respond.ts`) works out what they meant AND writes the
    reply, and pulls out anything they revealed about their own life for the fact
    ledger (`lib/facts.ts`). One round-trip, not three: this used to be classify,
@@ -240,7 +250,7 @@ Every narrator call returns structured output:
 
 ```json
 {
-  "speak_text": "text the AI says aloud (sent to Cartesia)",
+  "speak_text": "text the AI says aloud (sent to the speech endpoint)",
   "child_passage": "text the child reads next, or null",
   "plan_update": "optional: modified remaining beats",
   "current_beat_index": 1
@@ -260,28 +270,36 @@ Safety pass: before TTS, run `speak_text` + `child_passage` through one Haiku ca
 
 ### 8.2 Half-duplex rule (echo prevention)
 
-The rule is **"never score ourselves"**, not "never listen". Capture never stops
-and the Realtime connection never stops hearing. What the gate still governs is
-narrow and absolute: while audio is playing, and for 300ms after, no frame
-reaches pronunciation assessment. Scoring a child against a line while our own
-voice is in the room is the failure that rule exists to prevent.
+There is no gate any more, because there is nothing left for it to guard.
 
-Interruption is no longer inferred. The Realtime session runs server-side VAD on
-the input and emits `input_audio_buffer.speech_started` within ~200ms of the
-child's first syllable; the state machine cancels the in-flight response on that
-event and tells the browser to drop its queued audio (`stop_playback`). Every
-earlier design had to wait for a transcript, which arrives a second or more late
-— long enough that the narrator had usually finished the sentence anyway, making
-"stopping" indistinguishable from not stopping.
+The rule used to be "never score ourselves": while audio was playing, and for
+300ms after, no frame reached pronunciation assessment. It needed a timer because
+capture never stopped, so our own voice really was in the microphone and really
+could be scored as the child's.
 
-`getUserMedia` still runs with `echoCancellation: true`, and `looksLikeEcho`
-remains as a backstop for a stray word that gets through at high volume.
+The mic button removes the situation rather than defending against it. While
+Ollie is speaking the mic is closed, and a closed mic emits no frames at all —
+the AudioWorklet is gated, and the browser sends nothing. Mutual exclusion is a
+property of `lib/voice/machine.ts`: `MIC_OPEN` and `AI_SPEAKING` are different
+states, and asking to speak while the mic is open is refused outright rather than
+queued. `looksLikeEcho` is gone with the rest of it — there is no echo path left
+for it to be a backstop against.
+
+`getUserMedia` still runs with `echoCancellation: true`.
+
+**The end of an utterance is reported by the browser, not the server.** The
+server knows when it stopped *sending* audio; the child stops *hearing* it
+seconds later. In story mode that difference is what auto-opens the mic, so
+`playback_drained` comes from the browser watching its own queue drain. Opening
+on the server's signal would put the microphone live while Ollie was still
+audible — the exact failure the old gate existed to prevent, arriving by a new
+route.
 
 ### 8.3 Playback
-Realtime audio (24kHz mono PCM16) is forwarded over the WebSocket and played via Web Audio with a small jitter buffer. While the child reads passage N, beat N+1 is already generated by the narrator.
+TTS audio (24kHz mono PCM16) is forwarded over the WebSocket and played via Web Audio with a small jitter buffer. Barge-in stops every scheduled source immediately, so the worst case is one jitter buffer already inside the audio device. While the child reads passage N, beat N+1 is already generated by the narrator.
 
 ### 8.4 Mic check onboarding
-A 15-second "say hi to Ollie!" screen. Verifies mic permission, audio path, and volume, and gives the child one successful voice interaction before any reading. If mic fails, show parent-facing fix instructions. Never start a session with an unverified mic — with no button anywhere, a dead microphone is a dead session.
+A 15-second "say hi to Ollie!" screen. Verifies mic permission, audio path, and volume, and gives the child one successful voice interaction before any reading. If mic fails, show parent-facing fix instructions. Never start a session with an unverified mic. It also teaches the one control there is: "tap the owl to talk, and tap him again when you're done".
 
 ---
 
@@ -293,11 +311,11 @@ Streaming, server-side SDK, per passage: `referenceText` = the passage,
 Parse per-word `Word`, `AccuracyScore`, `ErrorType`, `Phonemes[]`. Feed each result to the state machine and write to `reading_events`.
 
 ### 9.2 Conversation mode
-A separate recognizer with no pronunciation config, opened once at session start
-and never closed (`ConversationEar`). It runs alongside assessment on the same
-audio rather than taking turns with it — the two used to alternate, and every
-handover was a few hundred milliseconds during which the child was talking to
-nothing.
+Not Azure. Everything the child says goes to the Realtime transcription session
+(`server/realtime.ts`), which runs alongside assessment on the same audio for the
+duration of a turn. There used to be a second Azure recognizer here
+(`ConversationEar`); it was left behind when transcription moved and has been
+deleted.
 
 ### 9.3 Leniency table (developmental speech)
 Ages 4-6 routinely substitute phonemes. These are NOT reading errors: r→w, l→w/y, th→f/d/v, s/z lisped. Applied AFTER Azure scoring; if a word's only failing phonemes match, treat as passed and log `error_type = 'Developmental'`. Lives in `lib/leniency.ts` so it is easy to extend during kid testing.
@@ -327,13 +345,13 @@ answer (§5). Strict scoring, flexible tutoring.
 | 3 | "Wabbit" and friends | Leniency table (9.3) |
 | 4 | Stutters, repeats, self-corrections | Best-attempt scoring (9.4) |
 | 5 | Kid reads ahead or skips | Furthest-match tracking (9.5) |
-| 6 | Kid goes silent / walks away | 8s nudge, 20s check-in, 45s pause screen (§4) |
+| 6 | Kid goes silent / walks away | 12s nudge, 30s check-in, 50s pause screen, measured from the last TURN (§4). A manual turn left open is closed after 90s — a backstop, not turn detection |
 | 7 | Kid is frustrated or overwhelmed | ADAPT + choice offer; log `frustration` flag |
 | 8 | "Just tell me the answer!" | After 2 Socratic pushbacks, tell them warmly |
 | 9 | "I'm done" | Graceful END, story wrapped, zero guilt (§5) |
 | 10 | Heavy question | Fixed template + parent flag, never improvised (§5) |
 | 11 | Kid asks for Elsa / Pokemon | Original stand-in character (§7 rule 4) |
-| 12 | Child starts talking and trails off | Turn buffering: never settled until they are genuinely quiet (§5) |
+| 12 | Child starts talking and trails off | They still hold the floor. Nothing ends a turn but the child, or — on a reading turn the system opened — silence (§5) |
 | 13 | Mic broken or permission denied | Mic check screen blocks session start (8.4) |
 
 ---
@@ -371,16 +389,16 @@ answer (§5). Strict scoring, flexible tutoring.
 ## 14. Build order
 
 1. **Skeleton**: Next.js app, docker-compose.yml, schema migration, seed demo child, hardcoded session plan.
-2. **Voice out**: Cartesia streaming TTS plays a hardcoded beat in the browser. Half-duplex gate scaffolding.
+2. **Voice out**: streaming TTS plays a hardcoded beat in the browser, cancellable mid-sentence.
 3. **Listening**: AudioWorklet capture, WS to server, Azure Pronunciation Assessment, per-word scores rendered live.
 4. **Audio hardening**: mic check screen, echo test on a real laptop speaker+mic (no headphones), noise gating. Do not proceed until the app cannot hear itself.
 5. **State machine**: NARRATE / CHILD_READS / COACH / ENCOURAGE with templated coach lines.
-6. **TALK mode**: the button, barge-in, plain STT, Haiku intent router, `help_with_word`, `chitchat`, `want_to_stop`, sensitive-topic template. REMIX stubbed.
+6. **TALK mode**: the mic button and its state machine (`lib/voice/machine.ts`), barge-in, streaming STT, Haiku intent router, `help_with_word`, `chitchat`, `want_to_stop`, sensitive-topic template. REMIX stubbed.
 7. **Live narrator**: replace templates with the narrator agent, buffered beat generation, safety pass, real REMIX.
 8. **SOCRATIC + ADAPT** + frustration path.
 9. **Pedagogy + events**: reading_events writes, leniency table, best-attempt scoring, mastery math.
 10. **Consolidate button** + memory diff view + next-plan generation.
-11. **Demo polish**: story text on screen with current word highlighted, a live "I'm listening" indicator where the button used to be, memory panel on the side.
+11. **Demo polish**: story text on screen with current word highlighted, the owl-as-mic-button showing whose turn it is, memory panel on the side.
 
 Testing note: put the app in front of a real 4-6 year old no later than step 5. Every assumption about kid behaviour in this file is provisional until then.
 
@@ -390,10 +408,30 @@ Testing note: put the app in front of a real 4-6 year old no later than step 5. 
 
 Auth, multi-child, parent app, payments, mobile, nightly cron, custom ASR, agent frameworks, analytics, i18n, voice cloning, avatar animation.
 
-**The push-to-talk button is also gone**, and with it automatic off-script
-detection as a *separate* feature. Both were answers to the same question — how
-does a child get heard — and both were wrong. The button assumed a five-year-old
-would reach for a control mid-thought; off-script detection assumed we could
-guess from the assessment stream whether they meant to be reading. What replaced
-them is neither: the microphone is simply always on, and every utterance is
-compared to the line on screen and branched (§5). Do not reintroduce a button.
+### The mic button, and why it came back
+
+This section used to end "Do not reintroduce a button". It was wrong, and the
+reason it was wrong is worth keeping, because the argument against the button was
+good and it still lost.
+
+The case against was that a five-year-old would not reach for a control
+mid-thought. True — and that is why the button is not the whole answer. The
+system still opens and closes the mic for them during a reading turn, which is
+where the objection actually applies: a child who has just been handed a passage
+is not going to press anything first.
+
+The case FOR is everything the always-on microphone had to guess. Had the child
+started talking (VAD, plus two guard windows so the greeting did not kill
+itself)? Had they finished (a settle window of 350ms to 3.8s, chosen by looking
+at whether their last word was "and")? Was that our own voice coming back
+(`looksLikeEcho`)? Did they MEAN to interrupt (`isInterruption`)? Every one of
+those was a probabilistic answer to a question the child could have answered
+exactly, and every one had a failure mode that felt, to them, like not being
+listened to.
+
+Deleting those guesses removed far more code than the button added, and it made
+"the mic is open" and "Ollie is speaking" mutually exclusive by construction
+rather than by three overlapping timers.
+
+**Always-on listening is what is now out of scope.** Turn-taking goes through
+`lib/voice/machine.ts` and nothing else opens the mic or cancels the voice.

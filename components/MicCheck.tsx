@@ -71,6 +71,10 @@ export default function MicCheck({ onReady }: { onReady: (engine: AudioEngine) =
     const engine = engineRef.current;
     if (!engine) return;
     handedOff.current = true; // the session owns the engine from here on
+    // Drop our level handler before handing over: this component unmounts
+    // immediately, and the session installs its own. Leaving ours attached
+    // means every audio block calls setState on a component that is gone.
+    engine.onLevel = null;
     onReady(engine);
   }
 
@@ -112,11 +116,10 @@ export default function MicCheck({ onReady }: { onReady: (engine: AudioEngine) =
             <button className="btn btn-primary" onClick={start}>
               Start the story
             </button>
-            <div style={{ marginTop: 18 }}>
-              <a href="/audio-test" className="muted" style={{ fontSize: 14 }}>
-                Can&rsquo;t hear Ollie? Run the audio check →
-              </a>
-            </div>
+            <p className="muted" style={{ fontSize: 14, marginTop: 16 }}>
+              When it&rsquo;s your turn, tap the owl to talk &mdash; and tap him again
+              when you&rsquo;re done.
+            </p>
           </>
         )}
 

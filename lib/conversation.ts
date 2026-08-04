@@ -1,15 +1,11 @@
 /**
- * The conversation layer.
+ * The conversation layer: was that reading, or was it talking?
  *
  * Reading assessment and conversation are two different jobs and this file is
  * the seam between them. Azure's pronunciation assessment answers "how well did
  * they say the words we asked for". It cannot answer "did they even mean to say
- * those words", and the old design tried to make it: it watched the assessment
- * stream and *guessed* whether an utterance was reading, then tore the recognizer
- * down and built a different one if it decided otherwise.
- *
- * That guessing is gone. Every utterance now arrives here as plain text with the
- * passage it is being compared against, and gets branched:
+ * those words", so a completed turn arrives here as plain text with the passage
+ * it is being compared against, and gets branched:
  *
  *   reading      — they read what we asked. Scoring handles it; say nothing.
  *   conversation — they said something else. It must be answered.
@@ -17,6 +13,22 @@
  *
  * No branch is "ignore". A child utterance that reaches this file always ends in
  * either a score or a reply.
+ *
+ * This file used to be much larger, and most of what left it was answering a
+ * question the mic button now answers outright:
+ *
+ *   `settleDelay` / `soundsUnfinished` decided HOW LONG to wait before treating
+ *   a turn as over — 350ms to 3.8s, chosen by inspecting whether the last word
+ *   was "and". Tapping to close is the end of the turn, so there is nothing left
+ *   to time.
+ *
+ *   `looksLikeEcho` decided whether a recognised phrase was our own voice
+ *   arriving back through the speaker. The mic is shut while Ollie talks and the
+ *   browser sends no audio at all in that state, so there is no echo path to
+ *   defend against.
+ *
+ *   `isInterruption` / `startsAnInterruption` decided whether the child had
+ *   meant to cut in. A thumb on a button means it.
  */
 
 import { normalizeWord } from './skills';
@@ -63,74 +75,8 @@ export const CONVERSATION_CUES = new Set([
   'wait', 'guess', 'hey', 'listen', 'actually', 'know',
 ]);
 
-/**
- * Trailing words that mean the child has not finished talking.
- *
- * Azure ends an utterance at every pause. "I like cars, like Lamborghini... and"
- * is a pause in the middle of a thought, and treating it as the end of a turn is
- * how a child gets talked over mid-list.
- */
-const UNFINISHED_ENDINGS = new Set([
-  'and', 'or', 'but', 'like', 'um', 'uh', 'erm', 'so', 'because', 'cause', 'cos',
-  'with', 'the', 'a', 'an', 'my', 'your', 'to', 'for', 'of', 'is', 'was', 'its',
-]);
-
 function words(text: string): string[] {
   return tokenize(text).map(normalizeWord).filter(Boolean);
-}
-
-/**
- * Did that sound like the end of a thought, or a breath in the middle of one?
- *
- * Used to decide how long to wait before replying. Being wrong in the patient
- * direction costs a second; being wrong in the other direction cuts a child off.
- */
-export function soundsUnfinished(text: string): boolean {
-  const spoken = words(text);
-  if (spoken.length === 0) return false;
-
-  const last = spoken[spoken.length - 1].replace(/'/g, '');
-  if (UNFINISHED_ENDINGS.has(last)) return true;
-
-  // A single word on its own is usually the start of something, not a whole turn.
-  return spoken.length === 1 && !CONVERSATION_CUES.has(last);
-}
-
-/**
- * Openers that promise more is coming, however the sentence ends.
- *
- * "I like cars" is a complete sentence and could be a whole turn, but a child
- * who begins "I like..." is usually about to list three more things. These get
- * the patient window even when the grammar looks finished.
- */
-const LIST_OPENERS = new Set(['i', 'my', 'we', 'and', 'also', 'like', 'theres', 'there']);
-
-/**
- * How long to wait after this before deciding the child has finished.
- *
- * This number, not the language model, is what a reply's latency mostly is: at
- * two and a half seconds flat, the model was less than a third of the wait. So
- * spend the patience where it is actually needed — a plainly complete sentence
- * gets answered quickly, and only a thought that is visibly still in motion buys
- * the long window.
- */
-export function settleDelay(
-  text: string,
-  opts: { quick: number; normal: number; patient: number },
-): number {
-  const spoken = words(text);
-  if (spoken.length === 0) return opts.normal;
-
-  if (soundsUnfinished(text)) return opts.patient;
-
-  const first = spoken[0].replace(/'/g, '');
-  if (LIST_OPENERS.has(first)) return opts.normal;
-
-  // A cue on its own ("bored", "stop") is unambiguous and urgent.
-  if (spoken.length <= 2 && spoken.some((w) => CONVERSATION_CUES.has(w))) return opts.quick;
-
-  // A sentence of real length that closed cleanly is a finished turn.
-  return spoken.length >= 3 ? opts.quick : opts.normal;
 }
 
 /**
@@ -229,83 +175,4 @@ export function branchUtterance(args: { text: string; passage: string | null }):
     overlap,
     reason: 'messy, but still an attempt at the line',
   };
-}
-
-/**
- * Is what we just heard our own voice coming back through the speaker?
- *
- * The microphone is now open while the narrator speaks, because a child who
- * talks during the story has to be heard. This is what keeps that from meaning
- * the app hears itself: it has the exact words currently being spoken, so
- * anything that substantially *is* those words is echo.
- */
-export function looksLikeEcho(recognized: string, spokenText: string): boolean {
-  const heard = words(recognized);
-  if (heard.length === 0) return true;
-
-  const said = new Set(words(spokenText));
-  if (said.size === 0) return false;
-
-  const matched = heard.filter((t) => said.has(t)).length;
-  // Half is a low bar on purpose. Missing a real interruption costs one repeat;
-  // acting on our own echo means the app interrupts itself.
-  return matched / heard.length >= 0.5;
-}
-
-/**
- * Should we stop talking, right now, on a PARTIAL result?
- *
- * This is the difference between an interruption that works and one that does
- * not. A final result arrives a second or more after the child stops speaking a
- * segment — by which time the narrator has usually finished the sentence anyway,
- * so stopping "on interruption" was indistinguishable from not stopping at all.
- * Partials arrive within a few hundred milliseconds of the first syllable.
- *
- * The bar is two words, or one unmistakable cue, that are not our own echo.
- * Deliberately lower than `isInterruption`: stopping is cheap and recoverable,
- * being talked over is not.
- */
-export function startsAnInterruption(
-  partial: string,
-  spokenText: string,
-  previousPartial = '',
-): boolean {
-  // Judge only what is NEW since the last partial.
-  //
-  // This is the trap the old version fell into. While the narrator is talking,
-  // Azure is transcribing the narrator, so by the time the child cuts in the
-  // partial reads "the dragon flew over the hill can we" — six of our words and
-  // two of theirs. Scored whole, that is 75% echo and gets thrown away, and the
-  // child is ignored precisely when they most need not to be. The two words that
-  // just appeared are not ours, and that is the entire signal.
-  const before = words(previousPartial).length;
-  const all = words(partial);
-  const fresh = before > 0 && all.length > before ? all.slice(before) : all;
-  if (fresh.length === 0) return false;
-
-  const said = new Set(words(spokenText));
-  const novel = fresh.filter((t) => !said.has(t));
-  if (novel.length === 0) return false;
-
-  if (novel.some((t) => CONVERSATION_CUES.has(t))) return true;
-
-  return novel.length >= 2 && novel.some((t) => t.replace(/'/g, '').length >= 3);
-}
-
-/**
- * Did the child really interrupt, or did the microphone just pick something up?
- *
- * Applied to complete utterances, where there is enough text to be sure.
- */
-export function isInterruption(recognized: string, spokenText: string): boolean {
-  if (looksLikeEcho(recognized, spokenText)) return false;
-
-  const heard = words(recognized);
-  if (heard.length === 0) return false;
-
-  // An unmistakable cue stands on its own — "stop" and "bored" are not what a
-  // television in the next room says into a laptop microphone.
-  if (heard.some((t) => CONVERSATION_CUES.has(t))) return true;
-
-  return heard.length >= MIN_ASIDE_TOKENS && heard.some((t) => t.replace(/'/g, '').length >= 3);
 }

@@ -61,18 +61,14 @@ async function listAudioModels(): Promise<string[]> {
  * only reliable answer is to open a session with each one and see whether the
  * server accepts it or hangs up.
  */
-async function testTranscriptionModels(
-  candidates: string[],
-  sessionModel: string,
-): Promise<string[]> {
+async function testTranscriptionModels(candidates: string[]): Promise<string[]> {
   const working: string[] = [];
 
   for (const model of candidates) {
     const ok = await new Promise<boolean>((resolve) => {
-      const ws = new WebSocket(
-        `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(sessionModel)}`,
-        { headers: { Authorization: `Bearer ${env.openaiKey}` } },
-      );
+      const ws = new WebSocket('wss://api.openai.com/v1/realtime?intent=transcription', {
+        headers: { Authorization: `Bearer ${env.openaiKey}` },
+      });
       const finish = (value: boolean) => {
         clearTimeout(timer);
         try {
@@ -89,12 +85,14 @@ async function testTranscriptionModels(
           JSON.stringify({
             type: 'session.update',
             session: {
-              type: 'realtime',
-              output_modalities: ['text'],
+              type: 'transcription',
               audio: {
                 input: {
                   format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-                  transcription: { model, language: 'en' },
+                  transcription: { model, languages: ['en'] },
+                  // Exactly how the app configures it: the child's thumb is the
+                  // turn boundary, so there is no turn detection to negotiate.
+                  turn_detection: null,
                 },
               },
             },
@@ -103,7 +101,9 @@ async function testTranscriptionModels(
       );
       ws.on('message', (data) => {
         const event = JSON.parse(data.toString());
-        if (event.type === 'session.updated') finish(true);
+        if (event.type === 'session.updated' || event.type === 'transcription_session.updated') {
+          finish(true);
+        }
         if (event.type === 'error') finish(false);
       });
       ws.on('close', () => finish(false));
@@ -118,7 +118,7 @@ async function testTranscriptionModels(
 
 async function main() {
   console.log('\nRealtime connectivity check\n');
-  line('model', env.realtimeModel);
+  line('session', 'transcription (turn_detection: null — the mic button is the turn)');
   line('voice', env.ttsVoice);
   line('transcription', env.transcribeModel || 'auto (falls back on model_not_found)');
   line('key', `${env.openaiKey.slice(0, 7)}…${env.openaiKey.slice(-4)}`);
@@ -131,27 +131,23 @@ async function main() {
     const transcribers = audioModels.filter((id) => /transcribe|whisper/.test(id));
     console.log('');
     if (transcribers.length) {
-      console.log(`  Which of those open a session with model ${env.realtimeModel}:`);
-      const working = await testTranscriptionModels(transcribers, env.realtimeModel);
+      console.log('  Which of those actually open a transcription session:');
+      const working = await testTranscriptionModels(transcribers);
       console.log('');
 
       if (working.length) {
         console.log(`  -> put this in .env.local:  OPENAI_TRANSCRIBE_MODEL=${working[0]}`);
+        if (!working.includes('gpt-live-transcribe')) {
+          console.log(
+            '     (gpt-live-transcribe is the current low-latency model and would be\n' +
+              '      the better choice — ask for it on this project if you can.)',
+          );
+        }
       } else {
-        // Does the SESSION model change the answer? Worth knowing before anyone
-        // concludes the project has no transcription at all.
-        const alternate = env.realtimeModel === 'gpt-realtime' ? 'gpt-realtime-2.1' : 'gpt-realtime';
-        console.log(`  None worked. Trying the same list against ${alternate}:`);
-        const other = await testTranscriptionModels(transcribers, alternate);
-        console.log('');
         console.log(
-          other.length
-            ? `  -> the SESSION model is the problem. Put BOTH of these in .env.local:\n` +
-              `        OPENAI_REALTIME_MODEL=${alternate}\n` +
-              `        OPENAI_TRANSCRIBE_MODEL=${other[0]}`
-            : '  -> NONE work on either session model. This is a project entitlement\n' +
-              '     problem, not a code one: nothing the child says can be transcribed\n' +
-              '     until the OpenAI project is granted a transcription model.',
+          '  -> NONE of them work. This is a project entitlement problem, not a code\n' +
+            '     one: nothing the child says can be transcribed until the OpenAI\n' +
+            '     project is granted a transcription model.',
         );
       }
     } else {
@@ -167,32 +163,48 @@ async function main() {
   let opened = false;
   const started = Date.now();
 
+  let transcribed = false;
+
   const voice = new RealtimeVoice({
     onOpen: () => {
       opened = true;
       line('socket', `open in ${Date.now() - started}ms`);
     },
-    onSpeechStarted: () => line('speech_started', 'VAD fired (barge-in signal)'),
-    onSpeechStopped: () => line('speech_stopped', ''),
-    onUtterance: (text) => line('transcript', JSON.stringify(text)),
+    onPartial: (turnId, text) => verbose && line(`partial turn ${turnId}`, JSON.stringify(text)),
+    onTranscript: (turnId, text) => {
+      transcribed = true;
+      line(`turn ${turnId}`, text ? JSON.stringify(text) : '(nothing heard — expected, it was silence)');
+    },
     onError: (m) => line('ERROR', m),
     onClose: (code, reason) => line('socket closed', `${code} ${reason}`),
   });
 
-  // Give the session a moment to configure, then feed silence so the input
-  // pipeline is exercised the same way a real session exercises it.
+  // Give the session a moment to configure, then run one complete turn exactly
+  // the way the mic button runs one: open, feed audio, commit, get words back.
+  // Silence in, nothing out — but every part of the path is exercised, and a
+  // project that cannot use the configured model fails here rather than in
+  // front of a child.
   await new Promise((r) => setTimeout(r, 1500));
   if (!opened) {
     console.error('\nNever connected. Check OPENAI_API_KEY and outbound access to api.openai.com.\n');
     process.exit(1);
   }
 
+  line('turn', 'opening (this is what tapping the mic does)');
+  voice.beginTurn(1);
   const silence = Buffer.alloc(AUDIO.micSampleRate * 2 * 0.2); // 200ms at 16kHz
   for (let i = 0; i < 5; i++) {
     voice.write(silence);
     await new Promise((r) => setTimeout(r, 100));
   }
   line('sent', `1s of silence (upsampled to ${AUDIO.realtimeSampleRate}Hz)`);
+  voice.commit(1);
+  line('turn', 'committed (this is what tapping again does)');
+
+  // Every committed turn must come back, including an empty one — a turn that
+  // never resolves is a session stuck with the mic shut and no way out.
+  for (let i = 0; i < 40 && !transcribed; i++) await new Promise((r) => setTimeout(r, 100));
+  if (!transcribed) line('WARNING', 'the committed turn never came back within 4s');
 
   // The voice is a separate service now, so test it separately.
   const say = 'Hi there! I am Ollie, and I am ready to read with you.';

@@ -23,9 +23,6 @@ export const env = {
   get openaiKey() {
     return required('OPENAI_API_KEY');
   },
-  get realtimeModel() {
-    return process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
-  },
   /** alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer. */
   get ttsVoice() {
     return process.env.OPENAI_TTS_VOICE || process.env.OPENAI_REALTIME_VOICE || 'coral';
@@ -59,12 +56,15 @@ export const MODELS = {
  * Realtime API wants 24kHz, so the server upsamples on the way in — cheap, and it
  * keeps the assessment path bit-for-bit what it always was.
  *
- * Playback is 24kHz PCM16 because that is what Realtime returns.
+ * Playback is 24kHz PCM16 because that is what the speech endpoint returns.
+ *
+ * There is no half-duplex tail constant any more. It existed to keep scoring
+ * shut for 300ms after playback so we could not score our own voice; the mic
+ * button makes that impossible instead of merely unlikely — while Ollie is
+ * speaking the microphone is closed, and no audio leaves the browser at all.
  */
 export const AUDIO = {
   micSampleRate: 16000,
   realtimeSampleRate: 24000,
   ttsSampleRate: 24000,
-  /** Keep assessment closed this long after playback ends, to swallow the speaker tail. */
-  gateTailMs: 300,
 } as const;
