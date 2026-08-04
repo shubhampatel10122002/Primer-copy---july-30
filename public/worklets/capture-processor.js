@@ -2,9 +2,13 @@
  * Mic capture worklet. Downsamples the AudioContext rate to 16kHz mono and
  * emits 16-bit PCM frames for Azure. PLAN.md §8.1.
  *
- * Also reports an RMS level so the mic-check screen can show a live meter, and
- * honours a `mute` message so the client can pause capture while the narrator
- * is speaking (belt and suspenders — the server gate is authoritative).
+ * Capture is GATED on the mic being open. While it is closed this emits no
+ * audio frames at all — not silence, not dropped-on-arrival frames, nothing.
+ * The mic button is the only thing that opens it.
+ *
+ * The RMS level keeps flowing either way, because two things need it while the
+ * mic is shut: the mic-check meter, and the room-noise floor that end-of-speech
+ * detection measures itself against.
  */
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -16,13 +20,15 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.lastSample = 0;
     this.out = [];
     this.frameSize = 640; // 40ms at 16kHz
-    this.muted = false;
+    this.capturing = false;
     this.levelCounter = 0;
 
     this.port.onmessage = (e) => {
-      if (e.data && e.data.type === 'mute') {
-        this.muted = !!e.data.value;
-        if (this.muted) this.out.length = 0;
+      if (e.data && e.data.type === 'capture') {
+        this.capturing = !!e.data.value;
+        // Whatever is half-assembled belongs to the other side of the gate.
+        this.out.length = 0;
+        this.cursor = 0;
       }
     };
   }
@@ -32,7 +38,9 @@ class CaptureProcessor extends AudioWorkletProcessor {
     const ch = input && input[0];
     if (!ch || ch.length === 0) return true;
 
-    // Level meter runs even while muted so the mic check can't be fooled.
+    // The level runs whether or not we are capturing: the mic check needs it
+    // before a session exists, and the noise floor has to be measured from the
+    // quiet BEFORE the child starts talking to be worth anything.
     let sum = 0;
     for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
     const rms = Math.sqrt(sum / ch.length);
@@ -40,7 +48,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
       this.port.postMessage({ type: 'level', value: rms });
     }
 
-    if (this.muted) {
+    if (!this.capturing) {
       this.cursor = 0;
       return true;
     }

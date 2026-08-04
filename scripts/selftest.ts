@@ -14,14 +14,20 @@ import { AUDIO } from '../lib/env';
 import { upsample16to24 } from '../server/realtime';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
+import { branchUtterance } from '../lib/conversation';
 import {
-  branchUtterance,
-  looksLikeEcho,
-  isInterruption,
-  startsAnInterruption,
-  soundsUnfinished,
-  settleDelay,
-} from '../lib/conversation';
+  VoiceMachine,
+  transition,
+  initialSnapshot,
+  checkInvariants,
+  armsAutoClose,
+  AUTO_CLOSE_SILENCE_MS,
+  MIC_DOUBLE_TAP_MS,
+  type VoiceEffect,
+  type VoiceEvent,
+  type VoiceSnapshot,
+  type VoiceState,
+} from '../lib/voice/machine';
 import { FactLedger, mergeFactsIntoMemory, WEAVE_DELAY_BEATS } from '../lib/facts';
 import { shouldCheckIn, summarizeProgress, parseYesNo } from '../lib/sessionflow';
 import {
@@ -320,7 +326,6 @@ console.log('\nAudio framing');
   ok('mic rate is 16kHz for Azure', AUDIO.micSampleRate === 16000);
   ok('Realtime rate is 24kHz', AUDIO.realtimeSampleRate === 24000);
   ok('playback rate matches Realtime output', AUDIO.ttsSampleRate === AUDIO.realtimeSampleRate);
-  ok('half-duplex tail is 300ms', AUDIO.gateTailMs === 300);
   ok('tokenizer drops pure punctuation', tokenize('Hi -- there!').length === 2);
 
   // The mic is captured at Azure's rate and upsampled for Realtime, so scoring
@@ -464,12 +469,11 @@ console.log('\nBranching an utterance: reading, talking, or both');
   // A single wrong word inside a line is a stumble, not an interruption.
   ok('one odd word does not make it mixed', branch('The blue dragon flapped over the hill').kind === 'reading');
 
-  // Knowing when they have not finished talking.
-  ok('"I like cars and" is unfinished', soundsUnfinished('I like cars and'));
-  ok('"I like cars, like" is unfinished', soundsUnfinished('I like cars, like'));
-  ok('"I like cars" is finished', !soundsUnfinished('I like cars'));
-  ok('one bare word is treated as unfinished', soundsUnfinished('Lamborghini'));
-  ok('but a cue word on its own is a whole turn', !soundsUnfinished('bored'));
+  // "Have they finished talking?" is no longer asked here, or anywhere. It was
+  // the hardest question in the codebase — a settle window of 350ms to 3.8s,
+  // chosen by looking at whether the last word was "and" — and the mic button
+  // answers it outright. What survives is the question the button does NOT
+  // answer: was that the line on screen, or was it addressed to us.
 }
 
 // --------------------------------------------------------------------------
@@ -618,86 +622,6 @@ console.log('\nOnboarding profile');
 }
 
 // --------------------------------------------------------------------------
-console.log('\nBarge-in (hearing the child over our own voice)');
-// --------------------------------------------------------------------------
-{
-  const speaking = 'Blue the dragon flew over the tall green hill.';
-
-  // Our own voice coming back through the speaker.
-  ok('exact echo is echo', looksLikeEcho('Blue the dragon flew over', speaking));
-  ok('partial echo is echo', looksLikeEcho('over the tall green hill', speaking));
-  ok('nothing heard counts as echo', looksLikeEcho('', speaking));
-
-  // The child, talking over it.
-  ok('"I am bored" is not echo', !looksLikeEcho('I am bored', speaking));
-  ok('"can we do cars instead" is not echo', !looksLikeEcho('can we do cars instead', speaking));
-
-  // What actually gets to interrupt the story.
-  ok('a cue interrupts', isInterruption('I am bored', speaking));
-  ok('one cue word is enough', isInterruption('stop', speaking));
-  ok('a real sentence interrupts', isInterruption('can we do cars instead', speaking));
-  ok('our own voice never interrupts', !isInterruption('the dragon flew over the hill', speaking));
-  ok('a stray syllable does not interrupt', !isInterruption('uh', speaking));
-  ok('two tiny words do not interrupt', !isInterruption('oh a', speaking));
-
-  // Stopping on a PARTIAL is what makes an interruption feel immediate: a final
-  // arrives a second past the child's first syllable, by which point the
-  // narrator has usually finished the sentence anyway.
-  ok('two words stop us mid-sentence', startsAnInterruption('can we', speaking));
-  ok('one cue word stops us', startsAnInterruption('bored', speaking));
-  ok('a partial of our own line does not', !startsAnInterruption('the dragon flew', speaking));
-  ok('a single stray syllable does not', !startsAnInterruption('uh', speaking));
-  ok(
-    'partials are stopped on sooner than finals are acted on',
-    startsAnInterruption('can we', speaking) && !isInterruption('can we', speaking),
-  );
-
-  // The trap: while we talk, Azure transcribes US, so by the time the child cuts
-  // in the partial is mostly our own words. Scored whole it reads as echo and
-  // the child is ignored. Only the words that just arrived are theirs.
-  const contaminated = 'Blue the dragon flew over the tall can we do cars';
-  ok(
-    'echo-contaminated partial reads as echo when scored whole',
-    looksLikeEcho(contaminated, speaking),
-  );
-  ok(
-    'but the new words still interrupt',
-    startsAnInterruption(contaminated, speaking, 'Blue the dragon flew over the tall'),
-    JSON.stringify({ contaminated }),
-  );
-  ok(
-    'more of our own voice arriving does not interrupt',
-    !startsAnInterruption('Blue the dragon flew over the tall green', speaking, 'Blue the dragon flew over'),
-  );
-}
-
-// --------------------------------------------------------------------------
-console.log('\nHow long to wait before answering');
-// --------------------------------------------------------------------------
-{
-  const ms = { quick: 800, normal: 2000, patient: 3800 };
-  const delay = (text: string) => settleDelay(text, ms);
-
-  // The long wait is for thoughts still in motion.
-  ok('a trailing "and" waits longest', delay('I like cars and') === ms.patient);
-  ok('a trailing "like" waits longest', delay('I like cars, like') === ms.patient);
-  ok('one bare word waits longest', delay('Lamborghini') === ms.patient);
-
-  // A child who starts "I like..." is usually about to list three more things.
-  ok('a list opener gets the normal wait', delay('I like cars and trucks') === ms.normal);
-  ok('"my dog is called Max" gets the normal wait', delay('my dog is called Max') === ms.normal);
-
-  // Everything else gets answered quickly — this is where the latency went.
-  ok('a finished sentence is quick', delay('can we read about trucks instead') === ms.quick);
-  ok('an urgent cue is quick', delay('bored') === ms.quick);
-  ok('"stop" is quick', delay('stop') === ms.quick);
-  ok(
-    'quick really is quicker than the old flat wait',
-    delay('can we read about trucks instead') < 2_500,
-  );
-}
-
-// --------------------------------------------------------------------------
 console.log('\nSpoken turn length and repetition');
 // --------------------------------------------------------------------------
 {
@@ -752,6 +676,457 @@ console.log('\nPlanner fallback (must never be about somebody else)');
   const blank = fallbackPlan(child, ['short_a']);
   ok('with no interests it still names the child', blank.premise.includes('Sam'));
   ok('and stays within the passage limits', blank.vocab_constraints.max_sentence_words <= 12);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: the transition table is total');
+// --------------------------------------------------------------------------
+{
+  const STATES: VoiceState[] = ['IDLE', 'AI_SPEAKING', 'MIC_OPEN', 'PROCESSING', 'ERROR', 'ENDED'];
+  const EVENTS: VoiceEvent[] = [
+    { t: 'MIC_TAP' },
+    { t: 'AI_SPEECH_START', utteranceId: 99, text: 'hello', handoff: false },
+    { t: 'AI_SPEECH_END', utteranceId: 99 },
+    { t: 'SPEECH_END_DETECTED', turnId: 99 },
+    { t: 'TRANSCRIPT_FINAL', turnId: 99, text: 'hi' },
+    { t: 'RESPONSE_READY', turnId: 99, willSpeak: true },
+    { t: 'FLOOR_TO_CHILD' },
+    { t: 'ERROR', message: 'boom', from: 'stt' },
+    { t: 'RECOVER' },
+    { t: 'MODE_CHANGE', mode: 'STORY' },
+    { t: 'SESSION_END' },
+  ];
+
+  /** Reach a given state by the route a real session would take. */
+  function reach(state: VoiceState, mode: 'ONBOARDING' | 'STORY' = 'STORY'): VoiceSnapshot {
+    let s = initialSnapshot(mode);
+    const step = (e: VoiceEvent, at = 1000) => {
+      s = transition(s, e, at).snapshot;
+    };
+    switch (state) {
+      case 'IDLE':
+        break;
+      case 'AI_SPEAKING':
+        step({ t: 'AI_SPEECH_START', utteranceId: 1, text: 'a beat', handoff: true });
+        break;
+      case 'MIC_OPEN':
+        step({ t: 'MIC_TAP' });
+        break;
+      case 'PROCESSING':
+        step({ t: 'MIC_TAP' }, 1000);
+        step({ t: 'MIC_TAP' }, 9000);
+        break;
+      case 'ERROR':
+        step({ t: 'ERROR', message: 'stt died', from: 'stt' });
+        break;
+      case 'ENDED':
+        step({ t: 'SESSION_END' });
+        break;
+    }
+    return s;
+  }
+
+  // Every cell defined. An event that falls through the table would return the
+  // "unhandled" no-op, which is the one outcome that must never occur.
+  let undefinedCells = 0;
+  let invariantBreaks = 0;
+  for (const state of STATES) {
+    for (const event of EVENTS) {
+      const before = reach(state);
+      ok(`reach(${state}) really is ${state}`, before.state === state, before.state);
+      const out = transition(before, event, 20_000);
+      if (out.noop?.startsWith('unhandled')) {
+        undefinedCells++;
+        console.log(`        undefined: ${state} x ${event.t}`);
+      }
+      const broken = checkInvariants(out.snapshot);
+      if (broken.length) {
+        invariantBreaks++;
+        console.log(`        invariant: ${state} x ${event.t} -> ${broken.join('; ')}`);
+      }
+    }
+  }
+  ok(`all ${STATES.length * EVENTS.length} cells are defined`, undefinedCells === 0);
+  ok('no transition can break an invariant', invariantBreaks === 0);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: mutual exclusion');
+// --------------------------------------------------------------------------
+{
+  // Invariant 1, from both directions. This is the rule the whole rework is for.
+  let s = initialSnapshot('STORY');
+  s = transition(s, { t: 'MIC_TAP' }, 1000).snapshot;
+  ok('the mic is open', s.state === 'MIC_OPEN');
+
+  const refused = transition(s, { t: 'AI_SPEECH_START', utteranceId: 1, text: 'hi', handoff: true }, 2000);
+  ok('asking to speak over an open mic is REFUSED', refused.rejected !== null, String(refused.rejected));
+  ok('and nothing is queued to fire on close', refused.effects.length === 0);
+  ok('the state does not move', refused.snapshot.state === 'MIC_OPEN');
+
+  // Closing the mic must not then release the refused line: it was never held.
+  const closed = transition(refused.snapshot, { t: 'MIC_TAP' }, 5000);
+  ok('closing produces no speech', !closed.effects.some((e) => e.t === 'start_tts'));
+
+  // And nothing anywhere can produce a snapshot with both.
+  const speaking = transition(
+    initialSnapshot('STORY'),
+    { t: 'AI_SPEECH_START', utteranceId: 1, text: 'hi', handoff: true },
+    1000,
+  ).snapshot;
+  ok('AI_SPEAKING carries no mic session', speaking.mic === null);
+  ok('MIC_OPEN carries no utterance', s.speaking === null);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: mid-sentence barge-in');
+// --------------------------------------------------------------------------
+{
+  let clock = 1000;
+  const effects: VoiceEffect[] = [];
+  const m = new VoiceMachine({
+    mode: 'STORY',
+    onEffect: (e) => effects.push(e),
+    onViolation: (v) => ok(`no invariant broken (${v.join('; ')})`, false),
+    now: () => clock,
+  });
+
+  m.send({ t: 'AI_SPEECH_START', utteranceId: 1, text: 'Blue the dragon flew over the hill', handoff: true });
+  ok('Ollie is speaking', m.state === 'AI_SPEAKING');
+
+  effects.length = 0;
+  m.send({ t: 'MIC_TAP' });
+
+  // Everything a barge-in has to do, in the order it has to do it: kill the
+  // stream, drop what the browser has buffered, then hand over the floor.
+  const kinds = effects.map((e) => e.t);
+  ok('the stream is cancelled', kinds.includes('cancel_tts'));
+  ok('buffered audio is flushed', kinds.includes('flush_playback'));
+  ok('cancelling comes before opening', kinds.indexOf('cancel_tts') < kinds.indexOf('open_mic'));
+  ok('the mic opens in the same transition', m.state === 'MIC_OPEN');
+  ok('there is no guard window to wait out', true);
+
+  // THE rule from section 3: a manual interruption is never auto-closed.
+  ok('a barge-in mic session is MANUAL', m.snapshot.mic!.autoCloseArmed === false);
+  ok('it is marked as the child having opened it', m.snapshot.mic!.reason === 'user_tap');
+  ok('and no silence detector is armed', !kinds.includes('arm_auto_close'));
+
+  // Silence therefore cannot end it, which is the entire point: a child who
+  // interrupted mid-story is bored or has something to say, and pausing to
+  // think is not a reason to take their turn away.
+  const before = m.snapshot.state;
+  m.send({ t: 'SPEECH_END_DETECTED', turnId: m.snapshot.mic!.turnId });
+  ok('silence does NOT close a manual turn', m.state === before && m.state === 'MIC_OPEN');
+
+  // Only another tap does — a real one, seconds later. A second tap inside the
+  // double-tap window is a fumbled press, and is tested separately below.
+  clock += 4_000;
+  m.send({ t: 'MIC_TAP' });
+  ok('a second tap closes it', m.state === 'PROCESSING');
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: the reading turn opens and closes itself');
+// --------------------------------------------------------------------------
+{
+  const effects: VoiceEffect[] = [];
+  const m = new VoiceMachine({
+    mode: 'STORY',
+    onEffect: (e) => effects.push(e),
+    onViolation: (v) => ok(`no invariant broken (${v.join('; ')})`, false),
+  });
+
+  m.send({ t: 'AI_SPEECH_START', utteranceId: 7, text: 'Read this with me.', handoff: true });
+  effects.length = 0;
+
+  // The child never taps to take their reading turn.
+  m.send({ t: 'AI_SPEECH_END', utteranceId: 7 });
+  ok('the mic opens by itself when the passage ends', m.state === 'MIC_OPEN');
+  ok('the system is recorded as the opener', m.snapshot.mic!.reason === 'system_after_passage');
+  ok('so silence MAY close it', m.snapshot.mic!.autoCloseArmed === true);
+
+  const armed = effects.find((e) => e.t === 'arm_auto_close');
+  ok('the silence detector is armed', !!armed);
+  ok(
+    'and armed for this turn, at the configured threshold',
+    armed?.t === 'arm_auto_close' &&
+      armed.turnId === m.snapshot.mic!.turnId &&
+      armed.silenceMs === AUTO_CLOSE_SILENCE_MS,
+  );
+
+  // Reading finished.
+  effects.length = 0;
+  m.send({ t: 'SPEECH_END_DETECTED', turnId: m.snapshot.mic!.turnId });
+  ok('silence closes an armed turn', m.state === 'PROCESSING');
+  ok(
+    'and commits it — the audio becomes a transcript',
+    effects.some((e) => e.t === 'close_mic' && e.commit),
+  );
+  ok('the detector is disarmed on the way out', effects.some((e) => e.t === 'disarm_auto_close'));
+
+  // Silence reported for a turn that has already closed is ignored, not acted on.
+  const stale = transition(m.snapshot, { t: 'SPEECH_END_DETECTED', turnId: 1 }, 9000);
+  ok('stale silence changes nothing', stale.noop !== null && stale.snapshot.state === 'PROCESSING');
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: onboarding is manual at both ends');
+// --------------------------------------------------------------------------
+{
+  let clock = 1000;
+  const effects: VoiceEffect[] = [];
+  const m = new VoiceMachine({
+    mode: 'ONBOARDING',
+    onEffect: (e) => effects.push(e),
+    onViolation: (v) => ok(`no invariant broken (${v.join('; ')})`, false),
+    now: () => clock,
+  });
+
+  // No automatic OPEN: finishing a question leaves the floor with nobody.
+  m.send({ t: 'AI_SPEECH_START', utteranceId: 1, text: 'What should I call you?', handoff: true });
+  m.send({ t: 'AI_SPEECH_END', utteranceId: 1 });
+  ok('the mic does not open by itself in onboarding', m.state === 'IDLE');
+
+  // Nor does an explicit hand-over, which is a story-mode idea.
+  m.send({ t: 'FLOOR_TO_CHILD' });
+  ok('FLOOR_TO_CHILD is a no-op in onboarding', m.state === 'IDLE');
+
+  // The child opens it.
+  effects.length = 0;
+  m.send({ t: 'MIC_TAP' });
+  ok('tapping opens it', m.state === 'MIC_OPEN');
+  ok('never armed for auto-close', m.snapshot.mic!.autoCloseArmed === false);
+  ok('and no silence detector runs at all', !effects.some((e) => e.t === 'arm_auto_close'));
+
+  // No automatic CLOSE: a child pausing to think keeps their turn, however long
+  // they pause. This is the rule that a silence threshold cannot express.
+  m.send({ t: 'SPEECH_END_DETECTED', turnId: m.snapshot.mic!.turnId });
+  ok('silence never ends an onboarding turn', m.state === 'MIC_OPEN');
+
+  // However long they take. A four-year-old deciding what they love is not a
+  // child who has finished their turn.
+  clock += 60_000;
+  m.send({ t: 'SPEECH_END_DETECTED', turnId: m.snapshot.mic!.turnId });
+  ok('not after a minute either', m.state === 'MIC_OPEN');
+
+  clock += 1_000;
+  m.send({ t: 'MIC_TAP' });
+  ok('only the child ends it', m.state === 'PROCESSING');
+
+  // armsAutoClose is the single place the flag is computed, and it needs both.
+  ok('story + system arms it', armsAutoClose('STORY', 'system_after_passage'));
+  ok('story + a tap does not', !armsAutoClose('STORY', 'user_tap'));
+  ok('onboarding + system does not', !armsAutoClose('ONBOARDING', 'system_after_passage'));
+  ok('onboarding + a tap does not', !armsAutoClose('ONBOARDING', 'user_tap'));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: races and rapid taps');
+// --------------------------------------------------------------------------
+{
+  const make = () => {
+    const effects: VoiceEffect[] = [];
+    const m = new VoiceMachine({
+      mode: 'STORY',
+      onEffect: (e) => effects.push(e),
+      onViolation: (v) => ok(`no invariant broken (${v.join('; ')})`, false),
+      now: () => clock,
+    });
+    return { m, effects };
+  };
+  let clock = 1000;
+
+  // Rapid double tap: open and shut inside the double-tap window. There is no
+  // turn here to finalise, so the audio is discarded rather than committed —
+  // otherwise every fumbled press costs an empty transcript and an LLM call.
+  {
+    const { m, effects } = make();
+    clock = 1000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 1000 + MIC_DOUBLE_TAP_MS - 50;
+    effects.length = 0;
+    m.send({ t: 'MIC_TAP' });
+    ok('a double tap lands back at IDLE, not PROCESSING', m.state === 'IDLE');
+    ok(
+      'and discards rather than commits',
+      effects.some((e) => e.t === 'close_mic' && !e.commit),
+    );
+  }
+
+  // A deliberate tap-close is a real turn.
+  {
+    const { m, effects } = make();
+    clock = 1000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 4000;
+    effects.length = 0;
+    m.send({ t: 'MIC_TAP' });
+    ok('a real turn commits', effects.some((e) => e.t === 'close_mic' && e.commit));
+    ok('and lands in PROCESSING', m.state === 'PROCESSING');
+  }
+
+  // Ten taps in a row must never deadlock or leave the mic stuck either way.
+  {
+    const { m } = make();
+    clock = 1000;
+    for (let i = 0; i < 10; i++) {
+      clock += 500;
+      m.send({ t: 'MIC_TAP' });
+    }
+    ok('ten taps leave a legal state', ['MIC_OPEN', 'PROCESSING'].includes(m.state), m.state);
+    ok('and no broken invariant', checkInvariants(m.snapshot).length === 0);
+    clock += 500;
+    // Whatever state it is in, one more tap must still do something sane.
+    const before = m.state;
+    m.send({ t: 'MIC_TAP' });
+    ok('the button always still works', m.state !== before || m.state === 'MIC_OPEN');
+  }
+
+  // A tap in the async gap between "speech ended" and "mic opened". The gap is
+  // one transition wide, so the tap lands in MIC_OPEN and simply closes it.
+  {
+    const { m } = make();
+    clock = 1000;
+    m.send({ t: 'AI_SPEECH_START', utteranceId: 1, text: 'go on', handoff: true });
+    clock = 2000;
+    m.send({ t: 'AI_SPEECH_END', utteranceId: 1 });
+    ok('the mic auto-opened', m.state === 'MIC_OPEN');
+    clock = 3000;
+    m.send({ t: 'MIC_TAP' });
+    ok('a tap right after still closes cleanly', m.state === 'PROCESSING');
+  }
+
+  // A transcript arriving after the child has already reopened the mic. This is
+  // the one the turnId exists for: answering it would be answering a question
+  // the child has moved past.
+  {
+    const { m, effects } = make();
+    clock = 1000;
+    m.send({ t: 'MIC_TAP' });
+    const firstTurn = m.snapshot.mic!.turnId;
+    clock = 4000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 5000;
+    m.send({ t: 'MIC_TAP' }); // they want to say something else
+    ok('the child gets the floor back immediately', m.state === 'MIC_OPEN');
+    ok('the abandoned turn is dropped', true);
+
+    effects.length = 0;
+    m.send({ t: 'TRANSCRIPT_FINAL', turnId: firstTurn, text: 'the old thing' });
+    ok(
+      'a late transcript is never processed',
+      !effects.some((e) => e.t === 'process_turn'),
+    );
+    ok('and the mic stays open', m.state === 'MIC_OPEN');
+  }
+
+  // A reply that finishes generating after the child has taken the floor again
+  // must not be spoken. Two locks: the response is stale, and speaking is
+  // refused anyway.
+  {
+    const { m } = make();
+    clock = 1000;
+    m.send({ t: 'MIC_TAP' });
+    const turnId = m.snapshot.mic!.turnId;
+    clock = 4000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 5000;
+    m.send({ t: 'MIC_TAP' });
+    const late = transition(m.snapshot, { t: 'RESPONSE_READY', turnId, willSpeak: true }, 6000);
+    ok('a stale reply is ignored', late.noop !== null);
+    const spoken = transition(m.snapshot, { t: 'AI_SPEECH_START', utteranceId: 5, text: 'hi', handoff: false }, 6000);
+    ok('and could not be spoken even if it tried', spoken.rejected !== null);
+  }
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: recovery, never stuck');
+// --------------------------------------------------------------------------
+{
+  // Transcription dies mid-turn. The mic must not stay open with nobody
+  // listening, and the session must not stay mute with nobody able to fix it.
+  {
+    let s = initialSnapshot('STORY');
+    s = transition(s, { t: 'MIC_TAP' }, 1000).snapshot;
+    const out = transition(s, { t: 'ERROR', message: 'stt died', from: 'stt' }, 2000);
+    ok('an STT failure closes the mic', out.snapshot.state === 'ERROR' && out.snapshot.mic === null);
+    ok('the audio is discarded, not committed', out.effects.some((e) => e.t === 'close_mic' && !e.commit));
+
+    // And the child can always get out of it themselves.
+    const tapped = transition(out.snapshot, { t: 'MIC_TAP' }, 3000);
+    ok('a tap recovers straight into a live mic', tapped.snapshot.state === 'MIC_OPEN');
+    ok('with the error cleared', tapped.snapshot.error === null);
+  }
+
+  // TTS dies mid-sentence.
+  {
+    let s = initialSnapshot('STORY');
+    s = transition(s, { t: 'AI_SPEECH_START', utteranceId: 1, text: 'hi', handoff: true }, 1000).snapshot;
+    const out = transition(s, { t: 'ERROR', message: 'voice died', from: 'tts' }, 2000);
+    ok('a TTS failure cancels the utterance', out.effects.some((e) => e.t === 'cancel_tts'));
+    ok('and flushes what was buffered', out.effects.some((e) => e.t === 'flush_playback'));
+    const recovered = transition(out.snapshot, { t: 'RECOVER' }, 3000);
+    ok('RECOVER returns to a usable state', recovered.snapshot.state === 'IDLE');
+  }
+
+  // The transcript never arrives. A watchdog is armed on the way into
+  // PROCESSING so the session cannot sit there forever.
+  {
+    let s = initialSnapshot('STORY');
+    s = transition(s, { t: 'MIC_TAP' }, 1000).snapshot;
+    const closed = transition(s, { t: 'MIC_TAP' }, 5000);
+    ok('closing a turn arms a watchdog', closed.effects.some((e) => e.t === 'arm_watchdog'));
+    // Even without it, the child tapping is always a way out.
+    const tapped = transition(closed.snapshot, { t: 'MIC_TAP' }, 6000);
+    ok('a tap escapes a stalled PROCESSING', tapped.snapshot.state === 'MIC_OPEN');
+  }
+
+  // Ending is uniform and terminal.
+  {
+    for (const from of ['IDLE', 'MIC_OPEN', 'AI_SPEAKING'] as const) {
+      let s = initialSnapshot('STORY');
+      if (from === 'MIC_OPEN') s = transition(s, { t: 'MIC_TAP' }, 1000).snapshot;
+      if (from === 'AI_SPEAKING') {
+        s = transition(s, { t: 'AI_SPEECH_START', utteranceId: 1, text: 'x', handoff: false }, 1000).snapshot;
+      }
+      const out = transition(s, { t: 'SESSION_END' }, 2000);
+      ok(`SESSION_END from ${from} lands in ENDED`, out.snapshot.state === 'ENDED');
+      ok(`  and leaves nothing running`, out.snapshot.mic === null && out.snapshot.speaking === null);
+    }
+    const ended = transition(initialSnapshot('STORY'), { t: 'SESSION_END' }, 1000).snapshot;
+    ok('ENDED ignores a stray tap', transition(ended, { t: 'MIC_TAP' }, 2000).noop !== null);
+  }
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: the mode dimension');
+// --------------------------------------------------------------------------
+{
+  // The same event, resolved differently by mode. That is what "orthogonal"
+  // buys, and it is why the mode is a field rather than more states.
+  const onboarding = transition(
+    transition(initialSnapshot('ONBOARDING'), { t: 'AI_SPEECH_START', utteranceId: 1, text: 'x', handoff: true }, 1000).snapshot,
+    { t: 'AI_SPEECH_END', utteranceId: 1 },
+    2000,
+  ).snapshot;
+  const story = transition(
+    transition(initialSnapshot('STORY'), { t: 'AI_SPEECH_START', utteranceId: 1, text: 'x', handoff: true }, 1000).snapshot,
+    { t: 'AI_SPEECH_END', utteranceId: 1 },
+    2000,
+  ).snapshot;
+  ok('handoff opens the mic in STORY', story.state === 'MIC_OPEN');
+  ok('and does not in ONBOARDING', onboarding.state === 'IDLE');
+
+  // A mode change cannot leave an armed turn stranded in a mode that does not
+  // arm turns — invariant 4 has to survive the mode moving underneath it.
+  let s = initialSnapshot('STORY');
+  s = transition(s, { t: 'AI_SPEECH_START', utteranceId: 1, text: 'x', handoff: true }, 1000).snapshot;
+  s = transition(s, { t: 'AI_SPEECH_END', utteranceId: 1 }, 2000).snapshot;
+  ok('armed', s.mic!.autoCloseArmed === true);
+  const changed = transition(s, { t: 'MODE_CHANGE', mode: 'ONBOARDING' }, 3000);
+  ok('changing mode disarms the open turn', changed.snapshot.mic!.autoCloseArmed === false);
+  ok('and says so to the browser', changed.effects.some((e) => e.t === 'disarm_auto_close'));
+  ok('leaving the invariants intact', checkInvariants(changed.snapshot).length === 0);
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

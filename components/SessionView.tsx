@@ -3,8 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AudioEngine } from '@/lib/client/audio';
 import MicCheck from './MicCheck';
+import MicButton, { micVisual } from './MicButton';
 import PassageView, { type WordState } from './PassageView';
 import DebugPanel from './DebugPanel';
+import {
+  VoiceMachine,
+  initialSnapshot,
+  type VoiceEffect,
+  type VoiceSnapshot,
+} from '@/lib/voice/machine';
 import type { Intent, Mode, ServerMessage, SessionPlan } from '@/lib/types';
 
 const WS_URL =
@@ -13,13 +20,28 @@ const WS_URL =
     ? `ws://${window.location.hostname}:3001/session`
     : 'ws://localhost:3001/session');
 
+/**
+ * The session screen.
+ *
+ * The important thing about this component is what it does NOT decide. It does
+ * not choose when the mic opens, whether a tap is a barge-in, or whether the
+ * child has finished — it runs the same state machine the server runs
+ * (`lib/voice/machine.ts`) and carries out the effects that come back.
+ *
+ * Running a second copy of the machine here is not duplication, it is the whole
+ * latency story. A tap has to silence the voice in the same frame; a round trip
+ * to a Node process and back is 30-80ms of Ollie still talking over a child who
+ * has asked him to stop. So the browser applies the child's own events locally
+ * — tap, playback drained, silence detected — and sends them up, while the
+ * server applies its own and sends those down. Same reducer, same event
+ * sequence, same state. `voice_sync` is the safety net, not the mechanism.
+ */
 export default function SessionView() {
   const [micReady, setMicReady] = useState(false);
   const [connected, setConnected] = useState(false);
   const [mode, setMode] = useState<Mode>('IDLE');
   const [narratorText, setNarratorText] = useState('');
-  const [speaking, setSpeaking] = useState(false);
-  const [listening, setListening] = useState(false);
+  const [voice, setVoice] = useState<VoiceSnapshot>(() => initialSnapshot('ONBOARDING'));
   const [words, setWords] = useState<WordState[]>([]);
   const [cursor, setCursor] = useState(0);
   const [plan, setPlan] = useState<SessionPlan | null>(null);
@@ -39,11 +61,13 @@ export default function SessionView() {
   } | null>(null);
   const [facts, setFacts] = useState<{ text: string; topic: string; kind: string }[]>([]);
   const [awaiting, setAwaiting] = useState<'continue' | null>(null);
+  /** Sound is reaching the mic right now. Cosmetic; it decides nothing. */
+  const [hearing, setHearing] = useState(false);
   /**
    * Total TTS audio this browser has received, for the whole session.
    *
-   * Cumulative, not per-utterance: resetting it on `tts_start` meant the panel
-   * compared the PREVIOUS utterance's sent-bytes against the NEXT one's
+   * Cumulative, not per-utterance: resetting it on each new utterance meant the
+   * panel compared the PREVIOUS one's sent-bytes against the NEXT one's
    * received-bytes-so-far, which is zero for a moment every single time, and
    * cried "audio not arriving" at a browser that was receiving audio perfectly.
    */
@@ -51,19 +75,22 @@ export default function SessionView() {
 
   const engineRef = useRef<AudioEngine | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const gateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Server VAD says the child is talking right now. Drives the indicator only. */
-  const [hearing, setHearing] = useState(false);
+  const machineRef = useRef<VoiceMachine | null>(null);
   /** Caption updates waiting for the previous utterance to finish playing. */
-  const captionTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const captionTimers = useRef<{ timer: ReturnType<typeof setTimeout>; fn: () => void }[]>([]);
+
+  const send = useCallback((msg: unknown) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }, []);
 
   /**
    * Apply a caption change only once the audio already queued has played out.
    *
-   * A `speak` message arrives just *before* its own audio streams, so whatever is
-   * still queued at that moment is precisely the tail of the previous utterance.
-   * Delaying by that much keeps text and voice roughly together without needing
-   * word-level timing.
+   * A new utterance's text arrives just *before* its own audio streams, so
+   * whatever is still queued at that moment is precisely the tail of the
+   * previous one. Delaying by that much keeps text and voice roughly together
+   * without needing word-level timing.
    */
   const afterCurrentAudio = useCallback((fn: () => void) => {
     // Capped. If the queue is somehow long — a burst of audio, a stalled clock —
@@ -75,141 +102,209 @@ export default function SessionView() {
       fn();
       return;
     }
-    const timer = setTimeout(() => {
-      captionTimers.current = captionTimers.current.filter((t) => t !== timer);
-      fn();
-    }, delay);
-    captionTimers.current.push(timer);
+    const entry = {
+      timer: setTimeout(() => {
+        captionTimers.current = captionTimers.current.filter((e) => e !== entry);
+        fn();
+      }, delay),
+      fn,
+    };
+    captionTimers.current.push(entry);
   }, []);
 
-  /** Barge-in and teardown must not leave stale captions queued. */
-  const flushCaptions = useCallback(() => {
-    for (const t of captionTimers.current) clearTimeout(t);
+  /**
+   * Clear the caption queue.
+   *
+   * `apply` is the difference between a barge-in and a teardown, and getting it
+   * wrong loses the passage. Queued updates are waiting on audio that a barge-in
+   * has just cancelled, so they will never fire on their own — but what they
+   * carry is still true. The words the child is about to read are the words they
+   * are about to read, whether or not Ollie finished announcing them. Dropping
+   * them left a child looking at an empty screen with nothing to do about it.
+   *
+   * On unmount there is nothing left to show, so they are dropped.
+   */
+  const flushCaptions = useCallback((apply: boolean) => {
+    const pending = captionTimers.current;
     captionTimers.current = [];
+    for (const { timer, fn } of pending) {
+      clearTimeout(timer);
+      if (apply) fn();
+    }
   }, []);
 
-  const handleServerMessage = useCallback((msg: ServerMessage) => {
-    switch (msg.t) {
-      case 'ready':
-        setPlan(msg.plan);
-        break;
+  // -------------------------------------------------------------------------
+  // The local mirror of the state machine
+  // -------------------------------------------------------------------------
 
-      case 'mode':
-        setMode(msg.mode);
-        // The question is only on the table while the wrap-up is.
-        if (msg.mode !== 'WRAP_UP') setAwaiting(null);
-        break;
+  /**
+   * Carry out one decision the machine has made, here in the browser.
+   *
+   * `cancel_tts` and `flush_playback` are the reason this exists. They run
+   * synchronously inside the click handler, before a single byte goes to the
+   * server, which is what puts barge-in-to-silence at one frame plus whatever
+   * the audio device is already holding.
+   */
+  const applyEffect = useCallback(
+    (effect: VoiceEffect) => {
+      const engine = engineRef.current;
+      switch (effect.t) {
+        case 'open_mic':
+          engine?.setCapturing(true);
+          break;
+        case 'close_mic':
+          engine?.setCapturing(false);
+          break;
+        case 'arm_auto_close':
+          engine?.armAutoClose(effect.turnId, effect.silenceMs);
+          break;
+        case 'disarm_auto_close':
+          engine?.disarmAutoClose();
+          break;
+        case 'cancel_tts':
+        case 'flush_playback':
+          // Apply, do not drop: the audio is cancelled, the words are not.
+          flushCaptions(true);
+          engine?.stopPlayback();
+          break;
+        case 'start_tts':
+          engine?.beginUtterance(effect.utteranceId);
+          // The caption waits for the tail of the previous utterance; the audio
+          // for this one is already on its way.
+          afterCurrentAudio(() => setNarratorText(effect.text));
+          setTranscript((t) => [...t, { kind: 'narrator', text: effect.text }]);
+          break;
+        // Server-side bookkeeping. Nothing for the browser to do.
+        case 'arm_watchdog':
+        case 'disarm_watchdog':
+        case 'process_turn':
+        case 'drop_turn':
+          break;
+      }
+    },
+    [afterCurrentAudio, flushCaptions],
+  );
 
-      case 'speak':
-        // Hold the caption until the previous utterance has finished out loud.
-        afterCurrentAudio(() => setNarratorText(msg.text));
-        setTranscript((t) => [...t, { kind: 'narrator', text: msg.text }]);
-        break;
+  if (machineRef.current === null && typeof window !== 'undefined') {
+    machineRef.current = new VoiceMachine({
+      mode: 'ONBOARDING',
+      onEffect: (effect) => applyEffect(effect),
+      onChange: (snapshot) => setVoice(snapshot),
+      onViolation: (violations) =>
+        console.error(`[voice] invariant broken in the browser: ${violations.join('; ')}`),
+    });
+  }
 
-      case 'passage':
-        // The server sends this once it has finished *sending* audio, which is
-        // before the browser has finished playing it. Same treatment.
-        afterCurrentAudio(() => {
-          setWords(msg.words.map((w) => ({ word: w, status: 'pending', score: null })));
-          setCursor(0);
-        });
-        setTranscript((t) => [...t, { kind: 'passage', text: msg.text }]);
-        break;
+  /**
+   * The tap. Everything the child can do, in one handler.
+   *
+   * Applied locally FIRST and unconditionally — the machine decides what a tap
+   * means from the state it is in, so there is nothing to check here — and only
+   * then reported. If the two ever disagree, `voice_sync` settles it in the
+   * server's favour a few milliseconds later.
+   */
+  const onMicTap = useCallback(() => {
+    machineRef.current?.send({ t: 'MIC_TAP' });
+    send({ t: 'mic_tap' });
+  }, [send]);
 
-      case 'word':
-        setWords((ws) =>
-          ws.map((w, i) => (i === msg.index ? { ...w, status: msg.status, score: msg.score } : w)),
-        );
-        break;
+  const handleServerMessage = useCallback(
+    (msg: ServerMessage) => {
+      switch (msg.t) {
+        case 'ready':
+          setPlan(msg.plan);
+          break;
 
-      case 'cursor':
-        setCursor(msg.index);
-        break;
+        case 'mode':
+          setMode(msg.mode);
+          // The question is only on the table while the wrap-up is.
+          if (msg.mode !== 'WRAP_UP') setAwaiting(null);
+          break;
 
-      case 'tts_start':
-        setSpeaking(true);
-        // The microphone never closes. Detecting that the child has started
-        // talking is the Realtime session's job now — it hears the audio itself
-        // and tells us within a couple of hundred milliseconds, which is the
-        // whole reason it is here.
-        if (gateTimer.current) clearTimeout(gateTimer.current);
-        engineRef.current?.setMuted(false);
-        break;
+        // One event the browser could not have known about. Replayed through
+        // the local machine so both sides stay on the same sequence.
+        case 'voice_event':
+          machineRef.current?.send(msg.event);
+          break;
 
-      case 'stop_playback':
-        // A barge-in was accepted. Drop the queued tail and any caption waiting
-        // on audio that will now never play.
-        flushCaptions();
-        engineRef.current?.stopPlayback();
-        setSpeaking(false);
-        break;
+        // The authoritative snapshot. Normally identical to what we already
+        // have; adopting it only matters when a message was lost.
+        case 'voice_sync':
+          if (machineRef.current?.adopt(msg.snapshot)) setVoice(msg.snapshot);
+          break;
 
-      case 'tts_end':
-        setSpeaking(false);
-        // Capture keeps running here too. The server stops feeding pronunciation
-        // assessment while its own audio is in the room, so the tail is handled
-        // there; muting locally would only create a window where the child is
-        // talking to nothing, which is the thing we are trying to abolish.
-        break;
+        case 'tts_complete':
+          engineRef.current?.endUtteranceStream(msg.utteranceId);
+          break;
 
-      case 'talk_closed':
-        if (msg.transcript) {
-          setLastIntent({ transcript: msg.transcript, intent: msg.intent });
-          setTranscript((t) => [
-            ...t,
-            { kind: `child · ${msg.intent ?? 'unknown'}`, text: msg.transcript! },
-          ]);
-        }
-        break;
+        case 'passage':
+          // Sent before the beat has finished playing. Same treatment as a
+          // caption: hold it until the child has heard the sentence about it.
+          afterCurrentAudio(() => {
+            setWords(msg.words.map((w) => ({ word: w, status: 'pending', score: null })));
+            setCursor(0);
+          });
+          setTranscript((t) => [...t, { kind: 'passage', text: msg.text }]);
+          break;
 
-      // The microphone went live. It stays live for the whole session.
-      case 'listening':
-        setListening(msg.on);
-        break;
+        case 'word':
+          setWords((ws) =>
+            ws.map((w, i) => (i === msg.index ? { ...w, status: msg.status, score: msg.score } : w)),
+          );
+          break;
 
-      // Server VAD, live. This is the same signal that stops the narrator.
-      case 'hearing':
-        setHearing(msg.on);
-        break;
+        case 'cursor':
+          setCursor(msg.index);
+          break;
 
-      case 'profile':
-        setProfile({ name: msg.name, age: msg.age, interests: msg.interests });
-        break;
+        case 'talk_closed':
+          if (msg.transcript) {
+            setLastIntent({ transcript: msg.transcript, intent: msg.intent });
+            setTranscript((t) => [
+              ...t,
+              { kind: `child · ${msg.intent ?? 'unknown'}`, text: msg.transcript! },
+            ]);
+          }
+          break;
 
-      case 'fact':
-        setFacts((f) => [...f, { text: msg.text, topic: msg.topic, kind: msg.kind }]);
-        setTranscript((t) => [...t, { kind: 'remembered', text: msg.text }]);
-        break;
+        case 'profile':
+          setProfile({ name: msg.name, age: msg.age, interests: msg.interests });
+          break;
 
-      case 'awaiting_answer':
-        setAwaiting(msg.question);
-        break;
+        case 'fact':
+          setFacts((f) => [...f, { text: msg.text, topic: msg.topic, kind: msg.kind }]);
+          setTranscript((t) => [...t, { kind: 'remembered', text: msg.text }]);
+          break;
 
-      case 'flag':
-        setFlags((f) => [{ type: msg.type, detail: msg.detail }, ...f]);
-        break;
+        case 'awaiting_answer':
+          setAwaiting(msg.question);
+          break;
 
-      case 'debug':
-        setDebug((d) => ({ ...d, [msg.key]: msg.value }));
-        if (msg.key === 'plan') setPlan(msg.value as SessionPlan);
-        break;
+        case 'flag':
+          setFlags((f) => [{ type: msg.type, detail: msg.detail }, ...f]);
+          break;
 
-      case 'nudge':
-        setTranscript((t) => [...t, { kind: 'nudge', text: msg.text }]);
-        break;
+        case 'debug':
+          setDebug((d) => ({ ...d, [msg.key]: msg.value }));
+          if (msg.key === 'plan') setPlan(msg.value as SessionPlan);
+          break;
 
-      case 'error':
-        setError(msg.message);
-        break;
+        case 'nudge':
+          setTranscript((t) => [...t, { kind: 'nudge', text: msg.text }]);
+          break;
 
-      case 'ended':
-        setEnded(true);
-        setMode('END');
-        break;
-    }
-    // afterCurrentAudio is stable, but declare it: an empty dep array here is
-    // exactly the stale-closure shape that silently broke audio once already.
-  }, [afterCurrentAudio]);
+        case 'error':
+          setError(msg.message);
+          break;
+
+        case 'ended':
+          setEnded(true);
+          setMode('END');
+          break;
+      }
+    },
+    [afterCurrentAudio],
+  );
 
   const connect = useCallback(
     (engine: AudioEngine) => {
@@ -247,14 +342,21 @@ export default function SessionView() {
   function onMicReady(engine: AudioEngine) {
     engineRef.current = engine;
 
+    // The two things only the browser can observe. Both go through the local
+    // machine first and are reported afterwards.
+    engine.onSpeaking = (on) => setHearing(on);
+    engine.onSpeechEnd = (turnId) => {
+      machineRef.current?.send({ t: 'SPEECH_END_DETECTED', turnId });
+      send({ t: 'speech_end', turnId });
+    };
+    engine.onPlaybackDrained = (utteranceId) => {
+      machineRef.current?.send({ t: 'AI_SPEECH_END', utteranceId });
+      send({ t: 'playback_drained', utteranceId });
+    };
+
     setMicReady(true);
     connect(engine);
   }
-
-  const send = (msg: unknown) => {
-    const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-  };
 
   /** Answering the check-in by tapping. Saying it out loud works too. */
   function answer(value: 'yes' | 'no') {
@@ -264,14 +366,15 @@ export default function SessionView() {
 
   useEffect(() => {
     return () => {
-      if (gateTimer.current) clearTimeout(gateTimer.current);
-      flushCaptions();
+      flushCaptions(false);
       wsRef.current?.close();
       void engineRef.current?.destroy();
     };
   }, [flushCaptions]);
 
   if (!micReady) return <MicCheck onReady={onMicReady} />;
+
+  const visual = micVisual(voice);
 
   return (
     <div className="shell">
@@ -284,23 +387,19 @@ export default function SessionView() {
           <div className="status-line">
             {!connected
               ? 'connecting…'
-              : speaking
-                ? 'Ollie is speaking…'
-                : ended
-                  ? 'all done'
-                  : listening
-                    ? 'listening…'
-                    : mode === 'CHILD_READS'
-                      ? 'listening to you'
-                      : mode === 'TALK'
-                        ? 'listening…'
-                        : mode === 'PAUSED'
-                          ? 'paused'
-                          : mode === 'ONBOARDING'
-                            ? 'getting to know you'
-                            : // NARRATE / COACH / SOCRATIC / REMIX / ADAPT between
-                              // utterances all mean one thing: waiting on the LLM.
-                              'Ollie is thinking…'}
+              : ended
+                ? 'all done'
+                : visual === 'speaking'
+                  ? 'Ollie is speaking…'
+                  : visual === 'live'
+                    ? 'your turn'
+                    : visual === 'thinking'
+                      ? 'Ollie is thinking…'
+                      : mode === 'PAUSED'
+                        ? 'paused'
+                        : mode === 'ONBOARDING'
+                          ? 'getting to know you'
+                          : 'waiting for you'}
           </div>
         </header>
 
@@ -311,8 +410,7 @@ export default function SessionView() {
           </div>
         )}
 
-        <div className={`narrator${speaking ? ' speaking' : ''}`}>
-          <span className="owl-mini">🦉</span>
+        <div className={`narrator${visual === 'speaking' ? ' speaking' : ''}`}>
           <span>{narratorText || 'Getting your story ready…'}</span>
         </div>
 
@@ -320,7 +418,11 @@ export default function SessionView() {
           <div>
             <div className="passage-label">Getting to know you</div>
             <p className="empty-passage">
-              {listening ? 'Ollie is listening — just talk!' : 'Ollie is thinking…'}
+              {visual === 'live'
+                ? 'Go on — I’m listening!'
+                : visual === 'speaking'
+                  ? 'Listen to Ollie…'
+                  : 'Tap the owl and tell me!'}
             </p>
             {profile && (profile.name || profile.interests.length > 0) && (
               <div style={{ marginTop: 14 }}>
@@ -372,30 +474,20 @@ export default function SessionView() {
         )}
 
         {/*
-          No button. The microphone is on from the moment the session starts and
-          the child can speak at any time, over anything. This only tells them
-          that — it is an indicator, not a control.
+          One object: the thing that shows whose turn it is and the thing you
+          press to take yours. See components/MicButton.tsx.
         */}
-        <div className="talk-dock">
-          <div
-            className={`ear${listening ? ' live' : ''}${speaking ? ' speaking' : ''}${
-              hearing ? ' hearing' : ''
-            }`}
-          >
-            <span className="ear-dot" />
-            {hearing
-              ? 'I hear you!'
-              : speaking
-                ? 'You can talk any time'
-                : listening
-                  ? "I'm listening"
-                  : 'Connecting…'}
-          </div>
-        </div>
+        <MicButton
+          snapshot={voice}
+          hearing={hearing}
+          disabled={!connected || ended}
+          onTap={onMicTap}
+        />
       </main>
 
       <DebugPanel
         mode={mode}
+        voice={voice}
         plan={plan}
         debug={debug}
         lastIntent={lastIntent}

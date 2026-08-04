@@ -1,5 +1,7 @@
 /** Shared domain + wire types. See PLAN.md §4, §6, §7, §13. */
 
+import type { VoiceEvent, VoiceSnapshot } from './voice/machine';
+
 export type Mode =
   | 'IDLE'
   /** Getting to know a child with no profile yet. */
@@ -113,13 +115,39 @@ export interface WordAssessment {
 
 // ---------------------------------------------------------------------------
 // WebSocket protocol.
-// Client -> server binary frames are mic PCM16 @16k.
-// Server -> client binary frames are TTS float32 PCM @44.1k.
+//
+// Client -> server binary frames are mic PCM16 @16k, and they are sent ONLY
+// while the mic is open. When the mic is closed no audio leaves the browser at
+// all — that is the strongest form the mutual-exclusion rule can take.
+// Server -> client binary frames are TTS PCM16 @24k.
 // Everything else is JSON text.
+//
+// Turn-taking rides on the shared state machine (lib/voice/machine.ts) rather
+// than on bespoke messages. Both sides run the same reducer:
+//
+//   - Events the CHILD causes (mic_tap) and events only the browser can observe
+//     (playback drained, silence detected) are applied locally first — so a tap
+//     stops the voice in the same frame, with no round trip — and then sent up.
+//   - Events only the server can cause (a reply is ready, a transcript landed)
+//     are applied there and forwarded down as `voice_event`.
+//   - `voice_sync` carries the authoritative snapshot, so a dropped message
+//     cannot leave the two sides disagreeing about who holds the floor.
 // ---------------------------------------------------------------------------
 
 export type ClientMessage =
   | { t: 'start' }
+  /** The child pressed the button. The whole interaction model, in one message. */
+  | { t: 'mic_tap' }
+  /** Client-side silence detector fired. Honoured only if that turn was armed. */
+  | { t: 'speech_end'; turnId: number }
+  /**
+   * Playback has DRAINED — every queued sample has been heard.
+   *
+   * The server knows when it stopped *sending* audio, which is seconds earlier.
+   * Auto-opening the mic on that would put the microphone live while Ollie was
+   * still audible, and hand his own voice to pronunciation assessment.
+   */
+  | { t: 'playback_drained'; utteranceId: number }
   | { t: 'resume' }
   | { t: 'stop' }
   /** Tapping the on-screen answer to a yes/no question, instead of saying it. */
@@ -131,20 +159,23 @@ export type ClientMessage =
 export type ServerMessage =
   | { t: 'ready'; childName: string; plan: SessionPlan }
   | { t: 'mode'; mode: Mode; reason?: string }
-  | { t: 'speak'; text: string }
+  /** One server-originated state machine event, for the browser's mirror. */
+  | { t: 'voice_event'; event: VoiceEvent }
+  /** The authoritative snapshot. Reconciliation, not the normal path. */
+  | { t: 'voice_sync'; snapshot: VoiceSnapshot }
   | { t: 'passage'; text: string; words: string[] }
   | { t: 'word'; index: number; status: TrackedWord['status']; score: number | null; errorType: ErrorType | null }
   | { t: 'cursor'; index: number }
-  | { t: 'tts_start' }
-  | { t: 'tts_end' }
-  /** Drop whatever is still queued — the child interrupted and we have stopped. */
-  | { t: 'stop_playback' }
+  /**
+   * Every sample of this utterance has been SENT.
+   *
+   * Not the same as heard. The browser watches its own queue from here and
+   * reports `playback_drained` once the last one has actually played, which is
+   * what ends the utterance and, in story mode, opens the mic.
+   */
+  | { t: 'tts_complete'; utteranceId: number }
   /** Something the child said, and what we made of it. */
   | { t: 'talk_closed'; transcript: string | null; intent: Intent | null }
-  /** The microphone is live. It is live for the whole session. */
-  | { t: 'listening'; on: boolean }
-  /** Server VAD hears the child right now — the interruption signal, live. */
-  | { t: 'hearing'; on: boolean }
   /** Onboarding progress, so the panel can show the profile filling in. */
   | { t: 'profile'; name: string | null; age: number | null; interests: string[] }
   /** Something the child told us, now in the session's memory. */

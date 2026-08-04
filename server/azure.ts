@@ -3,12 +3,20 @@ import { env, AUDIO } from '../lib/env';
 import type { ErrorType, WordAssessment } from '../lib/types';
 
 /**
- * Azure Speech integration. Two modes (PLAN.md §9):
- *   - PronunciationSession: reading mode, referenceText = the child's passage.
- *   - TalkRecognizer: plain conversational recognition for TALK mode.
+ * Azure Speech integration. One job (PLAN.md §9): scoring.
  *
- * Audio arrives as 16kHz mono PCM16 from the browser AudioWorklet and is pushed
- * into an Azure push stream. We never use the browser's SpeechRecognition API.
+ * `PronunciationSession` takes the child's passage as `referenceText` and
+ * answers exactly one question — how well were those words said. It is never
+ * asked whether the child MEANT to read them.
+ *
+ * There used to be a second class here, `ConversationEar`, a plain recognizer
+ * held open for the whole session so that everything the child said was heard
+ * in every mode. Transcription moved to the Realtime session some time ago and
+ * this was left behind, imported by nothing.
+ *
+ * Audio arrives as 16kHz mono PCM16 from the browser AudioWorklet — and only
+ * while the mic is open — and is pushed into an Azure push stream. We never use
+ * the browser's SpeechRecognition API.
  */
 
 function speechConfig(): sdk.SpeechConfig {
@@ -138,103 +146,6 @@ export class PronunciationSession {
       this.pushStream.close();
     } catch {
       /* already closed */
-    }
-    await new Promise<void>((resolve) => {
-      this.recognizer.stopContinuousRecognitionAsync(
-        () => resolve(),
-        () => resolve(),
-      );
-    });
-    try {
-      this.recognizer.close();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-export interface ConversationCallbacks {
-  /** Fires while the child is mid-utterance. This is how we know not to speak. */
-  onPartial?: (text: string) => void;
-  /** One complete thing the child said. Fires for EVERYTHING, always. */
-  onUtterance: (text: string) => void;
-  onError?: (message: string) => void;
-}
-
-/**
- * The conversation layer's ear: one recognizer, open from the first moment of
- * the session to the last.
- *
- * It replaces a family of short-lived recognizers — one per talk-button press,
- * one per onboarding question, one per narrated utterance for barge-in — each of
- * which cost a few hundred milliseconds of connection setup during which the
- * child was speaking to nothing at all. Those gaps were most of why the thing
- * felt unresponsive, and every one of them landed at exactly the moment a child
- * was most likely to say something.
- *
- * So: never torn down, never rebuilt, deaf at no point in the session. It runs
- * alongside PronunciationSession rather than taking turns with it — scoring and
- * listening are different jobs and no longer contend for the microphone.
- */
-export class ConversationEar {
-  private recognizer: sdk.SpeechRecognizer;
-  private pushStream: sdk.PushAudioInputStream;
-  private closed = false;
-  private restarts = 0;
-
-  constructor(private cb: ConversationCallbacks) {
-    this.pushStream = sdk.AudioInputStream.createPushStream(pcmFormat());
-    const audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
-    this.recognizer = new sdk.SpeechRecognizer(speechConfig(), audioConfig);
-
-    this.recognizer.recognizing = (_s, e) => {
-      if (e.result?.text) this.cb.onPartial?.(e.result.text);
-    };
-
-    this.recognizer.recognized = (_s, e) => {
-      if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
-        this.cb.onUtterance(e.result.text);
-      }
-    };
-
-    this.recognizer.canceled = (_s, e) => {
-      if (this.closed) return;
-      if (e.reason === sdk.CancellationReason.Error) {
-        this.cb.onError?.(`azure canceled: ${e.errorDetails}`);
-      }
-      // A session runs for tens of minutes and Azure will drop the connection at
-      // some point in that. Silently going deaf for the rest of the session is
-      // the worst possible failure here, so climb back up.
-      if (this.restarts < 5) {
-        this.restarts += 1;
-        console.warn(`[ear] recognition stopped, restarting (${this.restarts}/5)`);
-        this.recognizer.startContinuousRecognitionAsync(
-          () => {},
-          (err) => this.cb.onError?.(`azure restart failed: ${err}`),
-        );
-      }
-    };
-
-    this.recognizer.startContinuousRecognitionAsync(
-      () => {},
-      (err) => this.cb.onError?.(`azure start failed: ${err}`),
-    );
-  }
-
-  write(pcm: Buffer) {
-    if (this.closed) return;
-    this.pushStream.write(
-      pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength) as ArrayBuffer,
-    );
-  }
-
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    try {
-      this.pushStream.close();
-    } catch {
-      /* ignore */
     }
     await new Promise<void>((resolve) => {
       this.recognizer.stopContinuousRecognitionAsync(

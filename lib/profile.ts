@@ -93,10 +93,6 @@ export function hasEnoughToStart(draft: OnboardingDraft): boolean {
   return Boolean(draft.name) && draft.interests.length >= 1;
 }
 
-/** A name alone is enough to fall back to when a child stops answering. */
-export function canStartAtAll(draft: OnboardingDraft): boolean {
-  return Boolean(draft.name);
-}
 
 const PLACEHOLDER_NAMES = new Set(['', 'friend', 'child', 'new child', 'unknown', 'reader']);
 

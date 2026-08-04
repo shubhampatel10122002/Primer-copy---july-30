@@ -105,14 +105,14 @@ async function main() {
     return `${bytes} bytes (~${(bytes / 2 / 24000).toFixed(2)}s) via ${model}, voice ${env.ttsVoice}`;
   });
 
-  await check(`OpenAI Realtime ears (${env.realtimeModel})`, async () => {
-    // Connect only. This session never speaks, so there is nothing else to test
-    // here — `npm run realtime:check` lists the transcription models available.
+  await check('OpenAI Realtime ears (transcription session)', async () => {
+    // Connect only. This session cannot speak and no longer detects turns —
+    // `npm run realtime:check` runs a full open/commit/transcribe turn and
+    // lists the transcription models this project may actually use.
     const { RealtimeVoice } = await import('../server/realtime');
     const voice = await new Promise<any>((resolve, reject) => {
       const v: any = new RealtimeVoice({
-        onSpeechStarted: () => {},
-        onUtterance: () => {},
+        onTranscript: () => {},
         onOpen: () => resolve(v),
         onError: (m: string) => reject(new Error(m)),
       });

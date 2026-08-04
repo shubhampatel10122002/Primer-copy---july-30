@@ -128,11 +128,6 @@ button {
   gap: 14px;
 }
 
-.narrator .owl-mini {
-  font-size: 28px;
-  flex-shrink: 0;
-}
-
 .narrator.speaking {
   border-color: var(--accent);
   box-shadow: 0 0 0 4px var(--accent-soft);
@@ -191,9 +186,9 @@ button {
   font-weight: 500;
 }
 
-/* ---------- the listening indicator ---------- */
+/* ---------- the mic dock ---------- */
 
-.talk-dock {
+.mic-dock {
   position: fixed;
   bottom: 28px;
   left: 40px;
@@ -459,55 +454,157 @@ button {
   color: #7d7871;
 }
 
-/* ---------- the ear ----------
-   Where the owl button used to be. The child never presses anything: the
-   microphone is live for the whole session, and this only says so. */
+/* ---------- the mic button ----------
 
-.ear {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 22px;
+   The owl and the control are one object. There used to be two: a small owl in
+   the narrator bubble showing who was talking, and an "ear" pill down here
+   saying "I'm listening" that could not be pressed, because there was nothing to
+   press. Now the thing a child looks at to know whose turn it is and the thing
+   they touch to take theirs are the same thing.
+
+   Every state is legible without reading a word: the ring says whose turn it
+   is, the owl's tilt says what he is doing. State changes are transitions on
+   colour and scale only — nothing here re-lays-out, so the button cannot twitch
+   or resize as the machine moves through PROCESSING on the way to speaking. */
+
+.mic {
+  position: relative;
+  width: 92px;
+  height: 92px;
   border-radius: 999px;
-  border: 1px solid var(--line);
+  border: none;
+  padding: 0;
   background: var(--card);
-  color: var(--muted);
-  font-size: 15px;
-  font-weight: 600;
+  box-shadow: 0 6px 22px rgba(47, 42, 38, 0.13);
+  display: grid;
+  place-items: center;
+  /* No transition on transform: a tap has to look instant. */
+  transition: background 140ms ease, box-shadow 140ms ease;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
-.ear.live {
-  border-color: var(--good);
-  color: var(--good);
+.mic:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
-.ear-dot {
-  width: 10px;
-  height: 10px;
+.mic:not(:disabled):active {
+  transform: scale(0.94);
+}
+
+.mic:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.mic-owl {
+  font-size: 44px;
+  line-height: 1;
+  transition: transform 180ms ease;
+}
+
+/* The ring. One element, four meanings. */
+.mic-ring {
+  position: absolute;
+  inset: -6px;
   border-radius: 999px;
-  background: currentColor;
-  opacity: 0.35;
+  border: 4px solid var(--line);
+  transition: border-color 140ms ease, transform 140ms ease, opacity 140ms ease;
 }
 
-.ear.live .ear-dot {
-  opacity: 1;
-  animation: ear-pulse 1.6s ease-in-out infinite;
-}
-
-.ear.speaking {
+/* Closed, and it is the child's move. The one state that invites a press, so
+   it is the only one that moves on its own. */
+.mic[data-visual='idle'] .mic-ring {
   border-color: var(--accent);
-  color: var(--accent);
+  animation: mic-invite 2.4s ease-in-out infinite;
 }
 
-@keyframes ear-pulse {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.35); opacity: 0.55; }
-}
-
-/* Server VAD is hearing the child right now — the same signal that stops the
-   narrator mid-word. Showing it makes "it heard me" visible instead of implied. */
-.ear.hearing {
-  border-color: var(--good);
-  color: var(--good);
+/* Open. Green, steady, unmistakable — this is the state a child has to be able
+   to recognise from across a room. */
+.mic[data-visual='live'] {
   background: var(--good-soft);
+}
+.mic[data-visual='live'] .mic-ring {
+  border-color: var(--good);
+}
+.mic[data-visual='live'] .mic-owl {
+  transform: scale(1.08);
+}
+
+/* Sound is reaching the microphone right now. Cosmetic, and deliberately so:
+   nothing about the turn depends on it. */
+.mic.hearing .mic-ring {
+  animation: mic-hear 900ms ease-in-out infinite;
+}
+
+/* Ollie is talking. Still pressable — that is the barge-in. */
+.mic[data-visual='speaking'] {
+  background: var(--accent-soft);
+}
+.mic[data-visual='speaking'] .mic-ring {
+  border-color: var(--accent);
+  animation: mic-speak 1.4s ease-in-out infinite;
+}
+
+.mic[data-visual='thinking'] .mic-ring {
+  border-color: var(--warn);
+  animation: mic-think 1.1s linear infinite;
+}
+
+.mic[data-visual='error'] .mic-ring {
+  border-color: var(--bad);
+}
+
+.mic[data-visual='ended'] .mic-ring {
+  border-color: var(--line);
+}
+
+.mic-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--muted);
+  /* Fixed height so a longer label cannot nudge the button sideways. */
+  min-height: 40px;
+  justify-content: center;
+}
+
+.mic-hint {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--good);
+}
+
+@keyframes mic-invite {
+  0%, 100% { transform: scale(1); opacity: 0.85; }
+  50% { transform: scale(1.06); opacity: 1; }
+}
+
+@keyframes mic-hear {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.09); }
+}
+
+@keyframes mic-speak {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+@keyframes mic-think {
+  0% { transform: rotate(0deg); border-top-color: var(--card); }
+  100% { transform: rotate(360deg); border-top-color: var(--card); }
+}
+
+/* A child who is sensitive to motion still needs to know whose turn it is, so
+   the colours stay and only the movement goes. */
+@media (prefers-reduced-motion: reduce) {
+  .mic-ring,
+  .mic-owl,
+  .mic {
+    animation: none !important;
+    transition: none !important;
+  }
 }

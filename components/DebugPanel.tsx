@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { Intent, Mode, SessionPlan } from '@/lib/types';
+import type { VoiceSnapshot } from '@/lib/voice/machine';
 
 /**
  * The visible loop IS the YC demo (PLAN.md §2.7). Live mode, last Azure result,
@@ -23,6 +24,7 @@ interface MemoryResponse {
 
 export default function DebugPanel({
   mode,
+  voice,
   plan,
   debug,
   lastIntent,
@@ -34,6 +36,7 @@ export default function DebugPanel({
   connected,
 }: {
   mode: Mode;
+  voice: VoiceSnapshot;
   plan: SessionPlan | null;
   debug: Record<string, unknown>;
   lastIntent: { transcript: string; intent: Intent | null } | null;
@@ -109,13 +112,12 @@ export default function DebugPanel({
   const words = (debug.lastWords as any[]) ?? [];
   const wovenFact = debug.wovenFact as { text: string; beat: number } | undefined;
   const tts = debug.lastTts as
-    | { bytes: number; seconds: number; totalSent?: number; firstChunkMs: number }
+    | { bytes: number; seconds: number; totalSent?: number }
     | undefined;
   const sentBytes = tts?.bytes ?? null;
   // Compare like with like: both totals are for the whole session.
   const totalSent = tts?.totalSent ?? null;
   const sentSeconds = tts?.seconds ?? 0;
-  const firstChunkMs = tts && tts.firstChunkMs >= 0 ? tts.firstChunkMs : null;
 
   return (
     <aside className="panel">
@@ -142,6 +144,50 @@ export default function DebugPanel({
         <span>v{memory?.memory.version ?? 0}</span>
       </div>
 
+      {/*
+        The state machine, on screen. Every question the old design answered by
+        inference — is the mic live, may silence end this turn, who opened it —
+        is now a field you can just read.
+      */}
+      <h2>Floor</h2>
+      <div className="panel-section">
+        <div className="kv">
+          <span>State</span>
+          <span>{voice.state}</span>
+        </div>
+        <div className="kv">
+          <span>Turn-taking</span>
+          <span>{voice.mode}</span>
+        </div>
+        <div className="kv">
+          <span>Mic</span>
+          <span>{voice.mic ? `open · turn ${voice.mic.turnId}` : 'closed'}</span>
+        </div>
+        <div className="kv">
+          <span>Opened by</span>
+          <span>{voice.mic?.reason ?? '—'}</span>
+        </div>
+        <div className="kv">
+          <span>Auto-close</span>
+          <span>{voice.mic ? (voice.mic.autoCloseArmed ? 'armed' : 'manual') : '—'}</span>
+        </div>
+        <div className="kv">
+          <span>Speaking</span>
+          <span>{voice.speaking ? `#${voice.speaking.utteranceId}` : '—'}</span>
+        </div>
+        {(debug.voiceRejected as any) && (
+          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            last refused: {(debug.voiceRejected as any).event} — {(debug.voiceRejected as any).why}
+          </div>
+        )}
+        {(debug.voiceInvariant as any) && (
+          <div className="flag sensitive_topic" style={{ marginTop: 8 }}>
+            <b>invariant broken</b>
+            <div>{((debug.voiceInvariant as any).violations ?? []).join('; ')}</div>
+          </div>
+        )}
+      </div>
+
       <h2>Audio</h2>
       <div className="panel-section">
         <button
@@ -156,8 +202,7 @@ export default function DebugPanel({
           <span>Sent by server</span>
           <span>
             {sentBytes === null
-              ? '—'
-              : `${sentBytes} B · ${sentSeconds}s${firstChunkMs === null ? '' : ` · ${firstChunkMs}ms`}`}
+              ? '—' : `${sentBytes} B · ${sentSeconds}s`}
           </span>
         </div>
         <div className="kv">
@@ -230,12 +275,6 @@ export default function DebugPanel({
               <span>Intent</span>
               <span>{lastIntent.intent ?? '—'}</span>
             </div>
-            {debug.offScript ? (
-              <div className="kv">
-                <span>Heard without the button</span>
-                <span>{(debug.offScript as any).reason}</span>
-              </div>
-            ) : null}
           </>
         ) : (
           <div className="muted" style={{ padding: '6px 0' }}>
