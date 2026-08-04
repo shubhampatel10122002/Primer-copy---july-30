@@ -97,6 +97,8 @@ export class RealtimeVoice {
   private transcribeModels: string[] = env.transcribeModel
     ? [env.transcribeModel]
     : [...TRANSCRIBE_MODELS];
+  /** Set once every candidate has been refused. VAD still works without it. */
+  private transcriptionDisabled = false;
 
   constructor(private cb: RealtimeCallbacks) {
     this.connect();
@@ -148,15 +150,34 @@ export class RealtimeVoice {
       this.ready = false;
       const why = reason.toString();
 
-      if (this.refusedModel(why) && this.transcribeModels.length > 1) {
+      if (!this.closed && this.refusedModel(why)) {
         const dead = this.transcribeModels.shift();
-        console.warn(
-          `[realtime] no access to ${dead} — reconnecting with ${this.transcribeModels[0]}`,
-        );
-        if (!this.closed) {
+
+        if (this.transcribeModels.length > 0) {
+          console.warn(
+            `[realtime] no access to ${dead} — reconnecting with ${this.transcribeModels[0]}`,
+          );
           setTimeout(() => this.connect(), 150);
           return;
         }
+
+        // Every candidate refused. Reconnect with transcription switched off
+        // rather than leaving the session dead: without it the child cannot be
+        // understood, but barge-in still works, so at least the narrator still
+        // stops when they talk. Say so loudly — this is not a degradation
+        // anyone should have to infer from the app being strange.
+        this.transcriptionDisabled = true;
+        console.error(
+          '[realtime] NO transcription model is available to this project. ' +
+            'Barge-in will still work but nothing the child says can be understood. ' +
+            'Run `npm run realtime:check` — it tests every model and tells you which to pin.',
+        );
+        this.cb.onError?.(
+          'Ollie can hear that you are talking but cannot understand the words yet — ' +
+            'no transcription model is available on this OpenAI project.',
+        );
+        setTimeout(() => this.connect(), 150);
+        return;
       }
 
       this.cb.onClose?.(code, why);
@@ -165,6 +186,7 @@ export class RealtimeVoice {
 
   /** Was this failure "the project cannot use that transcription model"? */
   private refusedModel(message: string): boolean {
+    if (this.transcriptionDisabled) return false;
     if (!/does not have access to model|model_not_found/i.test(message)) return false;
     return this.transcribeModels.some((m) => message.includes(m));
   }
@@ -232,7 +254,9 @@ export class RealtimeVoice {
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-            transcription: { model: this.transcribeModels[0], language: 'en' },
+            ...(this.transcriptionDisabled
+              ? {}
+              : { transcription: { model: this.transcribeModels[0], language: 'en' } }),
             // Laptop speakers and a laptop microphone in the same room.
             ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
             turn_detection: {
@@ -261,7 +285,11 @@ export class RealtimeVoice {
       case 'session.updated': {
         if (this.readyTimer) clearTimeout(this.readyTimer);
         this.readyTimer = null;
-        console.log(`[realtime] transcribing with ${this.transcribeModels[0]}`);
+        console.log(
+          this.transcriptionDisabled
+            ? '[realtime] listening WITHOUT transcription — barge-in only'
+            : `[realtime] transcribing with ${this.transcribeModels[0]}`,
+        );
         if (process.env.REALTIME_TRACE) {
           console.log('[realtime] effective session', JSON.stringify(event.session, null, 2));
         }
@@ -376,9 +404,9 @@ export class RealtimeVoice {
     this.send({ type: 'input_audio_buffer.append', audio: pcm24k.toString('base64') });
   }
 
-  /** Which transcription model is currently configured. */
+  /** Which transcription model is currently configured, if any. */
   get transcriptionModel(): string {
-    return this.transcribeModels[0];
+    return this.transcriptionDisabled ? 'none' : (this.transcribeModels[0] ?? 'none');
   }
 
   async close(): Promise<void> {

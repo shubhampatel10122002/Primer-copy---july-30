@@ -61,13 +61,16 @@ async function listAudioModels(): Promise<string[]> {
  * only reliable answer is to open a session with each one and see whether the
  * server accepts it or hangs up.
  */
-async function testTranscriptionModels(candidates: string[]): Promise<string[]> {
+async function testTranscriptionModels(
+  candidates: string[],
+  sessionModel: string,
+): Promise<string[]> {
   const working: string[] = [];
 
   for (const model of candidates) {
     const ok = await new Promise<boolean>((resolve) => {
       const ws = new WebSocket(
-        `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(env.realtimeModel)}`,
+        `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(sessionModel)}`,
         { headers: { Authorization: `Bearer ${env.openaiKey}` } },
       );
       const finish = (value: boolean) => {
@@ -128,15 +131,29 @@ async function main() {
     const transcribers = audioModels.filter((id) => /transcribe|whisper/.test(id));
     console.log('');
     if (transcribers.length) {
-      console.log('  Which of those this PROJECT may actually open a session with:');
-      const working = await testTranscriptionModels(transcribers);
+      console.log(`  Which of those open a session with model ${env.realtimeModel}:`);
+      const working = await testTranscriptionModels(transcribers, env.realtimeModel);
       console.log('');
-      console.log(
-        working.length
-          ? `  -> put this in .env.local:  OPENAI_TRANSCRIBE_MODEL=${working[0]}`
-          : '  -> NONE of them work. Nothing the child says can be heard; this needs\n' +
-            '     fixing in the OpenAI project settings before the app is usable.',
-      );
+
+      if (working.length) {
+        console.log(`  -> put this in .env.local:  OPENAI_TRANSCRIBE_MODEL=${working[0]}`);
+      } else {
+        // Does the SESSION model change the answer? Worth knowing before anyone
+        // concludes the project has no transcription at all.
+        const alternate = env.realtimeModel === 'gpt-realtime' ? 'gpt-realtime-2.1' : 'gpt-realtime';
+        console.log(`  None worked. Trying the same list against ${alternate}:`);
+        const other = await testTranscriptionModels(transcribers, alternate);
+        console.log('');
+        console.log(
+          other.length
+            ? `  -> the SESSION model is the problem. Put BOTH of these in .env.local:\n` +
+              `        OPENAI_REALTIME_MODEL=${alternate}\n` +
+              `        OPENAI_TRANSCRIBE_MODEL=${other[0]}`
+            : '  -> NONE work on either session model. This is a project entitlement\n' +
+              '     problem, not a code one: nothing the child says can be transcribed\n' +
+              '     until the OpenAI project is granted a transcription model.',
+        );
+      }
     } else {
       console.log('  -> NO transcription models available at all.');
     }
