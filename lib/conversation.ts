@@ -80,6 +80,44 @@ function words(text: string): string[] {
 }
 
 /**
+ * What counts as "that is not English".
+ *
+ * Deliberately low, and belt-and-braces, because the two errors are not
+ * symmetric: English contains no non-Latin letters at all (even "café" is
+ * Latin script), so a false positive is close to impossible, while a false
+ * negative derails the story. Two foreign letters in a row is already a
+ * fragment, not a stray.
+ */
+const FOREIGN_SCRIPT_SHARE = 0.05;
+const FOREIGN_LETTERS_MAX = 1;
+
+/**
+ * Did the transcription model hear a different language than the one being
+ * spoken?
+ *
+ * This app is English-only end to end, so a transcript in another script is
+ * always wrong. It was seen live: a child reading "Max sits on the red bench"
+ * came back as "मैंक्स सेज on the red bench".
+ *
+ * Scoring never cared — that is Azure's job on the raw audio, always en-US.
+ * What is at risk is the STORY. A PARTLY foreign transcript is already safe,
+ * because `tokenize` keeps only Latin words and the English half still matches
+ * the line. A WHOLLY foreign one is not: nothing matches, so `branchUtterance`
+ * sees zero overlap, concludes the child was talking to us rather than reading,
+ * and hands it to the responder — which then answers a hallucination and takes
+ * the plot with it.
+ *
+ * The first defence is telling the model to use English (`server/realtime.ts`).
+ * This is the second, because a language hint is a hint.
+ */
+export function looksMistranscribed(text: string): boolean {
+  const letters = text.match(/\p{L}/gu);
+  if (!letters || letters.length === 0) return false;
+  const foreign = letters.filter((ch) => !/\p{Script=Latin}/u.test(ch)).length;
+  return foreign > FOREIGN_LETTERS_MAX || foreign / letters.length > FOREIGN_SCRIPT_SHARE;
+}
+
+/**
  * Was that reading, talking, or both?
  *
  * `passage` is the whole line, not just the words ahead of the cursor — a child

@@ -11,10 +11,10 @@ import { applyLeniency } from '../lib/leniency';
 import { updateMastery, pickTargets } from '../lib/pedagogy';
 import { skillsForWord, SKILLS } from '../lib/skills';
 import { AUDIO } from '../lib/env';
-import { upsample16to24 } from '../server/realtime';
+import { upsample16to24, RealtimeVoice } from '../server/realtime';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
-import { branchUtterance } from '../lib/conversation';
+import { branchUtterance, looksMistranscribed } from '../lib/conversation';
 import {
   VoiceMachine,
   transition,
@@ -1127,6 +1127,194 @@ console.log('\nVoice state machine: the mode dimension');
   ok('changing mode disarms the open turn', changed.snapshot.mic!.autoCloseArmed === false);
   ok('and says so to the browser', changed.effects.some((e) => e.t === 'disarm_auto_close'));
   ok('leaving the invariants intact', checkInvariants(changed.snapshot).length === 0);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nWrong-language transcripts (the tennis-to-temple bug)');
+// --------------------------------------------------------------------------
+{
+  // The real one, from a live session: a child reading "Max sits on the red
+  // bench. Rex the dog naps in the hot sun." came back part-transliterated.
+  const real = 'मैंक्स सेज on the red bench. Rex the dog naps in the hot sun.';
+  ok('a part-Devanagari transcript is caught', looksMistranscribed(real));
+  ok('a wholly non-Latin transcript is caught', looksMistranscribed('मैं ठीक हूँ'));
+  ok('two foreign letters are already a fragment', looksMistranscribed('the कु bench'));
+
+  // False positives here cost a real turn, so ordinary English must never trip
+  // it — including the accented and punctuated shapes that look exotic but are
+  // Latin script.
+  ok('plain English is fine', !looksMistranscribed('Max sits on the red bench.'));
+  ok('accents are Latin script', !looksMistranscribed('We went to the café with José.'));
+  ok('sounding out is fine', !looksMistranscribed('b... l... ue. Blue!'));
+  ok('numbers and punctuation are fine', !looksMistranscribed('I am 5! Really, 5?!'));
+  ok('nothing at all is not a misdetection', !looksMistranscribed(''));
+  ok('emoji are not letters', !looksMistranscribed('yay 🎉🎉🎉'));
+
+  // Why it matters, precisely — and it is narrower than it first looked.
+  //
+  // A PARTLY foreign transcript is already safe: `tokenize` keeps only Latin
+  // words, so the English half still matches the line and the turn branches as
+  // reading. That is worth an assertion, because it is the thing that would
+  // quietly stop being true if the tokenizer ever learned about other scripts.
+  const passage = 'Max sits on the red bench. Rex the dog naps in the hot sun.';
+  ok(
+    'a part-foreign line still reads as READING',
+    branchUtterance({ text: real, passage }).kind === 'reading',
+  );
+
+  // A WHOLLY foreign transcript is the real hole. Nothing matches, so it looks
+  // like the child said something to us — and it goes to the responder, which
+  // answers a hallucination in the middle of a story.
+  const foreign = branchUtterance({ text: 'क्या हम कारों के बारे में पढ़ सकते हैं', passage });
+  ok('a wholly foreign transcript reads as CONVERSATION', foreign.kind === 'conversation');
+  ok('with nothing matched at all', foreign.overlap === 0);
+  ok('so the guard, not the branch, has to catch it', looksMistranscribed('क्या हम कारों के बारे में'));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nTurn bookkeeping (the livelock)');
+// --------------------------------------------------------------------------
+{
+  // The failure this exists to prevent, in full:
+  //
+  //   A commit is refused ("the buffer is too small. Expected at least 100ms").
+  //   Its turn stays in the pending queue. The watchdog gives up and opens a new
+  //   turn. THAT turn's transcript arrives, is matched against the stranded id,
+  //   is reported for a turn the child has moved past, and is discarded as
+  //   stale. The turn actually waiting never resolves. The watchdog fires again.
+  //   The session reopens the microphone every twelve seconds, forever, and
+  //   never progresses.
+  //
+  // One lost turn must cost exactly one turn.
+  //
+  // Driven through the private event handler rather than a live socket: this is
+  // bookkeeping, and it is the bookkeeping that broke.
+  const resolved: { turnId: number; text: string }[] = [];
+  const voice = Object.create(RealtimeVoice.prototype) as any;
+  voice.closed = false;
+  voice.ready = true;
+  voice.seenEventTypes = new Set();
+  voice.awaiting = [];
+  voice.openTurn = null;
+  voice.appended = 0;
+  voice.partial = '';
+  voice.configureAttempts = 1;
+  voice.transcribeModels = ['gpt-live-transcribe'];
+  voice.cb = { onTranscript: (turnId: number, text: string) => resolved.push({ turnId, text }) };
+  voice.send = () => {};
+
+  const commit = (turnId: number, bytes = 96_000) => {
+    voice.openTurn = turnId;
+    voice.appended = bytes;
+    voice.commit(turnId);
+  };
+
+  // A turn too short to transcribe is answered here, without a round trip that
+  // could be refused. This is the commit that used to start the livelock.
+  commit(1, 1_000);
+  ok('a sub-100ms turn resolves locally', resolved.length === 1 && resolved[0].turnId === 1);
+  ok('with an empty transcript', resolved[0].text === '');
+  ok('and never reaches the pending queue', voice.awaiting.length === 0);
+
+  // Ordinary turns are correlated by item_id, not arrival order.
+  resolved.length = 0;
+  commit(2);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_A' });
+  commit(3);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_B' });
+  ok('two turns are pending', voice.awaiting.length === 2);
+
+  // Answered OUT OF ORDER. The FIFO could not survive this; item_id does not care.
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    item_id: 'item_B',
+    transcript: 'the second thing',
+  });
+  ok('an out-of-order transcript finds its own turn', resolved[0]?.turnId === 3, JSON.stringify(resolved));
+  ok('and carries the right words', resolved[0]?.text === 'the second thing');
+
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    item_id: 'item_A',
+    transcript: 'the first thing',
+  });
+  ok('the older turn still resolves', resolved[1]?.turnId === 2 && resolved[1]?.text === 'the first thing');
+  ok('and the queue drains', voice.awaiting.length === 0);
+
+  // The exact error that caused it, verbatim from the API. It matched neither
+  // of the two phrases the old code tested for.
+  resolved.length = 0;
+  commit(4);
+  voice.handle({
+    type: 'error',
+    error: {
+      message:
+        'Error committing input audio buffer: the buffer is too small. ' +
+        'Expected at least 100ms of audio, but buffer only has 40.00ms of audio.',
+    },
+  });
+  ok('a refused commit still resolves its turn', resolved.length === 1 && resolved[0].turnId === 4);
+  ok('leaving nothing stranded', voice.awaiting.length === 0);
+
+  // And the turn AFTER it is unaffected — which is the whole point.
+  resolved.length = 0;
+  commit(5);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_C' });
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    item_id: 'item_C',
+    transcript: 'still working',
+  });
+  ok(
+    'the next turn is NOT off by one',
+    resolved.length === 1 && resolved[0].turnId === 5 && resolved[0].text === 'still working',
+    JSON.stringify(resolved),
+  );
+
+  // Giving up on a turn removes it, so a late answer cannot be misattributed.
+  resolved.length = 0;
+  commit(6);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_D' });
+  voice.abandon(6);
+  ok('abandoning clears the entry', voice.awaiting.length === 0);
+  commit(7);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_E' });
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    item_id: 'item_E',
+    transcript: 'the new one',
+  });
+  ok('the live turn resolves correctly after an abandon', resolved[0]?.turnId === 7);
+
+  // A failed transcription is still an answer.
+  resolved.length = 0;
+  commit(8);
+  voice.handle({ type: 'input_audio_buffer.committed', item_id: 'item_F' });
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.failed',
+    item_id: 'item_F',
+    error: { message: 'could not transcribe' },
+  });
+  ok('a failed transcription resolves empty', resolved.length === 1 && resolved[0].text === '');
+  ok('and does not strand the turn', voice.awaiting.length === 0);
+
+  // Losing the socket must not leave anything owed.
+  resolved.length = 0;
+  commit(9);
+  commit(10);
+  voice.failAwaiting('connection closed');
+  ok('a dropped connection resolves every pending turn', resolved.length === 2);
+  ok('and empties the queue', voice.awaiting.length === 0);
+
+  // A model that never echoes item_id still works: oldest-first is the fallback,
+  // and a resolved turn always leaves the queue either way.
+  resolved.length = 0;
+  commit(11);
+  voice.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: 'no item id here',
+  });
+  ok('a transcript with no item_id falls back to oldest-first', resolved[0]?.turnId === 11);
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

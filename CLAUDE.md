@@ -170,11 +170,25 @@ For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
   because it is the current low-latency streaming model; `npm run realtime:check`
   opens a session with each candidate and tells you which actually work. Pin one
   with `OPENAI_TRANSCRIBE_MODEL`.
-- **A committed turn must ALWAYS come back.** Every path through
-  `RealtimeVoice` resolves `onTranscript` — empty buffer, failed transcription,
-  dropped socket, all of it. A turn that never resolves leaves the session in
-  PROCESSING with the mic shut, which is the one failure a child cannot do
-  anything about.
+- **A committed turn must ALWAYS come back, and turns are matched by `item_id`.**
+  Every path through `RealtimeVoice` resolves `onTranscript` — too-short buffer,
+  refused commit, failed transcription, dropped socket, all of it. This was a
+  FIFO once, on the reasonable assumption that commits are answered in order.
+  They are, right up until one is not answered at all: a refused commit left its
+  turn in the queue, every later transcript then shifted off the wrong id and was
+  discarded as stale, and the session reopened the microphone every twelve
+  seconds forever without progressing. One lost turn must cost one turn.
+- **Never commit less than 100ms of audio.** The API refuses it, and the refusal
+  used to be the start of the livelock above. `MIN_COMMIT_BYTES` answers a
+  too-short turn locally so the round trip that can fail never happens.
+- **English is pinned three ways** (`language`, `languages`, and the prompt),
+  because the field name moved between transcription models and the wrong one is
+  ignored rather than rejected — which reads as auto-detect. A wholly non-Latin
+  transcript is then caught by `looksMistranscribed` before it can be routed to
+  the responder. Scoring never cared: Azure is always `en-US` on the raw audio.
+- **Recovery must be bounded.** The watchdog reopens the mic twice and then says
+  so out loud and stops. A session waiting to be tapped is recoverable; a session
+  talking to itself on a timer is not.
 - **PCM16 is two bytes per sample and the network does not care.** An odd-length
   chunk emitted as-is makes the receiver pair bytes off by one from then on —
   which is not a glitch but white noise over the entire voice. Both
