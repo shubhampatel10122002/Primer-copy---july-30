@@ -9,6 +9,7 @@ import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
 import { branchUtterance, looksMistranscribed } from '../lib/conversation';
+import { cleanTopic, resolveTopic } from '../lib/topics';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
   shouldCheckIn,
@@ -676,6 +677,7 @@ export class Session {
       mic: snapshot.mic,
       speaking: snapshot.speaking?.text.slice(0, 60) ?? null,
       pendingTurnId: snapshot.pendingTurnId,
+      superseded: snapshot.superseded,
     });
   }
 
@@ -740,6 +742,15 @@ export class Session {
    */
   private async onTurnLost(turnId: number) {
     if (this.closed || !this.machine) return;
+
+    // The turn moved on while this timer was in flight. Recovery is for a turn
+    // that is genuinely still waiting; firing it for one that has already been
+    // answered costs the child an "I didn't catch that" in the middle of a
+    // conversation that was working.
+    if (this.machine.snapshot.pendingTurnId !== turnId) {
+      this.debug('staleWatchdog', { turnId, pending: this.machine.snapshot.pendingTurnId });
+      return;
+    }
 
     // Whatever upstream still thinks it owes us for this turn, it does not.
     this.voice?.abandon(turnId);
@@ -1909,15 +1920,35 @@ export class Session {
         // seconds of silence, and they have just told us they are not enjoying it.
         await sayReply();
 
+        // What they asked for, read from every source we have — including their
+        // own words, which is the one that used to be thrown away. The responder
+        // returns `requested_topic: null` whenever it judges a request too vague
+        // to act on, and "change the topic to something religious" is exactly
+        // that: vague to a schema, perfectly clear to a person.
+        const favourite = this.favouriteTopic();
+        let topic = resolveTopic({
+          requested: reply.requestedTopic,
+          interest: reply.interestTopic,
+          transcript,
+        });
+
         // "I'm bored" is a change request with nothing to change to. Rebuilding
         // the story around the word "bored" is not an answer — asking them what
         // they would rather have is, and it is what a person would do.
-        let topic = reply.requestedTopic?.trim() || null;
+        //
+        // ONCE. Whatever comes back, the next thing that happens is a story: a
+        // child who has been asked what they want twice has been heard neither
+        // time, and the second question is the one that makes it feel like
+        // nobody is listening.
         if (!topic) {
-          const favourite = this.favouriteTopic();
           // The reply almost certainly already asked; only add a prompt if not.
+          // Either way the floor has to change hands — a question nobody can
+          // answer without hunting for the button is a question we did not
+          // really ask. The reply itself was spoken with the floor held.
           if (!/\?/.test(reply.speakText)) {
             await this.speak(T.whatWouldYouLikeLine(favourite), { handoff: true });
+          } else {
+            this.machine.send({ t: 'FLOOR_TO_CHILD' });
           }
 
           const said = await this.waitForReply(ANSWER_LISTEN_MS);
@@ -1937,11 +1968,19 @@ export class Session {
               source: 'off_script',
             });
             this.rememberFact(answer.fact, answer.interestTopic, answer.factKind);
-            topic = answer.requestedTopic?.trim() || answer.interestTopic?.trim() || said;
+            // `said` used to be the last resort here, which is how "no
+            // preference, pick any" became the subject of a story — and a
+            // narrator handed that as a subject asks what they meant.
+            topic = resolveTopic({
+              requested: answer.requestedTopic,
+              interest: answer.interestTopic,
+              transcript: said,
+              favourite,
+            });
           } else {
             // No answer. Their favourite thing is a far better guess than carrying
             // on with the story they just said they were bored of.
-            topic = favourite;
+            topic = cleanTopic(favourite);
           }
         }
 
@@ -1961,11 +2000,17 @@ export class Session {
           this.debug('plan', this.plan);
         }
 
+        // With no subject the narrator is told to PICK one, never to ask. It is
+        // the only writer left in the loop at this point, and a beat that comes
+        // back as a third question is how a child ends up having said what they
+        // wanted three times and read nothing.
+        const direction = topic
+          ? `They want the story to be about: ${topic}. Rebuild the next beat around that — really change it, do not just mention it once.`
+          : `They did not name a subject, so choose a completely new one yourself and commit to it. Do NOT ask them what they would like — they have already been asked.`;
+
         await this.narrate(
           'REMIX',
-          `The child said: "${transcript}". They want the story to be about: ${
-            topic ?? 'something completely new'
-          }. Rebuild the next beat around that — really change it, do not just mention it once. Keep difficulty ${this.plan.difficulty}, the same target skills, and the same must-use words: ${this.plan.vocab_constraints.must_use_words.join(', ')}.`,
+          `The child said: "${transcript}". ${direction} Keep difficulty ${this.plan.difficulty}, the same target skills, and the same must-use words: ${this.plan.vocab_constraints.must_use_words.join(', ')}.`,
         );
         return;
       }

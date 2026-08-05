@@ -8,9 +8,12 @@
  * browser at all. That is the strongest form the mutual-exclusion rule can
  * take: not "we ignore it", not "the server drops it" — it is never sent.
  *
- * Playback: PCM16 chunks from the server -> Web Audio with a jitter buffer, and
- * a drain signal, because the server stops SENDING audio seconds before the
- * child stops HEARING it (see `onPlaybackDrained`).
+ * Playback: PCM16 chunks from the server -> one continuous AudioWorklet stream
+ * with a jitter buffer, and a drain signal, because the server stops SENDING
+ * audio seconds before the child stops HEARING it (see `onPlaybackDrained`).
+ * The chunks are data, not audio: they are appended to a single buffer and
+ * never scheduled individually. Scheduling them individually is what made the
+ * voice hiss, and `public/worklets/playback-processor.js` explains why.
  *
  * This file also owns end-of-speech detection, which runs only when the state
  * machine arms it — a mic session the child opened themselves is never closed by
@@ -24,9 +27,9 @@ const MIC_SAMPLE_RATE = 16000;
 /**
  * Buffer this much audio before starting playback, to survive network jitter.
  *
- * Also the floor on how long a barge-in can take to be silent: cancelling drops
- * everything scheduled, so the worst case is one buffer's worth already inside
- * the audio device. 120ms is comfortably under the perceptual threshold.
+ * Also the floor on how long a barge-in can take to be silent: flushing drops
+ * everything queued, so the worst case is one render quantum already inside the
+ * audio device. 120ms is comfortably under the perceptual threshold.
  */
 const JITTER_BUFFER_SEC = 0.12;
 
@@ -60,8 +63,20 @@ export class AudioEngine {
   private node: AudioWorkletNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
 
-  private playHead = 0;
-  private scheduled: AudioBufferSourceNode[] = [];
+  /** The one continuous output stream. See public/worklets/playback-processor.js. */
+  private player: AudioWorkletNode | null = null;
+  /** Last buffer level the player reported, and when — see playbackRemainingMs. */
+  private buffered = 0;
+  private bufferedAt = 0;
+  /**
+   * How many times playback has been flushed.
+   *
+   * A level report already in flight when a barge-in happens describes a queue
+   * that no longer exists, and applying it would hold the next caption back by
+   * however many seconds the cancelled utterance had left. The worklet echoes
+   * this back, so a report from before the flush can be recognised and dropped.
+   */
+  private flushSeq = 0;
   /** Half a PCM16 sample left over from the previous chunk. See playChunk. */
   private pcmCarry: Uint8Array | null = null;
   private destroyed = false;
@@ -110,10 +125,10 @@ export class AudioEngine {
   async init(): Promise<void> {
     if (this.ctx) return;
 
-    // Let the browser pick its native rate and resample our 24kHz buffers for
-    // us. Forcing the context to 24kHz used to be worth it when playback and
-    // capture shared a rate; now they do not, and a mismatched context is the
-    // thing most likely to make the voice sound pitched.
+    // Let the browser pick its native rate. Nothing here depends on what it
+    // picks any more: the playback worklet resamples 24kHz to the context rate
+    // itself, continuously, which is precisely the job Web Audio was doing
+    // badly when it was handed one short buffer at a time.
     this.ctx = new AudioContext();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
 
@@ -127,6 +142,21 @@ export class AudioEngine {
     });
 
     await this.ctx.audioWorklet.addModule('/worklets/capture-processor.js');
+    await this.ctx.audioWorklet.addModule('/worklets/playback-processor.js');
+
+    this.player = new AudioWorkletNode(this.ctx, 'playback-processor', {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      processorOptions: { inputSampleRate: TTS_SAMPLE_RATE, jitterSec: JITTER_BUFFER_SEC },
+    });
+    this.player.port.onmessage = (e) => {
+      if (e.data?.type !== 'level') return;
+      if (e.data.flushSeq !== this.flushSeq) return; // measured before a barge-in
+      this.buffered = e.data.buffered as number;
+      this.bufferedAt = now();
+    };
+    this.player.connect(this.ctx.destination);
 
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.ctx, 'capture-processor', {
@@ -284,7 +314,14 @@ export class AudioEngine {
     this.onPlaybackDrained?.(utteranceId);
   }
 
-  /** Queue one PCM16 chunk from the server for gapless playback. */
+  /**
+   * Hand one PCM16 chunk from the server to the output stream.
+   *
+   * A chunk is a unit of NETWORK, not of audio. It is decoded to float samples
+   * and appended to the one buffer the playback worklet reads from; it is never
+   * scheduled, timed or resampled on its own. That distinction is the whole of
+   * the hiss that used to sit over the voice — see the worklet's own comment.
+   */
   playChunk(pcm: ArrayBuffer) {
     // Never fail silently here. A destroyed engine used to swallow every chunk
     // without a trace, which is indistinguishable from "the app is broken".
@@ -298,7 +335,7 @@ export class AudioEngine {
       }
       return;
     }
-    if (!this.ctx) {
+    if (!this.ctx || !this.player) {
       if (!this.warnedAfterDestroy) {
         this.warnedAfterDestroy = true;
         console.error('[audio] no AudioContext — call init() before playing audio.');
@@ -337,48 +374,27 @@ export class AudioEngine {
     const samples = new Float32Array(bytes.length / 2);
     for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
 
-    // Declaring the buffer at 24kHz is what tells Web Audio to resample it to
-    // the context rate. Get this wrong and Ollie sounds like a chipmunk.
-    const buffer = this.ctx.createBuffer(1, samples.length, TTS_SAMPLE_RATE);
-    buffer.copyToChannel(samples, 0);
+    // Transferred, not copied: the worklet owns these samples from here.
+    this.player.port.postMessage({ type: 'samples', buffer: samples.buffer }, [samples.buffer]);
 
-    const src = this.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(this.ctx.destination);
-
-    const nowSec = this.ctx.currentTime;
-    if (this.playHead < nowSec + 0.01) {
-      // Starting fresh (or we underran) — re-arm the jitter buffer.
-      this.playHead = nowSec + JITTER_BUFFER_SEC;
-    }
-    src.start(this.playHead);
-    this.playHead += buffer.duration;
-
-    this.scheduled.push(src);
-    src.onended = () => {
-      const i = this.scheduled.indexOf(src);
-      if (i >= 0) this.scheduled.splice(i, 1);
-    };
+    // Count them as queued straight away. The worklet reports its real level
+    // every few milliseconds, but a caption decision can land in the gap.
+    this.buffered += samples.length;
+    this.bufferedAt = now();
   }
 
   /**
-   * Barge-in: kill everything already scheduled, immediately.
+   * Barge-in: drop everything queued, immediately.
    *
    * Called synchronously from the tap handler, before any message reaches the
-   * server, so the gap between the child's thumb and silence is one frame plus
-   * whatever the audio device already has — well inside 100ms.
+   * server, so the gap between the child's thumb and silence is one render
+   * quantum plus whatever the audio device already has — well inside 100ms.
    */
   stopPlayback() {
     this.pcmCarry = null;
-    for (const src of this.scheduled) {
-      try {
-        src.stop();
-      } catch {
-        /* already stopped */
-      }
-    }
-    this.scheduled = [];
-    this.playHead = this.ctx?.currentTime ?? 0;
+    this.player?.port.postMessage({ type: 'flush', seq: ++this.flushSeq });
+    this.buffered = 0;
+    this.bufferedAt = now();
 
     // Whatever was streaming is cancelled, not finished: no drain report.
     this.streamingUtterance = null;
@@ -392,10 +408,16 @@ export class AudioEngine {
    *
    * Used for the drain signal, and to hold a caption back until the previous
    * utterance has actually finished out loud.
+   *
+   * The worklet's reports arrive a few milliseconds apart, so the last one is
+   * always slightly stale — and stale in a knowable direction, since the queue
+   * only drains as the clock advances. Subtracting the elapsed time is closer
+   * than the report alone and can never claim there is more left than there is.
    */
   playbackRemainingMs(): number {
     if (!this.ctx) return 0;
-    return Math.max(0, (this.playHead - this.ctx.currentTime) * 1000);
+    const queuedMs = (this.buffered / TTS_SAMPLE_RATE) * 1000;
+    return Math.max(0, queuedMs - (now() - this.bufferedAt));
   }
 
   async destroy() {
@@ -404,11 +426,14 @@ export class AudioEngine {
     this.disarmAutoClose();
     this.node?.port.close();
     this.node?.disconnect();
+    this.player?.port.close();
+    this.player?.disconnect();
     this.source?.disconnect();
     this.stream?.getTracks().forEach((t) => t.stop());
     await this.ctx?.close();
     this.ctx = null;
     this.node = null;
+    this.player = null;
     this.source = null;
     this.stream = null;
   }

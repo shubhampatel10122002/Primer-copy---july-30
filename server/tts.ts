@@ -79,7 +79,15 @@ export function speak(text: string, onChunk: (pcm: Buffer) => void): SpeakHandle
           throw new Error(`${res.status} ${body.slice(0, 200)}`);
         }
 
-        workingModel = model;
+        // Say WHICH voice this is, once. The models differ audibly, and "the
+        // voice does not sound clean" has two very different causes: something
+        // wrong with the audio path, or a silent fall through to the older and
+        // rougher model because the first one was refused. One log line
+        // separates them without anyone having to guess.
+        if (workingModel !== model) {
+          workingModel = model;
+          console.log(`[tts] speaking with ${model} (voice: ${env.ttsVoice})`);
+        }
         if (!res.body) throw new Error('no response body');
 
         // PCM16 is TWO bytes per sample, and the network does not care.
