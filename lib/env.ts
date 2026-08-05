@@ -25,7 +25,7 @@ export const env = {
   },
   /** alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer. */
   get ttsVoice() {
-    return process.env.OPENAI_TTS_VOICE || process.env.OPENAI_REALTIME_VOICE || 'coral';
+    return process.env.OPENAI_TTS_VOICE || process.env.OPENAI_REALTIME_VOICE || 'nova';
   },
   /** Pin a transcription model. Empty means walk the fallback list. */
   get transcribeModel() {

@@ -8,7 +8,7 @@ import { generateAcknowledgment } from '../lib/llm/acknowledge';
 import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
-import { branchUtterance } from '../lib/conversation';
+import { branchUtterance, looksMistranscribed } from '../lib/conversation';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
   shouldCheckIn,
@@ -106,6 +106,14 @@ const DRAIN_FALLBACK_MARGIN_MS = 1_500;
  * and either can answer first. Deciding what to say before scoring has landed
  * would mean coaching a child on a word they had already read correctly.
  */
+/**
+ * How many turns may vanish before we stop reopening the mic and say so.
+ *
+ * Two, because the first is a glitch and the second is a pattern. Beyond that,
+ * reopening is not recovery — it is a loop with a child inside it.
+ */
+const MAX_LOST_TURNS = 3;
+
 const SCORING_GRACE_MS = 900;
 const SCORING_QUIET_MS = 350;
 
@@ -169,6 +177,8 @@ export class Session {
   private speechChain: Promise<void> = Promise.resolve();
   /** Fires if a committed turn never produces a transcript. */
   private watchdog: NodeJS.Timeout | null = null;
+  /** Committed turns that produced nothing, in a row. Reset by any that does. */
+  private lostTurns = 0;
 
   /**
    * Segments of the turn currently being held open.
@@ -604,17 +614,7 @@ export class Session {
         if (this.watchdog) clearTimeout(this.watchdog);
         this.watchdog = setTimeout(() => {
           this.watchdog = null;
-          console.warn(`[voice] turn ${effect.turnId} never came back — recovering`);
-          this.machine.send({
-            t: 'ERROR',
-            message: 'Ollie did not catch that',
-            from: 'stt',
-          });
-          // Straight back to something usable rather than an error screen: in
-          // story mode the child gets their turn again, and in onboarding the
-          // button is already theirs to press.
-          this.machine.send({ t: 'RECOVER' });
-          this.machine.send({ t: 'FLOOR_TO_CHILD' });
+          void this.onTurnLost(effect.turnId);
         }, effect.ms);
         break;
 
@@ -726,6 +726,45 @@ export class Session {
   }
 
   /**
+   * A committed turn never produced any words.
+   *
+   * Recovering means opening the mic again, which is right once and catastrophic
+   * forever: an earlier version did exactly that with no counter, and a single
+   * desynchronised turn had it reopening the microphone every twelve seconds,
+   * silently, for the rest of the session. The child sees a button that keeps
+   * turning green and an owl that never says anything.
+   *
+   * So a retry is offered twice, out loud, and then the loop stops and the floor
+   * is left with the child. A session waiting to be tapped is recoverable; a
+   * session talking to itself on a timer is not.
+   */
+  private async onTurnLost(turnId: number) {
+    if (this.closed || !this.machine) return;
+
+    // Whatever upstream still thinks it owes us for this turn, it does not.
+    this.voice?.abandon(turnId);
+    this.lostTurns += 1;
+    console.warn(
+      `[voice] turn ${turnId} never came back (${this.lostTurns} in a row) — recovering`,
+    );
+    this.debug('turnLost', { turnId, consecutive: this.lostTurns });
+
+    this.machine.send({ t: 'ERROR', message: 'Ollie did not catch that', from: 'stt' });
+    this.machine.send({ t: 'RECOVER' });
+
+    if (this.lostTurns >= MAX_LOST_TURNS) {
+      // Stop. Say so, once, in words a child can act on, and then wait.
+      this.send({ t: 'flag', type: 'needs_help', detail: `${this.lostTurns} turns produced no transcript` });
+      await this.flag('needs_help', 'transcription is not returning anything');
+      await this.speak(T.cannotHearLine(), { handoff: false });
+      return;
+    }
+
+    await this.speak(T.didNotCatchLine(), { handoff: false });
+    this.machine.send({ t: 'FLOOR_TO_CHILD' });
+  }
+
+  /**
    * A turn's words came back.
    *
    * Always arrives, for every committed turn, including empty ones — a turn that
@@ -734,6 +773,8 @@ export class Session {
    */
   private onTranscript(turnId: number, text: string) {
     if (this.closed || !this.machine) return;
+    // Transcription is working. Whatever went wrong before is over.
+    if (text.trim()) this.lostTurns = 0;
     const merged = [this.turnText.get(turnId) ?? '', text].join(' ').replace(/\s+/g, ' ').trim();
     this.turnText.set(turnId, merged);
     this.machine.send({ t: 'TRANSCRIPT_FINAL', turnId, text: merged });
@@ -789,6 +830,24 @@ export class Session {
   private async routeTurn(turnId: number, text: string) {
     if (this.closed || this.mode === 'END') {
       this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
+      return;
+    }
+
+    // The model heard a language nobody was speaking.
+    //
+    // Never route this to the responder. A transcript with nothing Latin in it
+    // shares no words with the passage, so it reads as conversation, and
+    // answering it means answering a hallucination in the middle of a story.
+    // Scoring is unaffected either way: Azure has the same audio, always as
+    // en-US, and is the only thing that decides how the reading went.
+    if (looksMistranscribed(text)) {
+      console.warn(`[session] turn ${turnId} came back in the wrong script: "${text}"`);
+      this.debug('mistranscribed', text);
+      this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
+      // Mid-passage this was almost certainly them reading it, so treat it as
+      // reading and let scoring have the last word.
+      if (this.tracker && !this.tracker.isComplete()) await this.afterReadingTurn();
+      else this.machine.send({ t: 'FLOOR_TO_CHILD' });
       return;
     }
 

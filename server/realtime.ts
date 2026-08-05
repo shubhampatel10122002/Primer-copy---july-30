@@ -65,6 +65,20 @@ const TRANSCRIBE_MODELS = [
 ] as const;
 
 /**
+ * The API will not transcribe less than 100ms, and says so with an error.
+ *
+ * 24kHz, 16-bit, mono: 4800 bytes is 100ms. A little over it, because a commit
+ * that is refused is far more expensive than a turn that was never going to
+ * contain a word.
+ */
+const MIN_COMMIT_BYTES = 24_000 * 2 * 0.12;
+
+/** Milliseconds of 24kHz PCM16 in a byte count, for logging. */
+function pcm24Ms(bytes: number): number {
+  return Math.round((bytes / 2 / 24_000) * 1000);
+}
+
+/**
  * How much audio context the model buys before emitting text.
  *
  * Lower settings produce earlier partials at some cost to word error rate. A
@@ -124,9 +138,25 @@ export class RealtimeVoice {
    * prepended to the child's next sentence.
    */
   private openTurn: number | null = null;
-  /** Turns committed and awaiting a transcript, oldest first. */
-  private awaiting: number[] = [];
-  /** Bytes appended for the open turn, so an empty commit can be skipped. */
+
+  /**
+   * Turns committed and awaiting a transcript.
+   *
+   * Correlated by the server's `item_id`, NOT by arrival order, and that is a
+   * scar. This was a plain FIFO on the assumption that commits are answered in
+   * order — true, right up until one of them is not answered at all. A commit
+   * that errored left its turn stranded in the queue forever, so every later
+   * transcript shifted off the wrong id, was reported against a turn the child
+   * had moved past, and was discarded as stale. The turn actually waiting never
+   * resolved, the watchdog fired, opened a new turn, and that one desynchronised
+   * too: the session livelocked, reopening the microphone every twelve seconds
+   * and never once progressing.
+   *
+   * `item_id` removes the ordering assumption entirely. One lost turn now costs
+   * one turn.
+   */
+  private awaiting: { turnId: number; itemId: string | null }[] = [];
+  /** Bytes appended for the open turn, so a too-short commit can be skipped. */
   private appended = 0;
   private partial = '';
 
@@ -229,17 +259,40 @@ export class RealtimeVoice {
   }
 
   /**
+   * Hand one committed turn its words, whatever they turn out to be.
+   *
+   * The ONE promise this class makes: every turn that is committed comes back
+   * exactly once. Empty counts. A turn that never resolves is a session stuck in
+   * PROCESSING with the mic shut — the child tapped, nothing happened, and there
+   * is nothing they can do about it.
+   *
+   * `itemId` is how a transcript finds its turn. Falling back to the oldest
+   * entry covers models that do not echo one; that is a guess, but a bounded
+   * one, because a resolved turn always leaves the queue either way.
+   */
+  private resolve(itemId: string | null, text: string) {
+    let index = itemId ? this.awaiting.findIndex((a) => a.itemId === itemId) : -1;
+    if (index < 0) index = 0;
+
+    const entry = this.awaiting[index];
+    if (!entry) {
+      console.warn(`[realtime] transcript with no turn waiting: "${text}"`);
+      return;
+    }
+    this.awaiting.splice(index, 1);
+    console.log(`[realtime] turn ${entry.turnId} heard "${text}"`);
+    this.cb.onTranscript(entry.turnId, text);
+  }
+
+  /**
    * Resolve every pending turn with an empty transcript.
    *
-   * A turn that never comes back is a session stuck in PROCESSING with the mic
-   * shut — the child tapped, nothing happened, and there is nothing they can do
-   * about it. An empty transcript at least reaches the state machine, which
-   * knows how to get back to a usable state from there.
+   * Used when the connection itself is gone and nothing else is coming.
    */
   private failAwaiting(why: string) {
     const stuck = this.awaiting.splice(0, this.awaiting.length);
     if (stuck.length) console.warn(`[realtime] ${stuck.length} turn(s) lost: ${why}`);
-    for (const turnId of stuck) this.cb.onTranscript(turnId, '');
+    for (const { turnId } of stuck) this.cb.onTranscript(turnId, '');
   }
 
   /** Queue anything sent before the socket is open. */
@@ -289,15 +342,36 @@ export class RealtimeVoice {
             ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
             transcription: {
               model: this.transcribeModels[0],
+
+              // English, said three ways on purpose.
+              //
+              // These models auto-detect language when not told, and a child
+              // sounding out unfamiliar words is exactly the input that fools
+              // detection — "Max sits on the red bench" came back once as
+              // "मैंक्स सेज on the red bench". That does not break scoring, which
+              // is Azure's job on the raw audio and always en-US. What it breaks
+              // is the STORY: a transcript in another script has no words in
+              // common with the passage, so a child reading their line is
+              // classified as talking, handed to the responder, and the plot
+              // follows them somewhere else entirely.
+              //
+              // The field name moved between models — `language` on whisper-1
+              // and gpt-4o-transcribe, `languages` on gpt-live-transcribe — and
+              // the wrong one is silently ignored rather than rejected, which
+              // reads as auto-detect. Sending both is how a fallback down the
+              // model ladder cannot quietly unlock every language on Earth.
+              language: 'en',
               languages: ['en'],
               ...(minimal ? {} : { delay: TRANSCRIBE_DELAY }),
               // Children are the hardest speakers this model will meet: half
               // words, invented ones, and a lot of sounding out. Telling it what
               // it is listening to is free and measurably helps short phrases.
               prompt:
-                'A young child, roughly four to seven years old, reading a short ' +
-                'story aloud or talking to a friendly companion. Expect partial ' +
-                'words, sounding out letter by letter, and enthusiasm.',
+                'English only. A young child, roughly four to seven years old, ' +
+                'reading a short English story aloud or talking to a friendly ' +
+                'companion. Expect partial words, sounding out letter by letter, ' +
+                'and enthusiasm. Always transcribe in the Latin alphabet, even ' +
+                'when a word is mispronounced or unclear.',
             },
             // No automatic turn detection. The child's thumb is the boundary.
             turn_detection: null,
@@ -330,40 +404,34 @@ export class RealtimeVoice {
       case 'conversation.item.input_audio_transcription.delta':
         if (event.delta) {
           this.partial += event.delta;
-          const turnId = this.awaiting[0] ?? this.openTurn;
-          if (turnId !== null && turnId !== undefined) this.cb.onPartial?.(turnId, this.partial);
+          const pending = this.awaiting[0]?.turnId ?? this.openTurn;
+          if (pending !== null && pending !== undefined) this.cb.onPartial?.(pending, this.partial);
         }
         break;
 
       case 'conversation.item.input_audio_transcription.completed': {
         const text = (event.transcript ?? this.partial ?? '').trim();
         this.partial = '';
-        // Commits are answered in order, so the oldest outstanding turn owns
-        // this transcript. Threading the id through is what lets a late one be
-        // recognised as belonging to a turn the child has already moved past.
-        const turnId = this.awaiting.shift();
-        if (turnId === undefined) {
-          console.warn(`[realtime] transcript with no turn waiting: "${text}"`);
-          break;
-        }
-        console.log(`[realtime] turn ${turnId} heard "${text}"`);
-        this.cb.onTranscript(turnId, text);
+        this.resolve(event.item_id ?? null, text);
         break;
       }
 
       case 'conversation.item.input_audio_transcription.failed': {
         this.partial = '';
-        const err = event.error ?? {};
-        console.warn('[realtime] transcription failed', JSON.stringify(err));
-        const turnId = this.awaiting.shift();
+        console.warn('[realtime] transcription failed', JSON.stringify(event.error ?? {}));
         // An empty transcript, not silence: the state machine leaves PROCESSING
         // either way, which is the only thing that must not fail to happen.
-        if (turnId !== undefined) this.cb.onTranscript(turnId, '');
+        this.resolve(event.item_id ?? null, '');
         break;
       }
 
-      case 'input_audio_buffer.committed':
+      // The server has taken the buffer and named it. This is what lets a
+      // transcript find its own turn instead of trusting arrival order.
+      case 'input_audio_buffer.committed': {
+        const waiting = this.awaiting.find((a) => a.itemId === null);
+        if (waiting && event.item_id) waiting.itemId = event.item_id;
         break;
+      }
 
       case 'error': {
         const message = event.error?.message ?? JSON.stringify(event.error);
@@ -382,13 +450,22 @@ export class RealtimeVoice {
           break;
         }
 
-        // Committing a buffer with nothing in it is a race, not a fault: the
-        // child tapped twice, or tapped and said nothing. It is handled where it
-        // happens, and must never reach a five-year-old as "Something went
-        // wrong".
-        if (/buffer is empty|buffer too small/i.test(message)) {
-          const turnId = this.awaiting.shift();
-          if (turnId !== undefined) this.cb.onTranscript(turnId, '');
+        // ANY failure to commit resolves the turn it was for.
+        //
+        // This used to match two exact phrases and let everything else fall
+        // through to onError — which left the turn sitting in `awaiting`
+        // forever and desynchronised every turn after it. The real message is
+        // "the buffer is too small. Expected at least 100ms of audio", which
+        // matched neither pattern, so one child tapping twice quickly could
+        // livelock the whole session.
+        //
+        // The lesson is not a better regex. It is that a committed turn must
+        // come back on EVERY path, so the question is only whether this is worth
+        // telling anyone about — never whether the turn is owed an answer.
+        if (/buffer/i.test(message)) {
+          const benign = /empty|too small|at least \d+ ?ms/i.test(message);
+          if (!benign) console.error(`[realtime] commit failed: ${message}`);
+          this.resolve(null, '');
           break;
         }
 
@@ -433,23 +510,47 @@ export class RealtimeVoice {
     if (this.openTurn !== turnId) {
       console.warn(`[realtime] commit for turn ${turnId}, but ${this.openTurn} is open`);
     }
+    const captured = this.appended;
     this.openTurn = null;
+    this.appended = 0;
 
-    // Nothing was captured — a double tap, or a mic that produced no frames.
-    // Committing an empty buffer is an API error; answering it ourselves keeps
-    // the turn's promise without one.
-    if (this.appended === 0) {
+    // Too little audio to be a turn: a double tap, a mic that produced no
+    // frames, or a child who opened and closed it in one motion.
+    //
+    // The floor used to be zero bytes, which is not the API's floor — it wants
+    // at least 100ms — so a 40ms turn was sent, refused, and the refusal was the
+    // start of a livelock. Answering it here means the round trip that can fail
+    // never happens.
+    if (captured < MIN_COMMIT_BYTES) {
+      console.log(`[realtime] turn ${turnId} had ${pcm24Ms(captured)}ms of audio — nothing to hear`);
       this.cb.onTranscript(turnId, '');
       return;
     }
 
-    this.awaiting.push(turnId);
+    this.awaiting.push({ turnId, itemId: null });
     this.send({ type: 'input_audio_buffer.commit' });
+  }
+
+  /**
+   * Stop waiting for a turn's words.
+   *
+   * Called when something upstream has already given up on it — the watchdog,
+   * usually. Without this the abandoned entry stays in the queue and the next
+   * transcript is matched against it, which is precisely the desynchronisation
+   * that `item_id` exists to prevent. Belt as well as braces.
+   */
+  abandon(turnId: number) {
+    const before = this.awaiting.length;
+    this.awaiting = this.awaiting.filter((a) => a.turnId !== turnId);
+    if (this.awaiting.length !== before) {
+      console.warn(`[realtime] gave up on turn ${turnId}`);
+    }
   }
 
   /** The mic closed but the audio is not wanted. Nothing is transcribed. */
   discard(turnId: number) {
     if (this.openTurn === turnId) this.openTurn = null;
+    this.abandon(turnId);
     this.appended = 0;
     this.partial = '';
     this.send({ type: 'input_audio_buffer.clear' });

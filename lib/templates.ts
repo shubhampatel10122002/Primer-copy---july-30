@@ -138,3 +138,21 @@ export const makingStoryLine = (name: string | null): string =>
 
 export const goodbyeLine = (name: string, detail: string): string =>
   `That was wonderful, ${name}. ${detail} See you next time!`;
+
+/**
+ * A turn produced no words at all. Said out loud rather than shown, because a
+ * child who is waiting for an answer has no reason to look at the screen.
+ */
+export const didNotCatchLine = (): string =>
+  pick([
+    `Oops — I didn't catch that. Can you tell me again?`,
+    `Hmm, I missed that one. Try me once more!`,
+  ]);
+
+/**
+ * Transcription has stopped working. This is the honest version: it does not
+ * pretend the child did anything wrong, and it does not ask them to repeat
+ * something that is not going to be heard either.
+ */
+export const cannotHearLine = (): string =>
+  `My ears have gone funny — I can't hear you at the moment. Ask your grown-up to have a look, and tap the owl when you want to try again.`;
