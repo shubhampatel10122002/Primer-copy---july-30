@@ -181,11 +181,18 @@ For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.
 - **Never commit less than 100ms of audio.** The API refuses it, and the refusal
   used to be the start of the livelock above. `MIN_COMMIT_BYTES` answers a
   too-short turn locally so the round trip that can fail never happens.
-- **English is pinned three ways** (`language`, `languages`, and the prompt),
-  because the field name moved between transcription models and the wrong one is
-  ignored rather than rejected — which reads as auto-detect. A wholly non-Latin
-  transcript is then caught by `looksMistranscribed` before it can be routed to
-  the responder. Scoring never cared: Azure is always `en-US` on the raw audio.
+- **English is pinned in exactly ONE language field, chosen by model.**
+  `languages: ['en']` on gpt-live-transcribe, `language: 'en'` on whisper-1 and
+  the gpt-4o-transcribe family. Sending both is not belt and braces, it is an
+  error — "The 'language' and 'languages' parameters cannot be used together" —
+  and it fails the session at startup, so the first thing the child sees is
+  "Something went wrong". A wrong guess is renegotiated silently; the prompt says
+  English too, and `looksMistranscribed` catches what still gets through.
+  Scoring never cared: Azure is always `en-US` on the raw audio.
+- **A rejected session config is negotiated, never shown to the child.**
+  `configure(rung)` walks a ladder that gives up the least valuable thing first
+  and the language pin last. Which optional fields a transcription model accepts
+  genuinely varies, and this all happens before the child has heard anything.
 - **Recovery must be bounded.** The watchdog reopens the mic twice and then says
   so out loud and stops. A session waiting to be tapped is recoverable; a session
   talking to itself on a timer is not.

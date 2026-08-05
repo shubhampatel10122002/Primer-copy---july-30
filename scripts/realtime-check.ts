@@ -89,7 +89,13 @@ async function testTranscriptionModels(candidates: string[]): Promise<string[]> 
               audio: {
                 input: {
                   format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
-                  transcription: { model, languages: ['en'] },
+                  // Same per-model choice the app makes. The two spellings are
+                  // mutually exclusive, so probing with the wrong one would
+                  // report a perfectly usable model as unavailable.
+                  transcription: {
+                    model,
+                    ...(/live-transcribe/i.test(model) ? { languages: ['en'] } : { language: 'en' }),
+                  },
                   // Exactly how the app configures it: the child's thumb is the
                   // turn boundary, so there is no turn detection to negotiate.
                   turn_detection: null,

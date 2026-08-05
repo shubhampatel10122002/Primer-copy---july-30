@@ -1317,5 +1317,107 @@ console.log('\nTurn bookkeeping (the livelock)');
   ok('a transcript with no item_id falls back to oldest-first', resolved[0]?.turnId === 11);
 }
 
+// --------------------------------------------------------------------------
+console.log('\nRealtime session config negotiation');
+// --------------------------------------------------------------------------
+{
+  // The bug this exists to prevent: sending `language` AND `languages` to be
+  // safe. They are mutually exclusive — "The 'language' and 'languages'
+  // parameters cannot be used together" — and it failed the session at startup,
+  // so the very first thing a child saw was "Something went wrong".
+  const sent: any[] = [];
+  const make = (model: string) => {
+    const v = Object.create(RealtimeVoice.prototype) as any;
+    v.closed = false;
+    v.ready = false;
+    v.awaiting = [];
+    v.seenEventTypes = new Set();
+    v.transcribeModels = [model];
+    v.langSwapped = false;
+    v.rung = 0;
+    v.readyTimer = null;
+    v.cb = { onTranscript: () => {}, onError: (m: string) => sent.push({ error: m }) };
+    v.send = (e: any) => sent.push(e);
+    v.langField = v.preferredLanguageField(model);
+    return v;
+  };
+  const lastTranscription = () => {
+    const updates = sent.filter((e) => e.type === 'session.update');
+    return updates[updates.length - 1]?.session?.audio?.input?.transcription ?? {};
+  };
+
+  // Never both. Not in any configuration, on any rung.
+  for (const model of ['gpt-live-transcribe', 'whisper-1', 'gpt-4o-transcribe']) {
+    for (const rung of [0, 1, 2, 3]) {
+      sent.length = 0;
+      const v = make(model);
+      v.configure(rung);
+      const t = lastTranscription();
+      ok(
+        `${model} rung ${rung}: never sends both language fields`,
+        !('language' in t && 'languages' in t),
+        JSON.stringify(t),
+      );
+      if (v.readyTimer) clearTimeout(v.readyTimer);
+    }
+  }
+
+  // The right one per model family.
+  sent.length = 0;
+  let v = make('gpt-live-transcribe');
+  v.configure(0);
+  ok("gpt-live-transcribe gets `languages`", Array.isArray(lastTranscription().languages));
+  if (v.readyTimer) clearTimeout(v.readyTimer);
+
+  sent.length = 0;
+  v = make('whisper-1');
+  v.configure(0);
+  ok("whisper-1 gets `language`", lastTranscription().language === 'en');
+  if (v.readyTimer) clearTimeout(v.readyTimer);
+
+  // A wrong guess is negotiated, not fatal — and the swap happens without
+  // giving up any of the tuning, because the field name is not a rung.
+  sent.length = 0;
+  v = make('whisper-1');
+  v.configure(0);
+  const before = lastTranscription();
+  ok('starts on the singular', before.language === 'en' && before.delay !== undefined);
+  const handled = v.renegotiate("The 'language' and 'languages' parameters cannot be used together.");
+  ok('a language complaint is recoverable', handled === true);
+  const after = lastTranscription();
+  ok('and swaps to the plural', Array.isArray(after.languages) && after.language === undefined);
+  ok('without dropping the latency tuning', after.delay !== undefined);
+  if (v.readyTimer) clearTimeout(v.readyTimer);
+
+  // The ladder gives up the least valuable thing first, and English last.
+  sent.length = 0;
+  v = make('gpt-live-transcribe');
+  v.configure(0);
+  ok('rung 0 keeps noise reduction', !!sent.at(-1).session.audio.input.noise_reduction);
+  v.configure(2);
+  ok('rung 2 drops noise reduction', !sent.at(-1).session.audio.input.noise_reduction);
+  ok('rung 2 drops the delay tuning', lastTranscription().delay === undefined);
+  ok('but STILL pins English', Array.isArray(lastTranscription().languages));
+  v.configure(3);
+  ok(
+    'only the last rung gives up the language pin',
+    lastTranscription().languages === undefined && lastTranscription().language === undefined,
+  );
+  ok(
+    'and the English prompt survives even then',
+    /English only/.test(lastTranscription().prompt ?? ''),
+  );
+  ok('turn_detection stays null on every rung', sent.at(-1).session.audio.input.turn_detection === null);
+  if (v.readyTimer) clearTimeout(v.readyTimer);
+
+  // The ladder is finite: eventually a config problem IS worth reporting.
+  sent.length = 0;
+  v = make('gpt-live-transcribe');
+  v.rung = 3;
+  v.langSwapped = true;
+  ok('an exhausted ladder stops retrying', v.renegotiate('invalid session') === false);
+  if (v.readyTimer) clearTimeout(v.readyTimer);
+}
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

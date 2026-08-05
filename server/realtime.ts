@@ -73,6 +73,9 @@ const TRANSCRIBE_MODELS = [
  */
 const MIN_COMMIT_BYTES = 24_000 * 2 * 0.12;
 
+/** The last rung of the config negotiation ladder. See `configure`. */
+const LAST_CONFIG_RUNG = 3;
+
 /** Milliseconds of 24kHz PCM16 in a byte count, for logging. */
 function pcm24Ms(bytes: number): number {
   return Math.round((bytes / 2 / 24_000) * 1000);
@@ -160,7 +163,11 @@ export class RealtimeVoice {
   private appended = 0;
   private partial = '';
 
-  private configureAttempts = 0;
+  /** How far down the config negotiation ladder we are. */
+  private rung = 0;
+  /** Which spelling of the language hint this model wants, and whether we tried. */
+  private langField: 'languages' | 'language';
+  private langSwapped = false;
   private readyTimer: NodeJS.Timeout | null = null;
   /** Events asked for before the socket opened. */
   private outbox: string[] = [];
@@ -169,6 +176,7 @@ export class RealtimeVoice {
     : [...TRANSCRIBE_MODELS];
 
   constructor(private cb: RealtimeCallbacks) {
+    this.langField = this.preferredLanguageField(this.transcribeModels[0] ?? '');
     this.connect();
   }
 
@@ -226,6 +234,11 @@ export class RealtimeVoice {
           console.warn(
             `[realtime] no access to ${dead} — reconnecting with ${this.transcribeModels[0]}`,
           );
+          // A different model may well want the other spelling, and has not
+          // rejected anything yet. Negotiate from scratch.
+          this.langField = this.preferredLanguageField(this.transcribeModels[0]);
+          this.langSwapped = false;
+          this.rung = 0;
           setTimeout(() => this.connect(), 150);
           return;
         }
@@ -310,14 +323,39 @@ export class RealtimeVoice {
   }
 
   /**
+   * Which field this model wants the language in.
+   *
+   * There is no single right answer, which is the whole problem: `languages`
+   * (plural, a list) on gpt-live-transcribe, `language` (singular, ISO-639-1) on
+   * whisper-1 and the gpt-4o-transcribe family. Sending BOTH to cover the
+   * difference is not belt and braces, it is an error — "The 'language' and
+   * 'languages' parameters cannot be used together" — and it fails the session
+   * at startup, before the child has heard anything.
+   *
+   * So: guess from the model name, and negotiate if the guess is wrong.
+   */
+  private preferredLanguageField(model: string): 'languages' | 'language' {
+    return /live-transcribe/i.test(model) ? 'languages' : 'language';
+  }
+
+  private languageParam(): Record<string, unknown> {
+    return this.langField === 'languages' ? { languages: ['en'] } : { language: 'en' };
+  }
+
+  /**
    * Configure the session.
    *
    * `turn_detection: null` is the single most important line in this file. It
    * hands the turn boundary to the child's thumb: nothing is transcribed until
    * we commit, and we commit exactly once, when they close the mic.
+   *
+   * `rung` walks a negotiation ladder rather than a single retry. Which optional
+   * fields a transcription model accepts genuinely varies, and the difference
+   * between "no noise reduction" and "deaf" is the whole app — so each rung
+   * gives up the least valuable thing left, and English survives to the last.
    */
-  private configure(minimal = false) {
-    this.configureAttempts += 1;
+  private configure(rung = 0) {
+    this.rung = rung;
 
     // If the server never confirms, we would drop mic audio forever and the
     // session would be silently deaf. Fall forward instead, loudly.
@@ -331,6 +369,11 @@ export class RealtimeVoice {
       this.ready = true;
     }, 4_000);
 
+    // Rung 2 drops the tuning; rung 3 drops the language hint itself, which is
+    // the last thing worth giving up and is why it is last.
+    const tuned = rung < 2;
+    const withLanguage = rung < 3;
+
     this.send({
       type: 'session.update',
       session: {
@@ -339,30 +382,23 @@ export class RealtimeVoice {
           input: {
             format: { type: 'audio/pcm', rate: AUDIO.realtimeSampleRate },
             // Laptop speakers and a laptop microphone in the same room.
-            ...(minimal ? {} : { noise_reduction: { type: 'far_field' as const } }),
+            ...(tuned ? { noise_reduction: { type: 'far_field' as const } } : {}),
             transcription: {
               model: this.transcribeModels[0],
 
-              // English, said three ways on purpose.
+              // English, pinned — but in exactly ONE field.
               //
               // These models auto-detect language when not told, and a child
               // sounding out unfamiliar words is exactly the input that fools
-              // detection — "Max sits on the red bench" came back once as
+              // detection: "Max sits on the red bench" came back once as
               // "मैंक्स सेज on the red bench". That does not break scoring, which
-              // is Azure's job on the raw audio and always en-US. What it breaks
-              // is the STORY: a transcript in another script has no words in
-              // common with the passage, so a child reading their line is
-              // classified as talking, handed to the responder, and the plot
-              // follows them somewhere else entirely.
-              //
-              // The field name moved between models — `language` on whisper-1
-              // and gpt-4o-transcribe, `languages` on gpt-live-transcribe — and
-              // the wrong one is silently ignored rather than rejected, which
-              // reads as auto-detect. Sending both is how a fallback down the
-              // model ladder cannot quietly unlock every language on Earth.
-              language: 'en',
-              languages: ['en'],
-              ...(minimal ? {} : { delay: TRANSCRIBE_DELAY }),
+              // is Azure's job on the raw audio and always en-US. What it risks
+              // is the story — a transcript with no Latin in it shares no words
+              // with the passage, so a child reading their line reads as talking
+              // and the plot follows a hallucination. `looksMistranscribed`
+              // catches what gets through.
+              ...(withLanguage ? this.languageParam() : {}),
+              ...(tuned ? { delay: TRANSCRIBE_DELAY } : {}),
               // Children are the hardest speakers this model will meet: half
               // words, invented ones, and a lot of sounding out. Telling it what
               // it is listening to is free and measurably helps short phrases.
@@ -381,6 +417,31 @@ export class RealtimeVoice {
     });
   }
 
+  /**
+   * The server refused the session config. Give up the least valuable thing and
+   * try again.
+   *
+   * Returns false once the ladder is exhausted, which is the only point at which
+   * a configuration problem is worth putting in front of a child.
+   */
+  private renegotiate(message: string): boolean {
+    // The two language fields are mutually exclusive and which one is right
+    // depends on the model, so this is a straight swap rather than a rung.
+    if (/language/i.test(message) && !this.langSwapped) {
+      this.langSwapped = true;
+      this.langField = this.langField === 'languages' ? 'language' : 'languages';
+      console.warn(`[realtime] retrying with \`${this.langField}\` instead`);
+      this.configure(this.rung);
+      return true;
+    }
+
+    if (this.rung >= LAST_CONFIG_RUNG) return false;
+
+    console.warn(`[realtime] session config rejected, retrying without optional fields`);
+    this.configure(this.rung + 1);
+    return true;
+  }
+
   private handle(event: any) {
     switch (event.type) {
       case 'session.created':
@@ -396,7 +457,9 @@ export class RealtimeVoice {
         if (this.ready) break;
         this.ready = true;
         console.log(
-          `[realtime] listening — ${this.transcribeModels[0]}, manual turns (delay=${TRANSCRIBE_DELAY})`,
+          `[realtime] listening — ${this.transcribeModels[0]}, manual turns, ` +
+            `${this.rung < LAST_CONFIG_RUNG ? `${this.langField}=en` : 'NO language pin'}` +
+            `${this.rung < 2 ? `, delay=${TRANSCRIBE_DELAY}` : ''}`,
         );
         break;
       }
@@ -437,17 +500,13 @@ export class RealtimeVoice {
         const message = event.error?.message ?? JSON.stringify(event.error);
         console.error('[realtime]', message);
 
-        // A rejected session config is recoverable: try again without the
-        // optional fields. Models differ in which they accept, and the
-        // difference between "no noise reduction" and "deaf" is the whole app.
-        if (
-          !this.ready &&
-          this.configureAttempts === 1 &&
-          /session|param|unknown|invalid/i.test(message)
-        ) {
-          console.warn('[realtime] session config rejected, retrying without optional fields');
-          this.configure(true);
-          break;
+        // A rejected session config is recoverable, and must be recovered from
+        // SILENTLY: this happens during setup, before the child has heard
+        // anything, and "Something went wrong" is not what a five-year-old
+        // should be shown because two API fields are mutually exclusive.
+        if (!this.ready && /language|session|param|unknown|invalid/i.test(message)) {
+          if (this.renegotiate(message)) break;
+          console.error('[realtime] every session config was rejected');
         }
 
         // ANY failure to commit resolves the turn it was for.
