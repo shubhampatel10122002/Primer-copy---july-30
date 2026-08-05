@@ -57,6 +57,29 @@ export const CONVERSATION_OVERLAP = 0.34;
 export const MIN_ASIDE_TOKENS = 3;
 
 /**
+ * How many passage words an aside may swallow once it is already an aside.
+ *
+ * A child who breaks off to talk to you does not dip back into the line for two
+ * words and then carry on talking. When a word of the passage turns up in the
+ * middle of what they are saying it is a collision, not a return to reading —
+ * and the words that collide are exactly the ones this matters for: "to", "a",
+ * "the", "something", "and".
+ *
+ * This is the whole of a real bug. "Change topic to something religious", said
+ * over a line containing "to" and "something", split into three unmatched runs;
+ * the longest was two words, so the responder was handed "change topic" and had
+ * to ask what topic — while the child, who had already said, heard the same
+ * question twice and got no story about it either time.
+ *
+ * It widens an aside; it never creates one. Whether an utterance contains an
+ * aside at all is still decided by the longest UNBROKEN run, because that
+ * decision is the expensive one: two misread words, two right ones, two more
+ * misread is a child stumbling through a line, and joining those up into a
+ * four-word "aside" would interrupt them to answer their own reading.
+ */
+export const MAX_ASIDE_GAP = 2;
+
+/**
  * Words a child says to a person, not to a page.
  *
  * Kept short and high-signal, same discipline as lib/leniency.ts: a wrong entry
@@ -148,24 +171,27 @@ export function branchUtterance(args: { text: string; passage: string | null }):
 
   // The longest unbroken run of words that are not in the passage. A real aside
   // is contiguous ("...over the hill CAN WE DO CARS INSTEAD"); a misread is one
-  // wrong word here and there.
-  let bestStart = -1;
-  let bestLength = 0;
-  let runStart = -1;
-  for (let i = 0; i <= matched.length; i++) {
-    if (i < matched.length && !matched[i]) {
-      if (runStart < 0) runStart = i;
-    } else if (runStart >= 0) {
-      if (i - runStart > bestLength) {
-        bestLength = i - runStart;
-        bestStart = runStart;
-      }
-      runStart = -1;
+  // wrong word here and there. This, and only this, decides whether there is an
+  // aside at all — see MAX_ASIDE_GAP for why the widening below must not.
+  const runs: { start: number; end: number; length: number }[] = [];
+  for (let i = 0; i < matched.length; i++) {
+    if (matched[i]) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.end === i - 1) {
+      last.end = i;
+      last.length += 1;
+    } else {
+      runs.push({ start: i, end: i, length: 1 });
     }
   }
 
-  const asideWords = bestStart >= 0 ? spoken.slice(bestStart, bestStart + bestLength) : [];
-  const asideText = bestStart >= 0 ? raw.slice(bestStart, bestStart + bestLength).join(' ') : '';
+  // Ties go to the earliest run: an aside starts where the child stopped
+  // reading, and a later run of the same size is more likely to be a stumble.
+  let run: { start: number; end: number; length: number } | null = null;
+  for (const r of runs) if (!run || r.length > run.length) run = r;
+
+  const bestLength = run?.length ?? 0;
+  const asideWords = run ? spoken.slice(run.start, run.end + 1) : [];
   const hasCue = asideWords.some((w) => CONVERSATION_CUES.has(w) && !expected.has(w));
 
   if (overlap <= CONVERSATION_OVERLAP) {
@@ -182,15 +208,40 @@ export function branchUtterance(args: { text: string; passage: string | null }):
   // aside if it is long enough to be a sentence or carries an unmistakable cue —
   // otherwise it is a child stumbling, and interrupting them would be worse than
   // missing a comment.
-  if (bestLength >= MIN_ASIDE_TOKENS || (hasCue && bestLength >= 1)) {
-    const readingText = raw.filter((_, i) => i < bestStart || i >= bestStart + bestLength).join(' ');
-    return {
-      kind: 'mixed',
-      readingText,
-      conversationText: asideText,
-      overlap,
-      reason: hasCue ? `said "${asideWords.join(' ')}" mid-line` : `${bestLength} words that are not in the line`,
-    };
+  if (run && (bestLength >= MIN_ASIDE_TOKENS || (hasCue && bestLength >= 1))) {
+    // NOW widen it. They stopped reading somewhere in this run, so a passage
+    // word landing a syllable or two later is a collision and not a return to
+    // the line — and cutting the aside there hands the responder half a
+    // request, which is a request it has to ask about.
+    let start = run.start;
+    let end = run.end;
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const r of runs) {
+        if (r.start > end && r.start - end - 1 <= MAX_ASIDE_GAP) {
+          end = r.end;
+          grew = true;
+        } else if (r.end < start && start - r.end - 1 <= MAX_ASIDE_GAP) {
+          start = r.start;
+          grew = true;
+        }
+      }
+    }
+
+    const asideText = raw.slice(start, end + 1).join(' ');
+    const readingText = raw.filter((_, i) => i < start || i > end).join(' ');
+    const reason = hasCue
+      ? `said "${asideText}" mid-line`
+      : `${bestLength} words that are not in the line`;
+
+    // The aside was the whole turn — every word of it, passage collisions
+    // included. There is no reading half to score or come back to, so calling
+    // it mixed would send the session looking for one.
+    if (!readingText.trim()) {
+      return { kind: 'conversation', readingText: '', conversationText: args.text.trim(), overlap, reason };
+    }
+
+    return { kind: 'mixed', readingText, conversationText: asideText, overlap, reason };
   }
 
   if (overlap >= READING_OVERLAP) {

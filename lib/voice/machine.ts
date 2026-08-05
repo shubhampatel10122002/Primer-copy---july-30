@@ -58,7 +58,7 @@
  * MIC_OPEN     | ->PROCESSING   | REJECTED        | -               | ->PROCESSING
  *              |   commit turn  |   mic is open   |                 |   only if armed
  * PROCESSING   | ->MIC_OPEN     | ->AI_SPEAKING   | -               | -
- *              |   drop pending |   speak reply   |                 |
+ *              |   hold pending |   speak reply   |                 |
  * ERROR        | ->MIC_OPEN     | ->AI_SPEAKING   | -               | -
  *              |   recover      |   recover       |                 |
  * ENDED        | -              | -               | -               | -
@@ -73,6 +73,10 @@
  * ERROR        | -              | -               | update  | ->IDLE  | set mode
  * ENDED        | -              | -               | -       | -       | -
  * ```
+ *
+ * A TRANSCRIPT_FINAL for the HELD turn (see `superseded`) is answered before the
+ * table is consulted at all, from every state: it is not addressed to whoever
+ * holds the floor now, it is the thing being kept safe.
  *
  * FLOOR_TO_CHILD opens a system mic session — same reason, same arming rules as
  * the `handoff` path — from IDLE and PROCESSING, and only in STORY. It is a
@@ -163,6 +167,29 @@ export interface MicSession {
   openedAt: number;
 }
 
+/**
+ * A committed turn that a later mic session interrupted before it was answered.
+ *
+ * Taking the floor while a turn is still being processed normally voids it —
+ * that is right, and it is what "the child spoke again first" means. But the
+ * gesture that takes the floor is a tap, and a tap comes in pairs: a child (or a
+ * thumb resting on a big round button) shuts the mic and immediately knocks it
+ * on and off again. The old code voided the real turn on the second tap and then
+ * discarded the third tap's empty session as a double tap, so the sentence the
+ * child had actually just said was answered by nobody and the session went
+ * quiet with no error anywhere.
+ *
+ * So the drop is DEFERRED. The interrupted turn is held here, along with its
+ * transcript if that lands while somebody else has the floor, and it is only let
+ * go once the interruption proves to be a real turn with real words in it. An
+ * interruption that produces nothing gives the floor back to what it interrupted.
+ */
+export interface SupersededTurn {
+  turnId: number;
+  /** Its transcript, if it arrived while the interrupting session held the floor. */
+  text: string | null;
+}
+
 export interface Utterance {
   utteranceId: number;
   text: string;
@@ -227,6 +254,13 @@ export interface VoiceSnapshot {
   speaking: Utterance | null;
   /** The turn we are waiting on a transcript or a reply for. */
   pendingTurnId: number | null;
+  /**
+   * A turn that was interrupted before it could be answered, held rather than
+   * dropped until the interruption proves it meant something. See
+   * `SupersededTurn` — this exists so a fumbled double tap cannot swallow the
+   * sentence a child had just finished saying.
+   */
+  superseded: SupersededTurn | null;
   error: { message: string; from: ErrorSource } | null;
   /** Bumped on every accepted transition. Lets a mirror detect it is behind. */
   seq: number;
@@ -265,6 +299,7 @@ export function initialSnapshot(mode: VoiceMode = 'ONBOARDING'): VoiceSnapshot {
     mic: null,
     speaking: null,
     pendingTurnId: null,
+    superseded: null,
     error: null,
     seq: 0,
     generation: 0,
@@ -297,21 +332,71 @@ function reject(s: VoiceSnapshot, why: string): Outcome {
   return { snapshot: s, effects: [], noop: null, rejected: why };
 }
 
+/**
+ * Let go of a held turn. It is never coming back, so say so once, out loud.
+ *
+ * Pushed as an effect rather than done silently because `drop_turn` is what
+ * tells the session to forget the transcript segments it has been collecting —
+ * and because a turn a child took that nobody answers should always be visible
+ * in the debug panel with a reason next to it.
+ */
+function releaseSuperseded(s: VoiceSnapshot, effects: VoiceEffect[], why: string) {
+  if (s.superseded) effects.push({ t: 'drop_turn', turnId: s.superseded.turnId, reason: why });
+}
+
+/**
+ * The interruption produced nothing. Give the interrupted turn its floor back.
+ *
+ * Lands in PROCESSING on the held turn — exactly where the session was before
+ * the stray tap — and either hands over the transcript that arrived in the
+ * meantime or re-arms the watchdog to wait for it. Either way the turn ends in
+ * an answer, which is the promise a committed turn makes.
+ */
+function restoreSuperseded(s: VoiceSnapshot, effects: VoiceEffect[]): Outcome {
+  const held = s.superseded!;
+  effects.push(
+    held.text !== null
+      ? { t: 'process_turn', turnId: held.turnId, text: held.text }
+      : { t: 'arm_watchdog', turnId: held.turnId, ms: PROCESSING_WATCHDOG_MS },
+  );
+
+  return {
+    snapshot: {
+      ...s,
+      state: 'PROCESSING',
+      mic: null,
+      speaking: null,
+      pendingTurnId: held.turnId,
+      superseded: null,
+      seq: s.seq + 1,
+    },
+    effects,
+    noop: null,
+    rejected: null,
+  };
+}
+
 function openMic(
   s: VoiceSnapshot,
   reason: MicOpenReason,
   now: number,
   extra: VoiceEffect[] = [],
+  /** A committed turn this session interrupts, to be held rather than dropped. */
+  supersede: number | null = null,
 ): Outcome {
   const turnId = s.nextTurnId;
   const autoCloseArmed = armsAutoClose(s.mode, reason);
 
   const mic: MicSession = { turnId, reason, autoCloseArmed, openedAt: now };
-  const effects: VoiceEffect[] = [
-    ...extra,
-    { t: 'disarm_watchdog' },
-    { t: 'open_mic', turnId, autoCloseArmed, reason },
-  ];
+  const effects: VoiceEffect[] = [...extra];
+
+  // Only ever one held turn. A child interrupting their own interruption has
+  // moved on twice, and the older of the two really is gone.
+  if (s.superseded && s.superseded.turnId !== supersede) {
+    releaseSuperseded(s, effects, 'the child took the floor again');
+  }
+
+  effects.push({ t: 'disarm_watchdog' }, { t: 'open_mic', turnId, autoCloseArmed, reason });
 
   // Silence detection is armed if and only if this session may auto-close. The
   // browser is told to run its detector here and nowhere else, so "armed" cannot
@@ -327,6 +412,7 @@ function openMic(
       mic,
       speaking: null,
       pendingTurnId: null,
+      superseded: supersede === null ? null : { turnId: supersede, text: null },
       error: null,
       seq: s.seq + 1,
       generation: s.generation + 1,
@@ -348,6 +434,12 @@ function closeMic(s: VoiceSnapshot, commit: boolean, why: string): Outcome {
 
   if (!commit) {
     effects.push({ t: 'drop_turn', turnId: mic.turnId, reason: why });
+
+    // This session said nothing AND it interrupted one that did. A thumb that
+    // bounced off the button is not a child changing their mind, so the turn it
+    // landed on top of goes back to being the turn we owe an answer to.
+    if (s.superseded) return restoreSuperseded(s, effects);
+
     return {
       snapshot: {
         ...s,
@@ -385,6 +477,14 @@ function startSpeaking(s: VoiceSnapshot, e: Extract<VoiceEvent, { t: 'AI_SPEECH_
     handoff: e.handoff,
     startedAt: now,
   };
+
+  // Something is being said, so the conversation has moved past whatever was
+  // being held for a rescue. Let it go here rather than leaving it to linger
+  // into a turn it has nothing to do with.
+  const effects: VoiceEffect[] = [];
+  releaseSuperseded(s, effects, 'the session has already answered');
+  effects.push({ t: 'disarm_watchdog' }, { t: 'start_tts', utteranceId: e.utteranceId, text: e.text });
+
   return {
     snapshot: {
       ...s,
@@ -392,14 +492,12 @@ function startSpeaking(s: VoiceSnapshot, e: Extract<VoiceEvent, { t: 'AI_SPEECH_
       speaking,
       mic: null,
       pendingTurnId: null,
+      superseded: null,
       error: null,
       seq: s.seq + 1,
       nextUtteranceId: Math.max(s.nextUtteranceId, e.utteranceId + 1),
     },
-    effects: [
-      { t: 'disarm_watchdog' },
-      { t: 'start_tts', utteranceId: e.utteranceId, text: e.text },
-    ],
+    effects,
     noop: null,
     rejected: null,
   };
@@ -414,6 +512,7 @@ function endSession(s: VoiceSnapshot): Outcome {
   if (s.mic) {
     effects.push({ t: 'close_mic', turnId: s.mic.turnId, commit: false });
   }
+  releaseSuperseded(s, effects, 'the session ended');
   return {
     snapshot: {
       ...s,
@@ -421,6 +520,7 @@ function endSession(s: VoiceSnapshot): Outcome {
       mic: null,
       speaking: null,
       pendingTurnId: null,
+      superseded: null,
       seq: s.seq + 1,
       generation: s.generation + 1,
     },
@@ -439,6 +539,7 @@ function toError(s: VoiceSnapshot, message: string, from: ErrorSource): Outcome 
     effects.push({ t: 'close_mic', turnId: s.mic.turnId, commit: false });
     effects.push({ t: 'drop_turn', turnId: s.mic.turnId, reason: `error: ${message}` });
   }
+  releaseSuperseded(s, effects, `error: ${message}`);
   return {
     snapshot: {
       ...s,
@@ -446,6 +547,7 @@ function toError(s: VoiceSnapshot, message: string, from: ErrorSource): Outcome 
       mic: null,
       speaking: null,
       pendingTurnId: null,
+      superseded: null,
       error: { message, from },
       seq: s.seq + 1,
       generation: s.generation + 1,
@@ -484,6 +586,21 @@ export function transition(s: VoiceSnapshot, e: VoiceEvent, now: number = Date.n
       };
     }
     return { snapshot: next, effects: [], noop: null, rejected: null };
+  }
+
+  // The words of a HELD turn, arriving while somebody else holds the floor.
+  //
+  // Before the table, and from every state, because this transcript is not
+  // addressed to whoever has the floor now — it belongs to the turn being kept
+  // safe, and the table would quite correctly throw it away as stale. Held
+  // rather than acted on: nothing happens until the interruption resolves.
+  if (e.t === 'TRANSCRIPT_FINAL' && s.superseded && e.turnId === s.superseded.turnId) {
+    return {
+      snapshot: { ...s, superseded: { turnId: e.turnId, text: e.text }, seq: s.seq + 1 },
+      effects: [],
+      noop: null,
+      rejected: null,
+    };
   }
 
   if (e.t === 'ERROR') {
@@ -632,10 +749,13 @@ export function transition(s: VoiceSnapshot, e: VoiceEvent, now: number = Date.n
       switch (e.t) {
         // They want to say something else before we have answered. Always
         // allowed: a child must never have to wait for the network to be heard.
+        //
+        // The pending turn is HELD, not dropped. Dropping it here is right when
+        // this tap is a child changing their mind, and catastrophic when it is
+        // the first half of a fumbled double tap — which is the same event until
+        // the new session ends and we can see whether anything was said in it.
         case 'MIC_TAP':
-          return openMic(s, 'user_tap', now, [
-            { t: 'drop_turn', turnId: s.pendingTurnId ?? -1, reason: 'child spoke again first' },
-          ]);
+          return openMic(s, 'user_tap', now, [], s.pendingTurnId);
 
         case 'AI_SPEECH_START':
           return startSpeaking(s, e, now);
@@ -649,16 +769,30 @@ export function transition(s: VoiceSnapshot, e: VoiceEvent, now: number = Date.n
           if (e.turnId !== s.pendingTurnId) {
             return noop(s, `transcript for turn ${e.turnId}, but turn ${s.pendingTurnId} is pending`);
           }
+
+          // An interruption that turned out to contain nothing at all. The
+          // double-tap window catches the fast version of this; a slightly
+          // slower fumble gets as far as a commit and comes back empty, and
+          // costs the child the same real sentence unless it is caught here.
+          if (!e.text.trim() && s.superseded) {
+            return restoreSuperseded(s, [
+              { t: 'disarm_watchdog' },
+              { t: 'drop_turn', turnId: e.turnId, reason: 'said nothing — the held turn stands' },
+            ]);
+          }
+
           // Stay in PROCESSING: the transcript is the input, not the answer.
           // But the watchdog is disarmed here — it guards "the words never
           // arrived", and they have. Leaving it running would let a slow reply
           // trip a recovery in the middle of a working conversation.
+          const effects: VoiceEffect[] = [{ t: 'disarm_watchdog' }];
+          // They really did say something else first. NOW the older turn goes.
+          releaseSuperseded(s, effects, 'the child spoke again first');
+          effects.push({ t: 'process_turn', turnId: e.turnId, text: e.text });
+
           return {
-            snapshot: { ...s, seq: s.seq + 1 },
-            effects: [
-              { t: 'disarm_watchdog' },
-              { t: 'process_turn', turnId: e.turnId, text: e.text },
-            ],
+            snapshot: { ...s, superseded: null, seq: s.seq + 1 },
+            effects,
             noop: null,
             rejected: null,
           };
@@ -671,14 +805,21 @@ export function transition(s: VoiceSnapshot, e: VoiceEvent, now: number = Date.n
           // Something IS coming: hold PROCESSING so the UI keeps saying so
           // right up to the first syllable, rather than flicking through idle.
           if (e.willSpeak) return { snapshot: { ...s, seq: s.seq + 1 }, effects: [], noop: null, rejected: null };
+
+          // Answered without a word to say. Whatever was being held for a
+          // rescue has been overtaken by a turn that ran its whole course.
+          const effects: VoiceEffect[] = [{ t: 'disarm_watchdog' }];
+          releaseSuperseded(s, effects, 'a later turn was answered first');
           return {
-            snapshot: { ...s, state: 'IDLE', pendingTurnId: null, seq: s.seq + 1 },
-            effects: [{ t: 'disarm_watchdog' }],
+            snapshot: { ...s, state: 'IDLE', pendingTurnId: null, superseded: null, seq: s.seq + 1 },
+            effects,
             noop: null,
             rejected: null,
           };
         }
 
+        // The session deciding to move on, which is different from the child
+        // interrupting: nothing is held, because nothing here was a slip.
         case 'FLOOR_TO_CHILD':
           return s.mode === 'STORY'
             ? openMic(s, 'system_after_passage', now, [
@@ -753,6 +894,14 @@ export function checkInvariants(s: VoiceSnapshot): string[] {
   }
   if (s.mic?.autoCloseArmed && !armsAutoClose(s.mode, s.mic.reason)) {
     broken.push(`autoCloseArmed in mode=${s.mode} opened by ${s.mic.reason}`);
+  }
+  // A turn is either live or held, never both — otherwise one turn could be
+  // answered twice, or dropped by one path while the other still waits on it.
+  if (s.superseded && (s.superseded.turnId === s.pendingTurnId || s.superseded.turnId === s.mic?.turnId)) {
+    broken.push(`turn ${s.superseded.turnId} is both held and live`);
+  }
+  if (s.superseded && (s.state === 'IDLE' || s.state === 'AI_SPEAKING' || s.state === 'ENDED')) {
+    broken.push(`a turn is still held in ${s.state}, where nothing will ever resolve it`);
   }
 
   return broken;

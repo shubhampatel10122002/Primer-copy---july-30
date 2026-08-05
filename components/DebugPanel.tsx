@@ -175,6 +175,19 @@ export default function DebugPanel({
           <span>Speaking</span>
           <span>{voice.speaking ? `#${voice.speaking.utteranceId}` : '—'}</span>
         </div>
+        {/*
+          A turn that was interrupted before it could be answered, waiting to
+          find out whether the interruption meant anything. Shown because a
+          held turn used to be a dropped one, silently.
+        */}
+        <div className="kv">
+          <span>Held turn</span>
+          <span>
+            {voice.superseded
+              ? `turn ${voice.superseded.turnId} · ${voice.superseded.text === null ? 'awaiting words' : 'words in hand'}`
+              : '—'}
+          </span>
+        </div>
         {(debug.voiceRejected as any) && (
           <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
             last refused: {(debug.voiceRejected as any).event} — {(debug.voiceRejected as any).why}

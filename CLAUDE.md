@@ -25,6 +25,7 @@ mode and asked for words.
 | `lib/conversation.ts` | Was that reading, talking, or both? That is all it does now — "have they finished?" and the echo guard went with the button. |
 | `lib/facts.ts` | What the child told us today, and which beat may use it. |
 | `lib/sessionflow.ts` | When to check in, what progress to celebrate, was that a yes. |
+| `lib/topics.ts` | What did they ask the story to be about, and was that "you pick". |
 | `lib/profile.ts` | The onboarding draft and what counts as enough to start. |
 | `lib/pedagogy.ts` | Mastery math and target selection. Pure, no LLM. |
 | `lib/skills.ts` | The skill list and word→skill mapping. |
@@ -32,6 +33,7 @@ mode and asked for words.
 | `app/api/*` | REST surface (§13). |
 | `components/MicButton.tsx` | The owl. It is the control AND the indicator. |
 | `components/*` | Session UI + debug panel. |
+| `public/worklets/playback-processor.js` | The voice as ONE stream. Read before touching playback. |
 
 ## Conventions
 
@@ -94,6 +96,21 @@ mode and asked for words.
   work generated for an earlier generation drops itself. A coaching line written
   before they said "I don't want to read any more" is about a moment that no
   longer exists.
+- **An interruption that says nothing does not supersede anything.** Taking the
+  floor mid-PROCESSING HOLDS the pending turn (`snapshot.superseded`) instead of
+  dropping it, and drops it only once the new turn comes back with words in it.
+  A tap comes in pairs: off, then on-and-off again by accident. Dropping on the
+  second tap and discarding the third as a double tap threw away the sentence
+  the child had just finished saying, and the session went quiet with no error
+  anywhere. A transcript for a held turn is caught before the transition table
+  sees it, because from the table's point of view it is correctly stale.
+- **Playback is ONE stream, not one buffer per chunk.** Samples go into
+  `public/worklets/playback-processor.js` and it reads them out at the context
+  rate with a phase that survives chunk boundaries. Scheduling each network
+  chunk as its own `AudioBufferSourceNode` restarts the resampler, quantises
+  every start time onto the output grid, and splices silence in on underrun —
+  a dozen small discontinuities a second, which is not heard as clicks but as a
+  bad radio signal. A chunk is a unit of network, never a unit of audio.
 - **Never ask a question you will not wait for.** Onboarding decides whether it
   has enough BEFORE generating a turn, never after speaking one.
 - **A reply is on the critical path; a story beat is not.** Conversation is ONE
@@ -112,6 +129,14 @@ mode and asked for words.
 - **A detail the child shares never lands in the very next sentence.**
   `lib/facts.ts` owns the delay; the narrator is only told what to say, and only
   once a beat is cleared to use it.
+- **What they want the story to be about is asked ONCE, then chosen.**
+  `lib/topics.ts` reads the subject out of the child's own words when the
+  responder returns `requested_topic: null`, treats "you pick" as an ANSWER
+  rather than a missing one, and refuses to let a non-answer through as a
+  subject. "No preference, pick any" once became the premise of a story, and a
+  narrator handed that as a subject asks what they meant — which is the second
+  time of asking, from the child's side. After one question the session picks:
+  their words, then their favourite thing, then the narrator's own invention.
 
 ## Commands
 
@@ -129,12 +154,18 @@ any document), connects the ears, speaks a line, and cancels one mid-sentence.
 Far easier to read than the same failure buried in a live session.
 
 Run `npm run selftest` after touching `voice/machine.ts`, `tracker.ts`,
-`leniency.ts`, `pedagogy.ts`, `skills.ts`, `conversation.ts`, `facts.ts`,
-`sessionflow.ts`, or `profile.ts` — those files carry the behaviour that is
+`leniency.ts`, `pedagogy.ts`, `skills.ts`, `conversation.ts`, `topics.ts`,
+`facts.ts`, `sessionflow.ts`, `profile.ts`, or
+`public/worklets/playback-processor.js` — those files carry the behaviour that is
 hardest to eyeball and easiest to break. The voice machine's suite covers the
 transition table's totality, both mutual-exclusion directions, mid-sentence
 barge-in, the manual-interruption override, auto-open/auto-close, rapid double
-taps and every stale-message race.
+taps, the held-turn rescue and every stale-message race.
+
+The playback worklet is tested by rendering a tone through it in ragged chunks
+and measuring the result against the tone it should be — the only kind of test
+that can see this class of bug, because every individual chunk is always correct
+and the damage is entirely in the seams between them.
 
 `npm run db:reset` seeds an **empty** profile, so the app opens with onboarding.
 For the old pre-filled demo child: `SEED_CHILD_NAME=Maya npm run db:seed`.

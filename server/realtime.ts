@@ -582,7 +582,17 @@ export class RealtimeVoice {
     // never happens.
     if (captured < MIN_COMMIT_BYTES) {
       console.log(`[realtime] turn ${turnId} had ${pcm24Ms(captured)}ms of audio — nothing to hear`);
-      this.cb.onTranscript(turnId, '');
+      // Answered on the next tick, not in this call.
+      //
+      // `commit` is reached from inside the state machine's effect loop, and
+      // every other transcript arrives from the network — i.e. later, with the
+      // stack unwound. Resolving here instead re-enters the machine half way
+      // through applying a transition's effects, so the effects still queued
+      // behind us land on a state that has already moved on: the `arm_watchdog`
+      // that follows this `close_mic` would arm for a turn that had just been
+      // resolved. Same answer, same absence of a round trip that can fail —
+      // just delivered the way the machine already expects one.
+      queueMicrotask(() => this.cb.onTranscript(turnId, ''));
       return;
     }
 

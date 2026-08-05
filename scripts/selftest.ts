@@ -5,6 +5,7 @@
  *
  * Run: npm run selftest
  */
+import { readFileSync } from 'node:fs';
 import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
 import { PassageTracker, tokenize } from '../server/tracker';
 import { applyLeniency } from '../lib/leniency';
@@ -15,6 +16,7 @@ import { upsample16to24, RealtimeVoice } from '../server/realtime';
 import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
 import { branchUtterance, looksMistranscribed } from '../lib/conversation';
+import { cleanTopic, isTopicDeferral, resolveTopic, topicFrom } from '../lib/topics';
 import {
   VoiceMachine,
   transition,
@@ -468,6 +470,61 @@ console.log('\nBranching an utterance: reading, talking, or both');
 
   // A single wrong word inside a line is a stumble, not an interruption.
   ok('one odd word does not make it mixed', branch('The blue dragon flapped over the hill').kind === 'reading');
+
+  // A request that COLLIDES with the line it interrupts.
+  //
+  // "change topic to something religious" over a line containing "to" and
+  // "something" used to split into three unmatched runs; the longest was two
+  // words, so the responder was handed "change topic" — a request with its
+  // subject cut off — and had to ask which topic. The child, who had said,
+  // heard the question anyway.
+  {
+    const collides = branchUtterance({
+      text: 'change topic to something religious',
+      passage: 'Max wanted to find something new.',
+    });
+    ok(
+      'a stray passage word does not truncate a request',
+      collides.conversationText.toLowerCase().includes('religious'),
+      JSON.stringify(collides),
+    );
+    ok(
+      'and the whole of it goes to the conversation layer',
+      collides.conversationText.toLowerCase().startsWith('change topic'),
+      collides.conversationText,
+    );
+    ok(
+      'an utterance that is entirely an aside is conversation, not mixed',
+      collides.kind === 'conversation',
+      collides.kind,
+    );
+  }
+
+  // Widening an aside must never CREATE one. A child stumbling through a line
+  // produces short runs of wrong words with right ones between them, and
+  // joining those up would interrupt them to answer their own reading — the
+  // single most expensive false positive in this file.
+  {
+    const stumbling = branchUtterance({
+      text: 'duh bloo dragon flew ovah da hill and away',
+      passage: 'The blue dragon flew over the hill and away.',
+    });
+    ok('a stumble is still reading, not an aside', stumbling.kind === 'reading', JSON.stringify(stumbling));
+  }
+
+  // The same rule must not swallow a line the child really did read. Two
+  // matched words in the middle of talking is a collision; six of them at the
+  // end is reading.
+  {
+    const opener = branch('hey ollie The blue dragon flew over the hill');
+    ok('an opener before a read line stays mixed', opener.kind === 'mixed', JSON.stringify(opener));
+    ok(
+      'and only the opener is treated as talking',
+      !opener.conversationText.toLowerCase().includes('dragon'),
+      opener.conversationText,
+    );
+    ok('the reading half survives', opener.readingText.toLowerCase().includes('dragon'), opener.readingText);
+  }
 
   // "Have they finished talking?" is no longer asked here, or anywhere. It was
   // the hardest question in the codebase — a settle window of 350ms to 3.8s,
@@ -1211,7 +1268,13 @@ console.log('\nTurn bookkeeping (the livelock)');
 
   // A turn too short to transcribe is answered here, without a round trip that
   // could be refused. This is the commit that used to start the livelock.
+  //
+  // On the next tick, though, never inside the caller: `commit` runs inside the
+  // state machine's effect loop, and an answer delivered synchronously there
+  // re-enters the machine while a transition is still being applied.
   commit(1, 1_000);
+  ok('a sub-100ms turn does not answer inside the effect loop', resolved.length === 0);
+  await Promise.resolve();
   ok('a sub-100ms turn resolves locally', resolved.length === 1 && resolved[0].turnId === 1);
   ok('with an empty transcript', resolved[0].text === '');
   ok('and never reaches the pending queue', voice.awaiting.length === 0);
@@ -1417,6 +1480,432 @@ console.log('\nRealtime session config negotiation');
   v.langSwapped = true;
   ok('an exhausted ladder stops retrying', v.renegotiate('invalid session') === false);
   if (v.readyTimer) clearTimeout(v.readyTimer);
+}
+
+// --------------------------------------------------------------------------
+console.log('\nTopics: asked once, then we pick');
+// --------------------------------------------------------------------------
+{
+  // What the child asked for, read from their own words. This is the backstop
+  // for a responder that returns `requested_topic: null` because it judged the
+  // request too vague — vague to a schema, perfectly clear to a person.
+  ok('"change topic to something religious"', topicFrom('change topic to something religious') === 'something religious');
+  ok('"change the subject to space"', topicFrom('change the subject to space') === 'space');
+  ok('"can we read about trucks instead"', topicFrom('can we read about trucks instead') === 'trucks');
+  ok('"I want a story about dinosaurs"', topicFrom('I want a story about dinosaurs') === 'dinosaurs');
+  ok('"tell me a story about the moon"', topicFrom('tell me a story about the moon') === 'the moon');
+  ok('"how about pirates"', topicFrom('how about pirates') === 'pirates');
+  ok('a bare answer is the answer', topicFrom('dinosaurs!') === 'dinosaurs');
+  ok('filler is stripped', topicFrom('um, well, dinosaurs please') === 'dinosaurs', String(topicFrom('um, well, dinosaurs please')));
+
+  // Being handed the choice IS an answer. Treating it as a topic is what put a
+  // story "about no preference, pick any" in front of a narrator, which then
+  // asked what they meant — the second time of asking, for the child.
+  const deferrals = [
+    'no preference, pick any',
+    'you pick',
+    'anything',
+    'I don\'t mind',
+    'whatever you want',
+    'surprise me',
+    'idk',
+    'any is fine',
+    'you choose one',
+  ];
+  for (const said of deferrals) {
+    ok(`"${said}" is a deferral`, isTopicDeferral(said), JSON.stringify(said));
+    ok(`  and never becomes a topic`, topicFrom(said) === null, String(topicFrom(said)));
+  }
+
+  // ...but only when it is the whole answer. A shrug with a subject attached is
+  // a subject, and hearing only the shrug would be the second clear answer in
+  // one conversation to go unheard.
+  ok('"anything with dinosaurs" is not a deferral', !isTopicDeferral('anything with dinosaurs'));
+  ok('and keeps its subject', (topicFrom('anything with dinosaurs') ?? '').includes('dinosaurs'));
+  ok('"I don\'t mind, maybe dinosaurs" chose dinosaurs', topicFrom("I don't mind, maybe dinosaurs") === 'dinosaurs', String(topicFrom("I don't mind, maybe dinosaurs")));
+
+  // Non-answers never reach a plan.
+  ok('"no" is not a topic', cleanTopic('no') === null);
+  ok('"the" is not a topic', cleanTopic('the') === null);
+  ok('empty is not a topic', cleanTopic('   ') === null);
+  ok('punctuation alone is not a topic', cleanTopic('???') === null);
+  ok('a whole sentence is trimmed to eight words', (cleanTopic('a b c d e f g h i j k') ?? '').split(' ').length === 8);
+
+  // The resolution order: their words beat a guess, and a guess beats nothing.
+  ok(
+    'the responder wins when it named one',
+    resolveTopic({ requested: 'space', transcript: 'change topic to dinosaurs', favourite: 'cars' }) === 'space',
+  );
+  ok(
+    'their own words win over a guess',
+    resolveTopic({ requested: null, transcript: 'change topic to dinosaurs', favourite: 'cars' }) === 'dinosaurs',
+  );
+  ok(
+    'a deferral falls through to what they love',
+    resolveTopic({ requested: null, transcript: 'no preference, pick any', favourite: 'cars' }) === 'cars',
+  );
+  ok(
+    'and with nothing known, we still never ask twice',
+    resolveTopic({ requested: null, transcript: 'you pick', favourite: null }) === null,
+  );
+}
+
+// --------------------------------------------------------------------------
+console.log('\nVoice state machine: a fumbled tap never costs a turn');
+// --------------------------------------------------------------------------
+{
+  const make = (clock: () => number) => {
+    const effects: VoiceEffect[] = [];
+    const m = new VoiceMachine({
+      mode: 'STORY',
+      onEffect: (e) => effects.push(e),
+      onViolation: (v) => ok(`no invariant broken (${v.join('; ')})`, false),
+      now: clock,
+    });
+    return { m, effects };
+  };
+
+  // THE repro. The child interrupts Ollie, says something real, and then
+  // fumbles the closing tap: off, on, off, all in a moment. Every one of those
+  // is a legal event; together they used to throw the sentence away.
+  {
+    let clock = 1000;
+    const { m, effects } = make(() => clock);
+
+    m.send({ t: 'AI_SPEECH_START', utteranceId: 1, text: 'Once upon a time…', handoff: true });
+    clock = 1500;
+    m.send({ t: 'MIC_TAP' }); // barge-in
+    const spoken = m.snapshot.mic!.turnId;
+
+    clock = 6000;
+    m.send({ t: 'MIC_TAP' }); // done talking — committed
+    ok('the real turn is committed', effects.some((e) => e.t === 'close_mic' && e.commit && e.turnId === spoken));
+    ok('and is what we are waiting on', m.snapshot.pendingTurnId === spoken);
+
+    effects.length = 0;
+    clock = 6060;
+    m.send({ t: 'MIC_TAP' }); // fumble: on
+    ok('the fumble opens a new turn', m.state === 'MIC_OPEN');
+    ok(
+      'but the real turn is HELD, not dropped',
+      !effects.some((e) => e.t === 'drop_turn' && e.turnId === spoken),
+      JSON.stringify(effects),
+    );
+    ok('and the machine knows which turn it is holding', m.snapshot.superseded?.turnId === spoken);
+
+    effects.length = 0;
+    clock = 6120; // inside MIC_DOUBLE_TAP_MS
+    m.send({ t: 'MIC_TAP' }); // fumble: off
+
+    ok('a double tap gives the floor back to the held turn', m.state === 'PROCESSING');
+    ok('which is the turn they actually spoke in', m.snapshot.pendingTurnId === spoken);
+    ok('nothing is left held', m.snapshot.superseded === null);
+    ok(
+      'the empty session is the one discarded',
+      effects.some((e) => e.t === 'close_mic' && !e.commit),
+    );
+    ok(
+      'and the real turn is still waiting on its words',
+      effects.some((e) => e.t === 'arm_watchdog' && e.turnId === spoken),
+    );
+
+    // The words arrive and are acted on — the whole point.
+    effects.length = 0;
+    m.send({ t: 'TRANSCRIPT_FINAL', turnId: spoken, text: 'can we read about dinosaurs' });
+    const processed = effects.find((e) => e.t === 'process_turn');
+    ok('the sentence is answered after all', !!processed, JSON.stringify(effects));
+    ok(
+      'with exactly what the child said',
+      processed?.t === 'process_turn' && processed.text === 'can we read about dinosaurs',
+    );
+  }
+
+  // The same fumble, but the transcript beats the third tap home. It arrives
+  // while a different session holds the floor, where the table would quite
+  // correctly call it stale.
+  {
+    let clock = 1000;
+    const { m, effects } = make(() => clock);
+    m.send({ t: 'MIC_TAP' });
+    const spoken = m.snapshot.mic!.turnId;
+    clock = 5000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 5050;
+    m.send({ t: 'MIC_TAP' }); // fumble: on
+
+    effects.length = 0;
+    m.send({ t: 'TRANSCRIPT_FINAL', turnId: spoken, text: 'I want a story about trains' });
+    ok('a held turn\'s words are not acted on while somebody else has the floor', effects.length === 0);
+    ok('but they are kept', m.snapshot.superseded?.text === 'I want a story about trains');
+    ok('and the mic stays open', m.state === 'MIC_OPEN');
+
+    clock = 5100;
+    m.send({ t: 'MIC_TAP' }); // fumble: off
+    const processed = effects.find((e) => e.t === 'process_turn');
+    ok(
+      'closing the fumble delivers them immediately',
+      processed?.t === 'process_turn' && processed.text === 'I want a story about trains',
+    );
+    ok('no watchdog is armed for words we already have', !effects.some((e) => e.t === 'arm_watchdog'));
+  }
+
+  // A fumble slow enough to commit still comes back empty, and costs the same
+  // turn unless the empty transcript is caught too.
+  {
+    let clock = 1000;
+    const { m, effects } = make(() => clock);
+    m.send({ t: 'MIC_TAP' });
+    const spoken = m.snapshot.mic!.turnId;
+    clock = 5000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 5060;
+    m.send({ t: 'MIC_TAP' }); // fumble: on
+    const fumbled = m.snapshot.mic!.turnId;
+    clock = 5400; // past the double-tap window: this one commits
+    m.send({ t: 'MIC_TAP' });
+    ok('the fumbled turn was committed', m.snapshot.pendingTurnId === fumbled);
+    ok('and the real one is still held', m.snapshot.superseded?.turnId === spoken);
+
+    effects.length = 0;
+    m.send({ t: 'TRANSCRIPT_FINAL', turnId: fumbled, text: '   ' });
+    ok('an empty interruption hands the floor back', m.snapshot.pendingTurnId === spoken);
+    ok('the empty turn is dropped', effects.some((e) => e.t === 'drop_turn' && e.turnId === fumbled));
+    ok('and the real turn is not', !effects.some((e) => e.t === 'drop_turn' && e.turnId === spoken));
+  }
+
+  // The other half of the rule: a child who genuinely says something else HAS
+  // moved on, and the older turn really does go.
+  {
+    let clock = 1000;
+    const { m, effects } = make(() => clock);
+    m.send({ t: 'MIC_TAP' });
+    const first = m.snapshot.mic!.turnId;
+    clock = 5000;
+    m.send({ t: 'MIC_TAP' });
+    clock = 5500;
+    m.send({ t: 'MIC_TAP' }); // they want to say something else
+    const second = m.snapshot.mic!.turnId;
+    clock = 9000;
+    m.send({ t: 'MIC_TAP' });
+
+    effects.length = 0;
+    m.send({ t: 'TRANSCRIPT_FINAL', turnId: second, text: 'actually, dinosaurs' });
+    ok('the newer turn is processed', effects.some((e) => e.t === 'process_turn' && e.turnId === second));
+    ok('and the older one is finally dropped', effects.some((e) => e.t === 'drop_turn' && e.turnId === first));
+    ok('nothing stays held', m.snapshot.superseded === null);
+  }
+
+  // Nothing may be left held in a state that will never resolve it — that is
+  // an invariant, and these are the ways out.
+  {
+    for (const escape of ['AI_SPEECH_START', 'ERROR', 'SESSION_END', 'FLOOR_TO_CHILD'] as const) {
+      let clock = 1000;
+      const { m, effects } = make(() => clock);
+      m.send({ t: 'MIC_TAP' });
+      const held = m.snapshot.mic!.turnId;
+      clock = 5000;
+      m.send({ t: 'MIC_TAP' }); // committed, waiting on words
+      clock = 5050;
+      m.send({ t: 'MIC_TAP' }); // interrupted: the turn is now held
+      ok(`${escape}: a turn is held to start with`, m.snapshot.superseded?.turnId === held);
+
+      effects.length = 0;
+      switch (escape) {
+        case 'AI_SPEECH_START':
+          clock = 9000;
+          m.send({ t: 'MIC_TAP' }); // close first — nothing speaks over an open mic
+          m.send({ t: 'AI_SPEECH_START', utteranceId: 9, text: 'here we go', handoff: false });
+          break;
+        case 'ERROR':
+          m.send({ t: 'ERROR', message: 'stt died', from: 'stt' });
+          break;
+        case 'SESSION_END':
+          m.send({ t: 'SESSION_END' });
+          break;
+        case 'FLOOR_TO_CHILD':
+          clock = 9000;
+          m.send({ t: 'MIC_TAP' });
+          m.send({ t: 'FLOOR_TO_CHILD' });
+          break;
+      }
+      ok(`  ${escape} lets it go`, m.snapshot.superseded === null, JSON.stringify(m.snapshot.superseded));
+      ok(`  and says so`, effects.some((e) => e.t === 'drop_turn' && e.turnId === held), JSON.stringify(effects));
+      ok(`  leaving no broken invariant`, checkInvariants(m.snapshot).length === 0);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+console.log('\nPlayback: one stream, however many chunks it arrived in');
+// --------------------------------------------------------------------------
+{
+  /**
+   * Load the real worklet and drive it exactly as the audio thread would.
+   *
+   * The bug this covers cannot be seen in any single chunk: every one of them
+   * was correct PCM. It lived in the SEAMS between them — a resampler restarted
+   * per chunk, start times quantised to the output grid, silence spliced in on
+   * every underrun. A dozen of those a second is not heard as clicks, it is
+   * heard as a bad radio signal, which is how it was reported.
+   */
+  function loadPlayback(outRate: number) {
+    const source = readFileSync(
+      new URL('../public/worklets/playback-processor.js', import.meta.url),
+      'utf8',
+    );
+    class Base {
+      port = { onmessage: null as any, postMessage: (_m: unknown) => {} };
+    }
+    let Registered: any = null;
+    new Function(
+      'AudioWorkletProcessor',
+      'registerProcessor',
+      'sampleRate',
+      source,
+    )(Base, (_n: string, cls: any) => (Registered = cls), outRate);
+    return Registered;
+  }
+
+  /** Ragged on purpose: real chunks never line up with anything. */
+  const CHUNK_SIZES = [37, 401, 13, 1024, 5, 733, 128, 1999, 61];
+  /** High enough that a slip of one input sample is plainly audible. */
+  const TONE_HZ = 1500;
+  const AMPLITUDE = 0.8;
+  const INPUT_SAMPLES = 24000; // one second at 24kHz
+
+  function render(outRate: number) {
+    const Proc = loadPlayback(outRate);
+    const p = new Proc({ processorOptions: { inputSampleRate: 24000, jitterSec: 0.02 } });
+
+    // A cosine, so the very first sample is loud: it marks where playback
+    // begins, which is what the ideal signal below is lined up against.
+    const input = new Float32Array(INPUT_SAMPLES);
+    for (let i = 0; i < INPUT_SAMPLES; i++) {
+      input[i] = AMPLITUDE * Math.cos((2 * Math.PI * TONE_HZ * i) / 24000);
+    }
+
+    const out: number[] = [];
+    const quantum = new Float32Array(128);
+    let fed = 0;
+    let size = 0;
+
+    // Feed and render in lockstep, so the buffer really does run down and the
+    // underrun path is exercised rather than being outrun by a big prefill.
+    for (let step = 0; step < 400; step++) {
+      if (fed < INPUT_SAMPLES) {
+        const n = Math.min(CHUNK_SIZES[size++ % CHUNK_SIZES.length], INPUT_SAMPLES - fed);
+        const chunk = input.slice(fed, fed + n);
+        p.port.onmessage({ data: { type: 'samples', buffer: chunk.buffer } });
+        fed += n;
+      }
+      quantum.fill(0);
+      p.process([], [[quantum]]);
+      for (let i = 0; i < quantum.length; i++) out.push(quantum[i]);
+    }
+    return out;
+  }
+
+  for (const rate of [48000, 44100]) {
+    const out = render(rate);
+    const step = 24000 / rate;
+
+    // Trim the lead-in and the tail rather than measuring them: a stream that
+    // has not started and one that has ended are silence on purpose. Silence
+    // BETWEEN them is a dropout, and that is what this is looking for.
+    const first = out.findIndex((v) => Math.abs(v) > 1e-6);
+    let last = out.length - 1;
+    while (last > first && Math.abs(out[last]) < 1e-6) last--;
+    const played = last - first + 1;
+
+    // Compare against the tone this SHOULD be, resampled once, continuously.
+    // Not a spot check on the seams — a measurement of the whole signal, which
+    // is what "clean and smooth" actually means. A resampler that restarts per
+    // chunk, a read phase that resets, a dropped or duplicated sample: each
+    // shows up here as error energy however tidy the waveform looks locally.
+    let signal = 0;
+    let noise = 0;
+    let worstStep = 0;
+    for (let j = 0; j < played; j++) {
+      const ideal = AMPLITUDE * Math.cos((2 * Math.PI * TONE_HZ * (j * step)) / 24000);
+      const delta = out[first + j] - ideal;
+      signal += ideal * ideal;
+      noise += delta * delta;
+      if (j > 0) worstStep = Math.max(worstStep, Math.abs(out[first + j] - out[first + j - 1]));
+    }
+    const snr = 10 * Math.log10(signal / Math.max(noise, 1e-30));
+
+    // What linear interpolation alone costs on this tone is ~37dB. Anything
+    // structurally wrong lands tens of dB below that.
+    ok(`${rate}Hz: the voice is the voice, not an approximation of it`, snr > 30, `${snr.toFixed(1)}dB`);
+    ok(
+      `${rate}Hz: every sample arrives, none twice`,
+      Math.abs(played - Math.round(INPUT_SAMPLES / step)) <= 4,
+      `${played} played, ${Math.round(INPUT_SAMPLES / step)} expected`,
+    );
+    // A gap or a click steps further in one sample than the tone ever can.
+    const ceiling = ((2 * Math.PI * TONE_HZ) / rate) * AMPLITUDE * 2;
+    ok(
+      `${rate}Hz: no gap or click inside it`,
+      worstStep <= ceiling,
+      `worst step ${worstStep.toFixed(5)} vs ceiling ${ceiling.toFixed(5)}`,
+    );
+    ok(
+      `${rate}Hz: nothing clips`,
+      out.every((v) => Math.abs(v) <= AMPLITUDE + 0.01),
+    );
+  }
+
+  // Barge-in drops everything queued, and does not leave the reader pointing
+  // into audio that is no longer there.
+  {
+    const Proc = loadPlayback(48000);
+    const p = new Proc({ processorOptions: { inputSampleRate: 24000, jitterSec: 0.02 } });
+    const filled = new Float32Array(4800).fill(0.5);
+    p.port.onmessage({ data: { type: 'samples', buffer: filled.buffer } });
+
+    const quantum = new Float32Array(128);
+    p.process([], [[quantum]]);
+    ok('audio is playing before the barge-in', quantum.some((v) => v !== 0));
+
+    const levels: any[] = [];
+    p.port.postMessage = (m: any) => levels.push(m);
+
+    p.port.onmessage({ data: { type: 'flush', seq: 7 } });
+    quantum.fill(1);
+    p.process([], [[quantum]]);
+    ok('a flush silences it in one quantum', quantum.every((v) => v === 0));
+    ok('and reports an empty queue', levels.at(-1)?.buffered === 0, JSON.stringify(levels.at(-1)));
+    // The main thread drops any report that predates the flush it is holding,
+    // so a level measured before a barge-in cannot restore a queue that is gone.
+    ok('stamped with the flush it belongs to', levels.at(-1)?.flushSeq === 7);
+
+    // And it still works afterwards: a barge-in is not a teardown.
+    const again = new Float32Array(4800).fill(0.25);
+    p.port.onmessage({ data: { type: 'samples', buffer: again.buffer } });
+    quantum.fill(0);
+    p.process([], [[quantum]]);
+    ok('and the next utterance plays normally', quantum.some((v) => Math.abs(v - 0.25) < 1e-6));
+  }
+
+  // An utterance can arrive far faster than it plays — TTS streams ahead of
+  // real time — so the buffer has to grow rather than drop a word.
+  {
+    const Proc = loadPlayback(48000);
+    const p = new Proc({ processorOptions: { inputSampleRate: 24000, jitterSec: 0.12 } });
+    const thirtySeconds = 24000 * 30;
+    for (let i = 0; i < thirtySeconds; i += 4096) {
+      const chunk = new Float32Array(Math.min(4096, thirtySeconds - i)).fill(0.3);
+      p.port.onmessage({ data: { type: 'samples', buffer: chunk.buffer } });
+    }
+    let level = -1;
+    p.port.postMessage = (m: any) => {
+      if (m?.type === 'level') level = m.buffered;
+    };
+    const quantum = new Float32Array(128);
+    for (let i = 0; i < 8; i++) p.process([], [[quantum]]);
+    ok('thirty seconds of speech is held, not truncated', level > 24000 * 29, String(level));
+    ok('and it is playing', quantum.every((v) => Math.abs(v - 0.3) < 1e-6));
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
