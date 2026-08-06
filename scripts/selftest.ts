@@ -17,6 +17,7 @@ import { pickPraiseWord, mentionsWord } from '../lib/praise';
 import { sanitizeAcknowledgment, summarizeReading } from '../lib/ack';
 import { branchUtterance, looksMistranscribed } from '../lib/conversation';
 import { cleanTopic, isTopicDeferral, resolveTopic, topicFrom } from '../lib/topics';
+import { actOn, asksSomething, decideTurn, STALL_TURNS, type TurnPurpose } from '../lib/turns';
 import {
   VoiceMachine,
   transition,
@@ -1905,6 +1906,275 @@ console.log('\nPlayback: one stream, however many chunks it arrived in');
     for (let i = 0; i < 8; i++) p.process([], [[quantum]]);
     ok('thirty seconds of speech is held, not truncated', level > 24000 * 29, String(level));
     ok('and it is playing', quantum.every((v) => Math.abs(v - 0.3) < 1e-6));
+  }
+}
+
+// --------------------------------------------------------------------------
+console.log('\nTurn purpose: an answer is not a new conversation');
+// --------------------------------------------------------------------------
+{
+  const passage = 'Red is at the net.';
+  const decide = (text: string, purpose: TurnPurpose, turnsWithoutProgress = 0) =>
+    decideTurn({ text, purpose, passage, turnsWithoutProgress });
+
+  // THE bug, in one assertion. "Sure" said into a turn we asked for is a yes;
+  // said into a reading turn it is a child talking to us. Same word, same
+  // passage, different turn — and only the purpose can tell them apart.
+  ok('"sure" answers a question', decide('Sure,', 'ANSWER').yesNo === 'yes');
+  ok('  and is recognised as an answer', decide('Sure,', 'ANSWER').kind === 'answer');
+  ok('"yeah" too', decide('Yeah,', 'ANSWER').yesNo === 'yes');
+  ok('"yes, let\'s go" too', decide("Yes, let's go.", 'ANSWER').yesNo === 'yes');
+  ok('and "no" is taken at face value', decide('No,', 'ANSWER').yesNo === 'no');
+  ok(
+    'the same word in a READING turn is not an answer',
+    decide('Sure,', 'READ').kind !== 'answer',
+  );
+
+  // An answer is never matched against the line. It shares no words with any
+  // line ever written, which is exactly why it looped.
+  ok('an answer is never scored', decide('Sure,', 'ANSWER').kind === 'answer');
+
+  // Choosing to read instead of answering is an answer too — the best one.
+  const readInstead = decide('Red is at the net', 'ANSWER');
+  ok('reading instead of answering counts as reading', readInstead.kind === 'reading', readInstead.reason);
+  // ...but only on strong evidence. "Yes please" must not be scored as a misread.
+  ok('a plain yes is not mistaken for reading', decide('yes please', 'ANSWER').kind === 'answer');
+
+  // A misread in a reading turn stays reading. "Dad" for "Red" on a short line
+  // drops overlap below the conversation threshold, and answering it is how a
+  // session ends up discussing a word instead of teaching it.
+  const misread = decideTurn({
+    text: 'Dad is at the net',
+    purpose: 'READ',
+    passage,
+    turnsWithoutProgress: 0,
+  });
+  ok('a misread stays reading', misread.kind === 'reading', JSON.stringify(misread));
+
+  // Reading ahead onto the next line is reading, not an aside. This is the
+  // observed entry point: coverage of the line is high, overlap is low, and
+  // only coverage can tell those apart.
+  const ahead = decideTurn({
+    text: 'Dad is at the net. Ted and Subham hop and grind',
+    purpose: 'READ',
+    passage,
+    turnsWithoutProgress: 0,
+  });
+  ok('reading ahead is reading', ahead.kind === 'reading', JSON.stringify(ahead));
+
+  // A real request still gets out of the line, in any turn.
+  const bored = decideTurn({
+    text: 'I am bored can we do cars instead',
+    purpose: 'READ',
+    passage,
+    turnsWithoutProgress: 0,
+  });
+  ok('a real request still breaks out', bored.kind === 'conversation', JSON.stringify(bored));
+
+  // A question mark is what makes a reply an obligation.
+  ok('a question obliges an answer', asksSomething('Should we keep reading?'));
+  ok('a statement does not', !asksSomething("Let's keep reading."));
+}
+
+// --------------------------------------------------------------------------
+console.log('\nSession loop: it always, eventually, hands over a line to read');
+// --------------------------------------------------------------------------
+{
+  /**
+   * Drive the REAL policy — `decideTurn` + `actOn`, the same two functions the
+   * session dispatches over — across a whole conversation.
+   *
+   * Every bug this project has shipped was a sequence bug. Not one of them was
+   * a function misbehaving: in the livelock that prompted this, every single
+   * decision was locally correct and the aggregate ran forever. A component
+   * test cannot see that, which is why component tests did not.
+   *
+   * The adversary here is deliberately the worst case, and it is not a straw
+   * man — it is what was observed: a responder that ends every reply with a
+   * question, and a child who agrees to all of them.
+   */
+  interface Sim {
+    /** What Ollie said last, and whether it obliged an answer. */
+    turns: number;
+    replies: number;
+    longestReplyRun: number;
+    gaveLine: boolean;
+    brokeStall: boolean;
+    everRead: boolean;
+    /** Replies spent before the session first put the line back in front of them. */
+    repliesBeforeLine: number;
+  }
+
+  function run(
+    childSays: (turn: number, expecting: TurnPurpose) => string,
+    opts: { alwaysAsks: boolean; maxTurns?: number; startAs?: TurnPurpose },
+  ): Sim {
+    const passage = 'Red is at the net.';
+    let expecting: TurnPurpose = opts.startAs ?? 'READ';
+    let turnsWithoutProgress = 0;
+    let replyRun = 0;
+    const sim: Sim = {
+      turns: 0,
+      replies: 0,
+      longestReplyRun: 0,
+      gaveLine: false,
+      brokeStall: false,
+      everRead: false,
+      repliesBeforeLine: 0,
+    };
+
+    for (let turn = 0; turn < (opts.maxTurns ?? 30); turn++) {
+      sim.turns++;
+      const text = childSays(turn, expecting);
+      turnsWithoutProgress += 1;
+
+      const decision = decideTurn({ text, purpose: expecting, passage, turnsWithoutProgress });
+      const outcome = actOn(decision);
+
+      if (outcome.t === 'reply') {
+        sim.replies++;
+        if (!sim.gaveLine) sim.repliesBeforeLine++;
+        replyRun++;
+        sim.longestReplyRun = Math.max(sim.longestReplyRun, replyRun);
+        // The model writes the words; the code reads whether they obliged an
+        // answer. This is the exact seam the session now enforces.
+        expecting = opts.alwaysAsks ? 'ANSWER' : 'READ';
+        continue;
+      }
+
+      replyRun = 0;
+
+      if (outcome.t === 'score') {
+        // Reading only clears the counter when the cursor actually moves.
+        sim.everRead = true;
+        turnsWithoutProgress = 0;
+        expecting = 'READ';
+        continue;
+      }
+      if (outcome.t === 'give_line') {
+        sim.gaveLine = true;
+        expecting = 'READ';
+        // Being handed the line is not progress; reading it is.
+        continue;
+      }
+      if (outcome.t === 'break_stall') {
+        sim.brokeStall = true;
+        turnsWithoutProgress = 0;
+        expecting = 'READ';
+        continue;
+      }
+      if (outcome.t === 'check_in' || outcome.t === 'wait') {
+        expecting = 'ANSWER';
+        continue;
+      }
+    }
+    return sim;
+  }
+
+  // The observed session, exactly: Ollie asks, the child agrees, forever.
+  //
+  // The nine transcripts below are the real ones, in order, from the log that
+  // prompted this work. Under the old routing every one of them was a fresh
+  // conversation with a question for an answer.
+  {
+    const agreeable = ['Sure,', 'Sure,', 'Sure,', 'Sure,', 'Yeah,', 'You Yeah,', "Yes, let's go."];
+    const sim = run((t) => agreeable[Math.min(t, agreeable.length - 1)], {
+      alwaysAsks: true,
+      startAs: 'ANSWER',
+      maxTurns: 9,
+    });
+    ok('the FIRST agreement is acted on, not discussed', sim.repliesBeforeLine === 0, JSON.stringify(sim));
+    ok('and it reaches a line straight away', sim.gaveLine, JSON.stringify(sim));
+    // One reply across nine turns, not nine. The one that remains is honest:
+    // it is the child saying "sure" again AFTER being handed the line, which
+    // really is them talking rather than reading.
+    ok('nine agreements do not make nine questions', sim.replies <= 1, `${sim.replies} replies`);
+  }
+
+  // The harder case: a child whose answers are NOT plain yes or no, and a
+  // responder that keeps asking. Nothing here can read the child, so the only
+  // thing that can end it is the counter.
+  {
+    const sim = run(() => 'the blue one I think maybe', { alwaysAsks: true, startAs: 'ANSWER' });
+    ok('an unreadable answer is still answered', sim.replies > 0);
+    ok(
+      'but never more than twice in a row',
+      sim.longestReplyRun <= STALL_TURNS,
+      `${sim.longestReplyRun} replies in a row`,
+    );
+    ok('and the loop is broken deterministically', sim.gaveLine || sim.brokeStall, JSON.stringify(sim));
+  }
+
+  // Pure noise, for thirty turns. Must still terminate into a reading turn.
+  {
+    const sim = run(() => 'mmm', { alwaysAsks: true });
+    ok('even babble reaches a line', sim.gaveLine || sim.brokeStall, JSON.stringify(sim));
+    ok('and never runs away with replies', sim.longestReplyRun <= STALL_TURNS);
+  }
+
+  // A child who actually reads is never interrupted by any of this.
+  {
+    const sim = run(() => 'Red is at the net', { alwaysAsks: false });
+    ok('a child who reads is left alone', sim.replies === 0 && sim.everRead, JSON.stringify(sim));
+    ok('and is never handed a stall-breaker', !sim.brokeStall && !sim.gaveLine);
+  }
+
+  // The invariant, over every mixture of the things a five-year-old says.
+  // Not a scenario — a search. If any sequence can produce a third reply in a
+  // row, this finds it.
+  {
+    const vocabulary = [
+      'Sure,',
+      'No,',
+      'yes',
+      'mmm',
+      'Red is at the net',
+      'Dad is at the net',
+      'I am bored can we do cars instead',
+      'the blue one I think maybe',
+      '',
+      'Dad is at the net. Ted and Subham hop and grind',
+    ];
+    let worstRun = 0;
+    let stuck: string[] | null = null;
+    let neverGotAnywhere: string[] | null = null;
+
+    // Every sequence of five utterances from the vocabulary above.
+    const LENGTH = 5;
+    const total = vocabulary.length ** LENGTH;
+    for (let n = 0; n < total; n++) {
+      const script: string[] = [];
+      let k = n;
+      for (let i = 0; i < LENGTH; i++) {
+        script.push(vocabulary[k % vocabulary.length]);
+        k = Math.floor(k / vocabulary.length);
+      }
+      const sim = run((t) => script[t % script.length], {
+        alwaysAsks: true,
+        startAs: 'ANSWER',
+        maxTurns: 15,
+      });
+      // Termination, the property that actually matters: within fifteen turns
+      // every conversation reaches a line to read or is broken out of by the
+      // counter. A sequence that does neither is a livelock, and this is where
+      // one would surface.
+      if (!sim.everRead && !sim.brokeStall && !sim.gaveLine) neverGotAnywhere = script;
+      if (sim.longestReplyRun > worstRun) {
+        worstRun = sim.longestReplyRun;
+        stuck = script;
+      }
+    }
+
+    ok(
+      `no sequence of ${LENGTH} (${total.toLocaleString()} tried) can loop the model`,
+      worstRun <= STALL_TURNS,
+      `worst run ${worstRun} on ${JSON.stringify(stuck)}`,
+    );
+    ok(
+      'and every one of them reaches a line to read',
+      neverGotAnywhere === null,
+      `stuck on ${JSON.stringify(neverGotAnywhere)}`,
+    );
   }
 }
 

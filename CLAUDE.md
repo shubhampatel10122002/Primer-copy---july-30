@@ -23,6 +23,7 @@ mode and asked for words.
 | `server/tts.ts` | The VOICE: `/v1/audio/speech`, streamed PCM, cancellable. Verbatim, no opinion. |
 | `lib/leniency.ts` | Developmental-speech table. Extend this during kid testing. |
 | `lib/conversation.ts` | Was that reading, talking, or both? That is all it does now — "have they finished?" and the echo guard went with the button. |
+| `lib/turns.ts` | **What is the child's turn FOR, and what do we do about it?** The loop policy, pure. Read before touching anything that asks a question. |
 | `lib/facts.ts` | What the child told us today, and which beat may use it. |
 | `lib/sessionflow.ts` | When to check in, what progress to celebrate, was that a yes. |
 | `lib/topics.ts` | What did they ask the story to be about, and was that "you pick". |
@@ -129,6 +130,39 @@ mode and asked for words.
 - **A detail the child shares never lands in the very next sentence.**
   `lib/facts.ts` owns the delay; the narrator is only told what to say, and only
   once a beat is cleared to use it.
+- **A question is a decision, not words.** The LLM writes the reply and may end
+  it with a question — its prompt asks it to — so `asksSomething` reads that off
+  the words BEFORE the floor moves, and the turn is handed over as `ANSWER`
+  rather than `READ`. Without it the answer came back as a brand-new
+  conversation, was matched against a line it shared no words with, and went
+  back to the responder, which asked again. Nine turns of a child saying "sure"
+  to seven rephrasings of one question. The model could see it was repeating
+  itself and said so; leaving was never its decision to make.
+- **Every hand-over of the floor declares what the turn is for.**
+  `speak({ handoff })` takes a `TurnPurpose | null` and `handFloorToChild` takes
+  one too — between them the only two ways a child ever gets a turn, so an
+  undeclared turn cannot be constructed. Same trick as `autoCloseArmed`: decided
+  at the one moment it is knowable, never re-derived. An `ANSWER` turn is read by
+  `parseYesNo` before any model sees it and is NEVER matched against the passage;
+  "sure" shares no words with any line ever written.
+- **Progress is counted, and a stall is broken by code.** Every other guard here
+  — `MAX_LOST_TURNS`, `ADAPT_COACH_THRESHOLD`, `MAX_SOCRATIC_QUESTIONS`, the idle
+  ladder — guards one *named* failure, which is why an unnamed one ran forever.
+  `turnsWithoutProgress` counts turns where the passage cursor did not move, and
+  only scoring clears it. At `STALL_TURNS` the session stops asking and says a
+  templated line with no question in it; at `STALL_ESCALATE` it moves the story
+  on and flags a grown-up. `reply` is the only outcome that can reach the model,
+  which is what makes termination provable instead of hoped for.
+- **`overlap` and `coverage` answer different questions.** How much of what they
+  SAID was the line, versus how much of the LINE they said. Only ever asking the
+  first is why reading ahead onto the next line — which five-year-olds do
+  constantly — scored like a child talking and got answered as conversation.
+- **A single cue word mid-line is a misreading, not a child calling out.** A
+  child read "Red is at the net" as "Dad is at the net"; `dad` is in
+  `CONVERSATION_CUES`, so one substituted word turned an ordinary misread into an
+  interruption and the session discussed it instead of teaching it. A cue sitting
+  where a passage word belongs, with the line read correctly around it, is a
+  substitution. A cue at the END still means what it says.
 - **What they want the story to be about is asked ONCE, then chosen.**
   `lib/topics.ts` reads the subject out of the child's own words when the
   responder returns `requested_topic: null`, treats "you pick" as an ANSWER
@@ -153,14 +187,24 @@ your project which audio models it can actually use (the names move faster than
 any document), connects the ears, speaks a line, and cancels one mid-sentence.
 Far easier to read than the same failure buried in a live session.
 
-Run `npm run selftest` after touching `voice/machine.ts`, `tracker.ts`,
-`leniency.ts`, `pedagogy.ts`, `skills.ts`, `conversation.ts`, `topics.ts`,
-`facts.ts`, `sessionflow.ts`, `profile.ts`, or
+Run `npm run selftest` after touching `voice/machine.ts`, `turns.ts`,
+`tracker.ts`, `leniency.ts`, `pedagogy.ts`, `skills.ts`, `conversation.ts`,
+`topics.ts`, `facts.ts`, `sessionflow.ts`, `profile.ts`, or
 `public/worklets/playback-processor.js` — those files carry the behaviour that is
 hardest to eyeball and easiest to break. The voice machine's suite covers the
 transition table's totality, both mutual-exclusion directions, mid-sentence
 barge-in, the manual-interruption override, auto-open/auto-close, rapid double
 taps, the held-turn rescue and every stale-message race.
+
+**Every bug this project has shipped was a sequence bug.** Not one was a
+function misbehaving — in the livelock above, every individual decision was
+locally correct and the aggregate ran forever. Component tests cannot see that,
+which is why component tests did not. So the loop policy is pure (`decideTurn` +
+`actOn`, the same two functions `routeTurn` dispatches over) and the self-test
+drives it across ~100,000 scripted conversations, asserting the two things no
+unit test can: the model is never asked to reply more than `STALL_TURNS` times
+in a row, and every conversation reaches a line to read. Add a scenario there
+before adding a guard here.
 
 The playback worklet is tested by rendering a tone through it in ragged chunks
 and measuring the result against the tone it should be — the only kind of test

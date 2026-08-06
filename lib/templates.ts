@@ -82,6 +82,33 @@ export const whatWouldYouLikeLine = (favourite: string | null): string =>
         `Okay! You pick. What should we make the story about?`,
       ]);
 
+/**
+ * Break a stall. Says something warm and then gets out of the way.
+ *
+ * NEVER a question — that is the entire point of it, and the reason these are
+ * templated rather than generated. A session that has spent two turns going
+ * nowhere got there by asking, and the model cannot be relied on not to ask
+ * again: it can see it is repeating itself and still does, because choosing to
+ * stop is not a choice about words.
+ */
+export const backToTheLineLine = (firstWord: string | null): string => {
+  const clean = (firstWord ?? '').replace(/[^a-zA-Z']/g, '');
+  return clean
+    ? pick([
+        `Let's read it together. Your line starts with "${clean}".`,
+        `Here we go — start us off with "${clean}".`,
+        `I'm listening. Off you go, starting with "${clean}".`,
+      ])
+    : pick([`Here we go — your turn to read!`, `I'm listening. Off you go!`]);
+};
+
+/** The stall outlasted talking about it. Move the story and say so, warmly. */
+export const movingOnLine = (): string =>
+  pick([
+    `Let's try a different bit — I've got a good one coming up.`,
+    `I'll bring us something new. Here it comes!`,
+  ]);
+
 /** Instant reply to "yes, keep reading" while the next beats are being written. */
 export const keepGoingLine = (): string =>
   pick([`Yes! Let's keep going.`, `Wonderful — more story it is!`, `Yay! Here comes more.`]);

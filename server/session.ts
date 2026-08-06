@@ -8,7 +8,8 @@ import { generateAcknowledgment } from '../lib/llm/acknowledge';
 import { OnboardingAgent } from '../lib/llm/onboarding';
 import { pickTargets } from '../lib/pedagogy';
 import { pickPraiseWord } from '../lib/praise';
-import { branchUtterance, looksMistranscribed } from '../lib/conversation';
+import { looksMistranscribed } from '../lib/conversation';
+import { actOn, asksSomething, decideTurn, STALL_ESCALATE, type TurnPurpose } from '../lib/turns';
 import { cleanTopic, resolveTopic } from '../lib/topics';
 import { FactLedger, mergeFactsIntoMemory, type FactKind } from '../lib/facts';
 import {
@@ -238,6 +239,27 @@ export class Session {
   private lastCheckInAt = Date.now();
   private checkIns = 0;
 
+  /**
+   * What the child's next turn is FOR, and the question it answers.
+   *
+   * Set only by `expect`, which is reached only by handing the floor over, so a
+   * turn cannot exist without a declared purpose. `lib/turns.ts` explains why
+   * that matters: a question the state machine does not know about is a
+   * conversational obligation nobody is holding, and its answer comes back as a
+   * brand new conversation. Nine times, in one observed session.
+   */
+  private expecting: TurnPurpose = 'FREE';
+  private outstandingQuestion: string | null = null;
+
+  /**
+   * Turns since the child last moved forward through a passage.
+   *
+   * The general stall guard. Every other counter here — lostTurns,
+   * coachEventsThisPassage, socraticCount, nudgeStage — guards a specific named
+   * failure, which is why an unnamed one ran forever.
+   */
+  private turnsWithoutProgress = 0;
+
   /** Set when something is waiting for the child's next turn (onboarding, check-in). */
   private awaitingReply: ((text: string | null) => void) | null = null;
   private replyTimeout: NodeJS.Timeout | null = null;
@@ -375,7 +397,7 @@ export class Session {
     this.setMode('NARRATE', fresh ? 'making their story' : 'greeting');
     // No handoff: the story's first beat follows immediately, so the floor
     // stays with Ollie right through the greeting and into narration.
-    const greeting = this.speak(handoff, { handoff: false });
+    const greeting = this.speak(handoff, { handoff: null });
 
     // Resolve the plan while the greeting is playing.
     const planning = (async (): Promise<SessionPlan> => {
@@ -455,7 +477,7 @@ export class Session {
 
     // Something friendly before the first round-trip, for the same reason the
     // returning-child greeting is templated: silence at the start reads as broken.
-    await this.speak(T.helloStrangerLine(), { handoff: false });
+    await this.speak(T.helloStrangerLine(), { handoff: null });
 
     let heard: string | null = null;
     let silences = 0;
@@ -495,7 +517,7 @@ export class Session {
 
       // Onboarding is manual at both ends (the interaction spec), so nothing
       // here ever opens the mic — the child does, when they are ready.
-      await this.speak(line, { handoff: false });
+      await this.speak(line, { handoff: null });
       lastSaid = line;
       if (this.closed) return '';
 
@@ -681,6 +703,32 @@ export class Session {
     });
   }
 
+  /**
+   * Declare what the child's next turn is for.
+   *
+   * The ONE place `expecting` is written. Reached from `speak({ handoff })` and
+   * from `handFloorToChild`, which between them are the only two ways a child
+   * ever gets a turn — so there is no path to an undeclared one.
+   */
+  private expect(purpose: TurnPurpose, question?: string | null) {
+    this.expecting = purpose;
+    // Kept so the answer is not read in a vacuum. The responder was writing
+    // replies to "sure" with no idea what "sure" was agreeing to.
+    this.outstandingQuestion = purpose === 'ANSWER' ? (question?.trim() || null) : null;
+    this.debug('expecting', { purpose, question: this.outstandingQuestion });
+  }
+
+  /**
+   * Hand the floor over without speaking first, saying what the turn is for.
+   *
+   * Replaces every bare `FLOOR_TO_CHILD`. A hand-over is the moment the purpose
+   * is knowable and the last moment it is knowable, so it is declared here.
+   */
+  private handFloorToChild(purpose: TurnPurpose, question?: string | null) {
+    this.expect(purpose, question);
+    this.machine.send({ t: 'FLOOR_TO_CHILD' });
+  }
+
   /** Which turn-taking dimension the pedagogical mode implies. */
   private voiceModeFor(mode: Mode): VoiceMode {
     return mode === 'ONBOARDING' || mode === 'IDLE' ? 'ONBOARDING' : 'STORY';
@@ -767,12 +815,14 @@ export class Session {
       // Stop. Say so, once, in words a child can act on, and then wait.
       this.send({ t: 'flag', type: 'needs_help', detail: `${this.lostTurns} turns produced no transcript` });
       await this.flag('needs_help', 'transcription is not returning anything');
-      await this.speak(T.cannotHearLine(), { handoff: false });
+      await this.speak(T.cannotHearLine(), { handoff: null });
       return;
     }
 
-    await this.speak(T.didNotCatchLine(), { handoff: false });
-    this.machine.send({ t: 'FLOOR_TO_CHILD' });
+    await this.speak(T.didNotCatchLine(), { handoff: null });
+    // Whatever they say next is fair game: they are repeating themselves, and
+    // we do not know whether the lost turn was reading or talking.
+    this.handFloorToChild('FREE');
   }
 
   /**
@@ -803,6 +853,12 @@ export class Session {
     this.turnText.delete(turnId);
     this.lastTurnAt = Date.now();
     this.nudgeStage = 0;
+
+    // Counted BEFORE the turn is acted on, and cleared by `onWords` the moment
+    // the cursor actually moves. Anything else — an answer, an aside, a silent
+    // turn — leaves it climbing, which is the point: this counter measures the
+    // one thing the session is for, and nothing else resets it.
+    this.turnsWithoutProgress += 1;
 
     // They took a turn and said nothing in it. Not an error and not worth a
     // reply: let the idle ladder offer help if it keeps happening.
@@ -858,52 +914,133 @@ export class Session {
       // Mid-passage this was almost certainly them reading it, so treat it as
       // reading and let scoring have the last word.
       if (this.tracker && !this.tracker.isComplete()) await this.afterReadingTurn();
-      else this.machine.send({ t: 'FLOOR_TO_CHILD' });
+      else this.handFloorToChild('FREE');
       return;
     }
 
-    const branch = branchUtterance({ text, passage: this.tracker?.passage ?? null });
-    this.debug('branch', {
+    // What was that turn? Decided by what the turn was FOR, not by the words
+    // alone — see lib/turns.ts. An answer to our own question is read plainly
+    // and never compared against the line.
+    const decision = decideTurn({
       text,
-      kind: branch.kind,
-      overlap: Number(branch.overlap.toFixed(2)),
-      reason: branch.reason,
+      purpose: this.expecting,
+      passage: this.tracker?.passage ?? null,
+      turnsWithoutProgress: this.turnsWithoutProgress,
+    });
+    this.debug('turn', {
+      text,
+      purpose: this.expecting,
+      kind: decision.kind,
+      yesNo: decision.yesNo,
+      stalled: decision.stalled,
+      turnsWithoutProgress: this.turnsWithoutProgress,
+      reason: decision.reason,
     });
 
-    // They read the line. Scoring already has the audio; what happens next —
-    // coach, celebrate, or carry on — is decided once, in afterReadingTurn.
-    if (branch.kind === 'reading') {
-      this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
-      await this.afterReadingTurn();
-      return;
-    }
+    // What to DO about it, decided by the same pure policy the self-test drives
+    // over thousands of scripted conversations. Nothing below chooses; it only
+    // carries out.
+    const outcome = actOn(decision);
+    this.debug('turnOutcome', outcome);
 
-    // Mixed: they read the line AND said something in the middle of it. The
-    // reading half is already scored; answer the half that was aimed at us.
-    const said = branch.kind === 'mixed' ? branch.conversationText : text;
-    if (!said.trim()) {
-      this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
-      return;
+    switch (outcome.t) {
+      case 'wait':
+        this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
+        return;
+
+      // Scoring already has the audio; what happens next — coach, celebrate, or
+      // carry on — is decided once, in afterReadingTurn.
+      case 'score':
+        this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
+        await this.afterReadingTurn();
+        return;
+
+      case 'check_in':
+        this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: true });
+        this.log('child_talk', decision.said);
+        await this.checkIn('they said no');
+        return;
+
+      // Agreement, or a conversation that has gone round twice. Either way the
+      // answer is the same and it is not a sentence: give them the line.
+      case 'give_line':
+        this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: true });
+        this.log('child_talk', decision.said);
+        this.send({ t: 'talk_closed', transcript: decision.said, intent: 'chitchat' });
+        if (this.tracker && !this.tracker.isComplete()) {
+          if (decision.stalled) {
+            await this.speak(T.backToTheLineLine(this.currentWord()), { handoff: 'READ' });
+          } else {
+            this.resumeReading();
+          }
+        } else {
+          await this.nextBeat();
+        }
+        return;
+
+      case 'break_stall':
+        this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: true });
+        await this.breakStall(outcome.why);
+        return;
+
+      case 'reply':
+        break;
     }
 
     // Nothing to answer with yet — still onboarding or still planning. Hold it
     // so the next thing that listens picks it up instead of losing it.
     if (!this.plan || !this.narrator) {
-      this.pendingSpeech = said;
+      this.pendingSpeech = outcome.said;
       this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: false });
       return;
     }
 
     this.machine.send({ t: 'RESPONSE_READY', turnId, willSpeak: true });
 
-    // Mixed means the reading half of the same breath still needs an answer of
-    // its own, so the aside is handled WITHOUT giving the floor back yet.
-    const mixed = branch.kind === 'mixed';
-    await this.handleChildSpeech(said, mixed ? 'aside' : 'off_script', { holdFloor: mixed });
+    // `alsoScore` means the reading half of the same breath still needs an
+    // answer of its own, so the aside is handled WITHOUT giving the floor back.
+    const mixed = outcome.alsoScore;
+    await this.handleChildSpeech(outcome.said, mixed ? 'aside' : 'off_script', { holdFloor: mixed });
 
     if (mixed && !this.closed && (this.mode === 'CHILD_READS' || this.mode === 'COACH')) {
       await this.afterReadingTurn();
     }
+  }
+
+  /** The word they are on, for a line that has to name it. */
+  private currentWord(): string | null {
+    if (!this.tracker || this.tracker.cursor >= this.tracker.words.length) return null;
+    return this.tracker.words[this.tracker.cursor].expected;
+  }
+
+  /**
+   * Nothing is moving. Stop talking about it.
+   *
+   * Deterministic and terminal by construction: it says one templated line with
+   * no question in it, resets the counter, and hands over a reading turn — or,
+   * if even that has been tried, moves the story on and tells a grown-up. There
+   * is no branch here that can ask anything, which is the only reliable way to
+   * leave a loop made of questions.
+   */
+  private async breakStall(why: string) {
+    console.warn(`[session] breaking a stall: ${why}`);
+    this.debug('stallBroken', { why, turnsWithoutProgress: this.turnsWithoutProgress });
+    this.send({ t: 'flag', type: 'needs_help', detail: `stalled: ${why}` });
+    await this.flag('needs_help', `stalled: ${why}`);
+
+    const counted = this.turnsWithoutProgress;
+    this.turnsWithoutProgress = 0;
+
+    // Still a line in front of them, and they have not been given it plainly.
+    if (this.tracker && !this.tracker.isComplete() && counted < STALL_ESCALATE) {
+      await this.speak(T.backToTheLineLine(this.currentWord()), { handoff: 'READ' });
+      return;
+    }
+
+    // Talking about it has failed. Change what is in front of them.
+    this.discardBuffer();
+    await this.speak(T.movingOnLine(), { handoff: null });
+    await this.nextBeat();
   }
 
   /**
@@ -1007,7 +1144,7 @@ export class Session {
         // no LLM involved, so "can I hear anything at all?" is one click.
         await this.speak(
           "Hello! This is Ollie testing the sound. If you can hear me, the audio is working.",
-          { handoff: false },
+          { handoff: null },
         );
         break;
       case 'ping':
@@ -1067,11 +1204,19 @@ export class Session {
    * talking is how the app ends up explaining pronunciation to someone who just
    * asked to be finished.
    *
-   * `handoff` says whether the floor passes to the child when this ends. In
-   * story mode that is what auto-opens the mic for their reading turn; it is the
+   * `handoff` says whether the floor passes to the child when this ends, AND
+   * what their turn is then for. `null` keeps the floor. A TurnPurpose hands it
+   * over and declares the purpose in the same breath, which is the point: there
+   * is no way to give a child a turn without saying what it is for, so nobody
+   * can forget to. The same trick `autoCloseArmed` uses.
+   *
+   * In story mode this is what auto-opens the mic for their turn; it is the
    * caller's call because only the caller knows whether another line follows.
    */
-  private async speak(text: string, opts: { handoff: boolean }): Promise<boolean> {
+  private async speak(text: string, opts: { handoff: TurnPurpose | null }): Promise<boolean> {
+    // Declared BEFORE the words go out. The child can answer the instant they
+    // hear it, and a purpose set afterwards would be set after the answer.
+    if (opts.handoff) this.expect(opts.handoff, text);
     if (!text.trim() || this.closed) return false;
 
     const previous = this.speechChain;
@@ -1095,7 +1240,7 @@ export class Session {
         t: 'AI_SPEECH_START',
         utteranceId,
         text,
-        handoff: opts.handoff,
+        handoff: opts.handoff !== null,
       });
       if (outcome.rejected) {
         this.speechSettled = null;
@@ -1230,10 +1375,18 @@ export class Session {
     // screen until his voice has finished.
     if (passage && !closing && opts.after !== 'hold') this.preparePassage(passage);
 
-    // `handoff` is the whole of "the mic opens when the passage ends". It is
-    // true when the next thing that happens is the child's turn: a passage to
-    // read, or a check-in question waiting on their answer.
-    const handoff = !closing && (!!passage || opts.after === 'hold');
+    // `handoff` is the whole of "the mic opens when the passage ends", and it
+    // now carries WHAT the turn is for. A passage is a reading turn; `hold`
+    // means the caller asked something and is waiting on an answer. Getting
+    // these two the wrong way round is how an answer gets scored as a misread,
+    // or a read line gets replied to.
+    const handoff: TurnPurpose | null = closing
+      ? null
+      : passage
+        ? 'READ'
+        : opts.after === 'hold'
+          ? 'ANSWER'
+          : null;
     await this.speak(turn.speak_text, { handoff });
     if (this.closed || generation !== this.machine.generation) return;
 
@@ -1272,6 +1425,7 @@ export class Session {
     this.celebrated.clear();
     this.coachEventsThisPassage = 0;
     this.nudgeStage = 0;
+    this.turnsWithoutProgress = 0;
     this.lastTurnAt = Date.now();
 
     this.log('child_passage', passage);
@@ -1413,8 +1567,14 @@ export class Session {
     // branched separately to decide whether anything they said needs answering.
     // An aside mixed into a line comes back from Azure as Insertions, which the
     // tracker discards (§9.4/§9.6), so talking mid-line cannot corrupt a score.
+    const before = this.tracker.cursor;
     const result = this.tracker.ingest(words);
     this.debug('lastWords', this.tracker.summary());
+
+    // Forward progress through the line — the one thing that clears the stall
+    // counter. Not "the child took a turn", not "somebody said something":
+    // words on the screen actually got read.
+    if (this.tracker.cursor > before) this.turnsWithoutProgress = 0;
 
     for (const u of result.updates) {
       this.send({
@@ -1480,7 +1640,9 @@ export class Session {
       this.celebrated.add(celebrate);
       const word = this.tracker.words[celebrate];
       this.log('coach', `celebrated "${word.expected}"`, { word: word.expected });
-      await this.speak(T.gotItLine(word.expected), { handoff: !this.tracker.isComplete() });
+      await this.speak(T.gotItLine(word.expected), {
+        handoff: this.tracker.isComplete() ? null : 'READ',
+      });
     }
 
     if (this.tracker.isComplete()) {
@@ -1496,7 +1658,7 @@ export class Session {
     // They stopped part-way through with nothing to help them with. Hand the
     // floor straight back so they can carry on: making a child ask permission to
     // continue a sentence they were half-way through is absurd.
-    this.machine.send({ t: 'FLOOR_TO_CHILD' });
+    this.handFloorToChild('READ');
   }
 
   /**
@@ -1539,7 +1701,7 @@ export class Session {
 
       this.setMode('COACH', 'gave the word');
       // Only hand over if there is still something to read.
-      await this.speak(line, { handoff: !this.tracker.isComplete() });
+      await this.speak(line, { handoff: this.tracker.isComplete() ? null : 'READ' });
 
       if (this.tracker.isComplete()) {
         await this.onPassageComplete();
@@ -1557,7 +1719,7 @@ export class Session {
     // Back to the same word: `handoff` reopens the mic the moment this lands,
     // so the retry needs no press. Coaching used to interrupt them mid-line;
     // now it waits for them to finish, which is what a person would do.
-    await this.speak(line, { handoff: true });
+    await this.speak(line, { handoff: 'READ' });
 
     this.setMode('CHILD_READS');
     this.lastTurnAt = Date.now();
@@ -1696,7 +1858,7 @@ export class Session {
       if (this.closed) return null;
 
       // Nothing, or something that was neither yes nor no. Ask once more, plainly.
-      if (attempt === 0) await this.speak(T.continueRepromptLine(), { handoff: true });
+      if (attempt === 0) await this.speak(T.continueRepromptLine(), { handoff: 'ANSWER' });
     }
     return null;
   }
@@ -1707,7 +1869,7 @@ export class Session {
     // Say yes out loud before doing any work — extending the plan is an LLM call,
     // and the child has just committed to more reading.
     // More story is being written: Ollie keeps the floor through the wait.
-    await this.speak(T.keepGoingLine(), { handoff: false });
+    await this.speak(T.keepGoingLine(), { handoff: null });
 
     // Out of planned beats: extend the SAME story rather than starting a new one.
     // Premise, difficulty, target skills and must-use words all stay put — only
@@ -1816,7 +1978,7 @@ export class Session {
         this.debug('replyLatencyMs', Date.now() - askedAt);
         // The reply lands first; whatever happens next (a fixed template, a
         // resync, going back to the passage) decides who gets the floor.
-        await this.speak(speakText, { handoff: false });
+        await this.speak(speakText, { handoff: null });
         return true;
       },
     });
@@ -1873,7 +2035,25 @@ export class Session {
   ) {
     /** The reply may already be in the air — never say it twice. */
     const sayReply = async () => {
-      if (!alreadySpoken) await this.speak(reply.speakText, { handoff: false });
+      if (!alreadySpoken) await this.speak(reply.speakText, { handoff: null });
+    };
+
+    /**
+     * Hand the floor back, saying what the reply just obliged them to do.
+     *
+     * The last leak in the one rule, closed. The responder writes the words and
+     * is free to end them with a question — and until now nothing downstream
+     * knew, so the answer arrived as a brand new conversation, was matched
+     * against a line it shared no words with, and came back to the responder,
+     * which asked again. Nine times, in the session that prompted this.
+     *
+     * The model still chooses the words. Whether those words created an
+     * obligation is read off them here, in code, before the floor moves.
+     */
+    const handBack = () => {
+      if (holdFloor) return;
+      const asked = asksSomething(reply.speakText);
+      this.resumeReading(true, asked ? 'ANSWER' : 'READ', asked ? reply.speakText : null);
     };
 
     switch (intent) {
@@ -1886,8 +2066,10 @@ export class Session {
         this.log('narrator', line, { template: 'sensitive_topic' });
         // The generated reply is void here even if it has already been spoken —
         // this template is the answer, and it follows immediately.
-        await this.speak(line, { handoff: false });
-        this.resumeReading(!holdFloor);
+        await this.speak(line, { handoff: null });
+        // The comfort template is the answer, and it ends with a question of
+        // its own ("Should we find out what happens to...?").
+        if (!holdFloor) this.resumeReading(true, 'ANSWER', line);
         return;
       }
 
@@ -1908,7 +2090,7 @@ export class Session {
         this.send({ t: 'flag', type: 'needs_help', detail: transcript });
         await sayReply();
         this.resync();
-        this.resumeReading(!holdFloor);
+        handBack();
         return;
       }
 
@@ -1946,9 +2128,9 @@ export class Session {
           // answer without hunting for the button is a question we did not
           // really ask. The reply itself was spoken with the floor held.
           if (!/\?/.test(reply.speakText)) {
-            await this.speak(T.whatWouldYouLikeLine(favourite), { handoff: true });
+            await this.speak(T.whatWouldYouLikeLine(favourite), { handoff: 'ANSWER' });
           } else {
-            this.machine.send({ t: 'FLOOR_TO_CHILD' });
+            this.handFloorToChild('ANSWER', reply.speakText);
           }
 
           const said = await this.waitForReply(ANSWER_LISTEN_MS);
@@ -2022,7 +2204,7 @@ export class Session {
         this.socraticCount = this.socraticCount >= MAX_SOCRATIC_QUESTIONS ? 0 : this.socraticCount + 1;
         this.setMode('SOCRATIC', `question #${this.socraticCount}`);
         await sayReply();
-        this.resumeReading(!holdFloor);
+        handBack();
         return;
 
       case 'chitchat':
@@ -2031,14 +2213,14 @@ export class Session {
           this.debug('interestSignals', this.interestSignals);
         }
         await sayReply();
-        this.resumeReading(!holdFloor);
+        handBack();
         return;
 
       // help_with_word, unclear, and anything else: say the reply and carry on.
       // There is no branch here that stays silent.
       default:
         await sayReply();
-        this.resumeReading(!holdFloor);
+        handBack();
         return;
     }
   }
@@ -2080,9 +2262,17 @@ export class Session {
    * the mic there would refuse that line, because nothing may speak over an open
    * mic — so the caller keeps the floor and hands it over when it is done.
    */
-  private resumeReading(handOver = true) {
+  private resumeReading(handOver = true, purpose: TurnPurpose = 'READ', question?: string | null) {
     if (this.closed || this.mode === 'END') return;
-    if (!this.tracker || this.tracker.isComplete()) return;
+
+    // Nothing to go back to. The floor must STILL change hands: a reply that
+    // ends with the mic shut and nobody speaking is a session waiting to be
+    // rescued by a five-year-old finding a button, and it used to be reachable
+    // by saying anything at all after finishing a passage.
+    if (!this.tracker || this.tracker.isComplete()) {
+      if (handOver) this.handFloorToChild(purpose === 'READ' ? 'FREE' : purpose, question);
+      return;
+    }
 
     const passage = this.tracker.passage;
     if (!this.pron) {
@@ -2104,7 +2294,7 @@ export class Session {
     // Their turn again. Said out loud rather than inferred: the last thing
     // spoken here was an answer to a question, not a passage, so the utterance's
     // own handoff flag was false and something has to hand the floor over.
-    if (handOver) this.machine.send({ t: 'FLOOR_TO_CHILD' });
+    if (handOver) this.handFloorToChild(purpose, question);
   }
 
   // -------------------------------------------------------------------------
@@ -2157,13 +2347,13 @@ export class Session {
     if (idle > IDLE_PAUSE_MS && this.nudgeStage < 3) {
       this.nudgeStage = 3;
       this.setMode('PAUSED', 'nobody has taken a turn for 50s');
-      void this.speak(T.pausedLine(), { handoff: false });
+      void this.speak(T.pausedLine(), { handoff: null });
       return;
     }
     if (idle > IDLE_CHECKIN_MS && this.nudgeStage < 2) {
       this.nudgeStage = 2; // never nag more than twice
       this.send({ t: 'nudge', text: 'checking in' });
-      void this.speak(T.stillThereLine(), { handoff: true });
+      void this.speak(T.stillThereLine(), { handoff: 'ANSWER' });
       return;
     }
     if (idle > IDLE_NUDGE_MS && this.nudgeStage < 1) {
@@ -2173,7 +2363,7 @@ export class Session {
         this.send({ t: 'nudge', text: 'gentle prompt' });
         // Hands the floor back with the nudge, so a child who was waiting for
         // permission gets a live mic rather than another thing to press.
-        void this.speak(T.silenceNudge(w.expected), { handoff: true });
+        void this.speak(T.silenceNudge(w.expected), { handoff: 'READ' });
       }
       return;
     }
@@ -2256,7 +2446,7 @@ export class Session {
     // still being written. There is nothing to wrap up, so say goodbye kindly.
     if (!this.narrator) {
       await this.speak(T.goodbyeLine(this.child.name || 'friend', 'Come back and read with me soon!'), {
-        handoff: false,
+        handoff: null,
       });
       await this.finishEnd();
       return;

@@ -42,8 +42,10 @@ export interface UtteranceBranch {
   readingText: string;
   /** The words that did not — what the conversation layer has to answer. */
   conversationText: string;
-  /** Fraction of the utterance that matched the passage. */
+  /** Fraction of the UTTERANCE that was in the passage. */
   overlap: number;
+  /** Fraction of the PASSAGE the utterance got through. See below. */
+  coverage: number;
   reason: string;
 }
 
@@ -52,6 +54,38 @@ export const READING_OVERLAP = 0.6;
 
 /** At or below this, it is not about the passage at all. */
 export const CONVERSATION_OVERLAP = 0.34;
+
+/**
+ * At or above this coverage, they got through the line.
+ *
+ * `overlap` and `coverage` answer different questions, and only ever having
+ * asked the first one is a bug this file shipped with:
+ *
+ *   overlap  — how much of what they SAID was the line?
+ *   coverage — how much of the LINE did they say?
+ *
+ * A child who reads the line and keeps going onto the next one scores LOW on
+ * overlap (half of what they said is not in this line) and HIGH on coverage
+ * (they said all of it). Judged on overlap alone that is indistinguishable from
+ * a child talking to you, so reading ahead — which five-year-olds do constantly
+ * — came back as an aside and got answered as conversation. It is the opposite
+ * of an aside: it is reading, only more of it.
+ */
+export const PASSAGE_COVERED = 0.7;
+
+/**
+ * In a turn handed over FOR reading, this much of the line means they read it.
+ *
+ * A separate, lower bar than PASSAGE_COVERED, and it exists because `overlap`
+ * is a terrible judge of a child reading badly: sounding a word out, repeating
+ * themselves, or a transcript that half heard them all push it down without the
+ * child having said one word to us. What does not move is how much of the LINE
+ * turned up. Half of it means they were reading it.
+ *
+ * Not zero, which is what "any shared word at all" would mean — "the blue one I
+ * think maybe" shares "the" with half the lines in the English language.
+ */
+export const READING_TURN_COVERAGE = 0.5;
 
 /** A run of unmatched words shorter than this inside a read line is a misread. */
 export const MIN_ASIDE_TOKENS = 3;
@@ -146,11 +180,30 @@ export function looksMistranscribed(text: string): boolean {
  * `passage` is the whole line, not just the words ahead of the cursor — a child
  * re-reading something they already got right is still reading.
  */
-export function branchUtterance(args: { text: string; passage: string | null }): UtteranceBranch {
+export function branchUtterance(args: {
+  text: string;
+  passage: string | null;
+  /**
+   * Were they handed this turn to READ in?
+   *
+   * Not a hint about the words — a fact about the turn, decided by whoever gave
+   * them the floor (`lib/session/turns.ts`). It raises the bar for concluding
+   * "that was aimed at me", because in a turn that exists for reading, the prior
+   * is overwhelmingly that a noisy transcript is a child reading noisily.
+   */
+  readingExpected?: boolean;
+}): UtteranceBranch {
   const spoken = words(args.text);
 
   if (spoken.length === 0) {
-    return { kind: 'conversation', readingText: '', conversationText: '', overlap: 0, reason: 'nothing heard' };
+    return {
+      kind: 'conversation',
+      readingText: '',
+      conversationText: '',
+      overlap: 0,
+      coverage: 0,
+      reason: 'nothing heard',
+    };
   }
 
   // Nothing to read means there is nothing to compare against: it is all talking.
@@ -160,6 +213,7 @@ export function branchUtterance(args: { text: string; passage: string | null }):
       readingText: '',
       conversationText: args.text.trim(),
       overlap: 0,
+      coverage: 0,
       reason: 'no passage on screen',
     };
   }
@@ -168,6 +222,12 @@ export function branchUtterance(args: { text: string; passage: string | null }):
   const raw = tokenize(args.text);
   const matched = spoken.map((w) => expected.has(w));
   const overlap = matched.filter(Boolean).length / spoken.length;
+
+  // How much of the LINE they got through, which is a different question from
+  // how much of what they said was the line. See PASSAGE_COVERED.
+  const said = new Set(spoken);
+  const covered = [...expected].filter((w) => said.has(w)).length;
+  const coverage = expected.size === 0 ? 0 : covered / expected.size;
 
   // The longest unbroken run of words that are not in the passage. A real aside
   // is contiguous ("...over the hill CAN WE DO CARS INSTEAD"); a misread is one
@@ -192,23 +252,77 @@ export function branchUtterance(args: { text: string; passage: string | null }):
 
   const bestLength = run?.length ?? 0;
   const asideWords = run ? spoken.slice(run.start, run.end + 1) : [];
-  const hasCue = asideWords.some((w) => CONVERSATION_CUES.has(w) && !expected.has(w));
+  const saidCue = asideWords.some((w) => CONVERSATION_CUES.has(w) && !expected.has(w));
+
+  // One cue word, with more of the line still to come after it, is a MISREADING
+  // of the word it stands in for — not a child calling out.
+  //
+  // This is not a hypothetical. A child read "Red is at the net" as "Dad is at
+  // the net"; `dad` is in the cue list under "calling for a person", so a single
+  // substituted word turned a perfectly ordinary misread line into an
+  // interruption, and the session spent the next nine turns discussing it
+  // instead of teaching the word. A cue sitting exactly where a passage word
+  // belongs, with the rest of the line read correctly around it, is the shape of
+  // a substitution and nothing else.
+  //
+  // A cue at the END keeps its meaning: nothing follows it to read, so
+  // "...over the hill mom" really is a child calling their mum.
+  const cueIsSubstitution =
+    saidCue && bestLength === 1 && run !== null && run.end < matched.length - 1;
+  const hasCue = saidCue && !cueIsSubstitution;
+
+  // They got through the line and kept going. That is reading ahead — the most
+  // ordinary thing a fluent-ish five-year-old does — and it is the exact
+  // opposite of an aside, however it scores on overlap.
+  //
+  // Requires the extra words to come AFTER the line, and requires them not to
+  // be addressed to us: "the cat sat on the mat can we do cars instead" covers
+  // the line too, and that one really is a request.
+  if (coverage >= PASSAGE_COVERED && !hasCue && run && run.end === matched.length - 1) {
+    return {
+      kind: 'reading',
+      readingText: args.text.trim(),
+      conversationText: '',
+      overlap,
+      coverage,
+      reason: `read ${Math.round(coverage * 100)}% of the line and carried on into the next`,
+    };
+  }
 
   if (overlap <= CONVERSATION_OVERLAP) {
-    return {
-      kind: 'conversation',
-      readingText: '',
-      conversationText: args.text.trim(),
-      overlap,
-      reason: `${Math.round(overlap * 100)}% of it was in the passage`,
-    };
+    // In a turn handed over FOR reading, a low score is far more likely to be a
+    // child reading badly than a child talking. Only an unmistakable cue gets
+    // out of the line — otherwise a misread ("Dad" for "Red") on a short
+    // passage tips below the threshold and gets answered as conversation, which
+    // is how a session ends up discussing a word instead of teaching it.
+    const staysReading = args.readingExpected && !hasCue && coverage >= READING_TURN_COVERAGE;
+    if (!staysReading) {
+      return {
+        kind: 'conversation',
+        readingText: '',
+        conversationText: args.text.trim(),
+        overlap,
+        coverage,
+        reason: `${Math.round(overlap * 100)}% of it was in the passage`,
+      };
+    }
   }
 
   // Mostly the passage, with something else buried in it. Only counts as an
   // aside if it is long enough to be a sentence or carries an unmistakable cue —
   // otherwise it is a child stumbling, and interrupting them would be worse than
   // missing a comment.
-  if (run && (bestLength >= MIN_ASIDE_TOKENS || (hasCue && bestLength >= 1))) {
+  //
+  // In a reading turn the bar is a CUE, full stop. A long run of words that are
+  // not in the line is what reading badly looks like from here — sounding out,
+  // repeating, a transcript that half heard them — and none of it is addressed
+  // to us. Breaking out on length alone is how a child gets answered instead of
+  // taught.
+  const asideEnough = args.readingExpected
+    ? hasCue && bestLength >= 1
+    : bestLength >= MIN_ASIDE_TOKENS || (hasCue && bestLength >= 1);
+
+  if (run && asideEnough) {
     // NOW widen it. They stopped reading somewhere in this run, so a passage
     // word landing a syllable or two later is a collision and not a return to
     // the line — and cutting the aside there hands the responder half a
@@ -238,10 +352,10 @@ export function branchUtterance(args: { text: string; passage: string | null }):
     // included. There is no reading half to score or come back to, so calling
     // it mixed would send the session looking for one.
     if (!readingText.trim()) {
-      return { kind: 'conversation', readingText: '', conversationText: args.text.trim(), overlap, reason };
+      return { kind: 'conversation', readingText: '', conversationText: args.text.trim(), overlap, coverage, reason };
     }
 
-    return { kind: 'mixed', readingText, conversationText: asideText, overlap, reason };
+    return { kind: 'mixed', readingText, conversationText: asideText, overlap, coverage, reason };
   }
 
   if (overlap >= READING_OVERLAP) {
@@ -250,6 +364,7 @@ export function branchUtterance(args: { text: string; passage: string | null }):
       readingText: args.text.trim(),
       conversationText: '',
       overlap,
+      coverage,
       reason: 'matches the line',
     };
   }
@@ -262,6 +377,7 @@ export function branchUtterance(args: { text: string; passage: string | null }):
     readingText: args.text.trim(),
     conversationText: '',
     overlap,
+    coverage,
     reason: 'messy, but still an attempt at the line',
   };
 }
